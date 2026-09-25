@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      try {
+        const mode = localStorage.getItem('wonderland.theme.mode')
+        const dark = mode === 'dark' || mode === 'custom' || (mode === 'system' && matchMedia('(prefers-color-scheme: dark)').matches)
+        if (['light', 'dark', 'system', 'custom'].includes(mode)) {
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+        }
+      } catch (_) { /* Storage may be unavailable; the app will read its saved setting. */ }
+    </script>
+    <title>Wonderland Assistant</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

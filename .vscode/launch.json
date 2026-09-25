@@ -1,0 +1,36 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Core：运行桌面应用",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "pnpm --filter @wonderland/desktop run dev",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "CARGO_HOME": "${workspaceFolder}\\.cargo-home",
+        "RUSTUP_HOME": "${workspaceFolder}\\.cargo-home\\rustup",
+        "npm_config_cache": "${workspaceFolder}\\.npm-cache",
+        "WONDERLAND_PLUGIN_UI_ISOLATION_TEST": "1"
+      }
+    },
+    {
+      "name": "Core：调试 Rust 宿主（LLDB）",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--locked", "--package=wonderland-desktop", "--bin=wonderland-desktop"],
+        "filter": { "name": "wonderland-desktop", "kind": "bin" }
+      },
+      "cwd": "${workspaceFolder}/apps/desktop/src-tauri",
+      "env": {
+        "CARGO_HOME": "${workspaceFolder}\\.cargo-home",
+        "RUSTUP_HOME": "${workspaceFolder}\\.cargo-home\\rustup",
+        "npm_config_cache": "${workspaceFolder}\\.npm-cache",
+        "WONDERLAND_PLUGIN_UI_ISOLATION_TEST": "1"
+      },
+      "sourceLanguages": ["rust"],
+      "preLaunchTask": "prepare: Core Rust 调试"
+    }
+  ]
+}

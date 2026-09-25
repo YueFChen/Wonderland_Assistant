@@ -1,0 +1,15 @@
+[package]
+name = "wonderland-config"
+description = "应用设置实现：主题偏好与自定义背景的落盘（内核体系，不依赖 Tauri）。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wonderland-kernel = { path = "../kernel" }
+serde.workspace = true
+serde_json.workspace = true
+# 背景图以 data URL 与前端交换；纯 Rust，无 C 依赖。
+base64 = "0.22"

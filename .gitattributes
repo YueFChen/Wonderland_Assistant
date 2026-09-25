@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+# 二进制样本不参与文本和行尾转换。
+*.gip binary
+*.gil binary
+*.gia binary
+*.gir binary
+*.mihoyobin binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary

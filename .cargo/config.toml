@@ -1,0 +1,3 @@
+# Build artifacts are stored in the workspace.
+[build]
+target-dir = "target"

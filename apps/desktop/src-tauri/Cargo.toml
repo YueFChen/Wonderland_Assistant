@@ -1,0 +1,41 @@
+[package]
+name = "wonderland-desktop"
+description = "Wonderland Assistant 桌面壳：路由、IPC 与插件宿主。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+# 独立构建时将前端资源嵌入应用。
+custom-protocol = ["tauri/custom-protocol"]
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hex = "0.4"
+regex.workspace = true
+ring = "0.17"
+semver = "1"
+sha2 = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+wonderland-kernel = { path = "../../../crates/kernel" }
+wonderland-account = { path = "../../../crates/account" }
+wonderland-config = { path = "../../../crates/config" }
+wonderland-logging = { path = "../../../crates/logging" }
+wonderland-user-data = { path = "../../../crates/user-data" }
+wonderland-mihoyo = { path = "../../../crates/mihoyo" }
+wonderland-net = { path = "../../../crates/net" }
+wonderland-secret = { path = "../../../crates/secret" }
+wonderland-plugin-protocol = { path = "../../../crates/plugin-protocol" }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

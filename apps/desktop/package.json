@@ -1,0 +1,16 @@
+{
+  "name": "@wonderland/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Tauri 应用包：持有 CLI 与宿主编排脚本，前端源码在 ui/。",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "typecheck": "pnpm --dir ui run typecheck"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  }
+}

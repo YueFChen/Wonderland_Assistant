@@ -1,0 +1,13 @@
+[package]
+name = "wonderland-mihoyo"
+description = "米哈游平台适配层：米游社 / 通行证接口端点、请求组装与响应模型。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wonderland-kernel = { path = "../kernel" }
+wonderland-net = { path = "../net" }
+serde.workspace = true

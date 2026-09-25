@@ -1,0 +1,17 @@
+[package]
+name = "wonderland-logging"
+description = "日志实现层：唯一安装 subscriber 的 crate（按天落盘、脱敏、panic 记录）。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Logging implementation for the desktop host.
+[dependencies]
+wonderland-kernel = { path = "../kernel" }
+# 实现层直接安装全局 subscriber，并需要 Metadata / Interest 等核心类型（门面只导出宏）。
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+regex.workspace = true

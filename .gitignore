@@ -1,0 +1,38 @@
+# Build output
+target/
+
+# Independent plugin repositories
+plugins/
+
+# Node and pnpm
+node_modules/
+dist/
+*.tsbuildinfo
+.pnpm-store/
+.npm-cache/
+
+# Generated Tauri files
+apps/desktop/src-tauri/gen/
+
+# Local runtime files
+*.log
+logs/
+tmp/
+docs/
+# Local Cargo cache
+.cargo-home/
+.DS_Store
+Thumbs.db
+
+# Editor files
+.idea/
+# Shared VS Code configuration
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+
+# Authentication secrets
+*.cookie
+*.session

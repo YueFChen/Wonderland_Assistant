@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend（typecheck / build）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: node scripts/check-vscode-config.mjs
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r run typecheck
+      - run: pnpm -r run test
+      - run: pnpm run check:ui-literals
+      - run: pnpm --filter @wonderland/desktop-ui run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-ui-dist
+          path: apps/desktop/ui/dist
+
+  rust:
+    name: Rust（fmt / clippy / test / build）
+    needs: frontend
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-ui-dist
+          path: apps/desktop/ui/dist
+      - name: 显示生效工具链（由 rust-toolchain.toml 固定）
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo run --locked -p wonderland-kernel --example generate_bindings --features bindings -- --check
+      - run: cargo run --locked -p wonderland-plugin-protocol --example generate_bindings --features bindings -- --check
+      - run: cargo run --locked -p wonderland-my-wonderland --example generate_bindings --features bindings -- --check
+      - run: cargo run --locked -p wonderland-comment-collector --example generate_bindings --features bindings -- --check
+      - run: cargo run --locked -p wonderland-rich-editor --example generate_bindings --features bindings -- --check
+      - run: cargo run --locked -p wonderland-knowledge-library --example generate_bindings --features bindings -- --check
+      - run: cargo run --locked -p wonderland-translator --example generate_bindings --features bindings -- --check
+      - run: cargo build --workspace --locked
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Verify Windows Core bundle
+        shell: pwsh
+        run: |
+          $bundles = @(Get-ChildItem -Path 'target/release/bundle' -Recurse -File |
+            Where-Object { $_.Extension -in '.msi', '.exe' })
+          if ($bundles.Count -eq 0) { throw 'Windows installer missing from target/release/bundle' }
+          $bundles | Select-Object -ExpandProperty FullName
+
+  supply-chain:
+    name: Supply chain（cargo-deny）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

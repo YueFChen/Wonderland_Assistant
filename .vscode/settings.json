@@ -1,0 +1,14 @@
+{
+  "git.autoRepositoryDetection": "subFolders",
+  "git.repositoryScanMaxDepth": 3,
+
+  "terminal.integrated.env.windows": {
+    "CARGO_HOME": "${workspaceFolder}\\.cargo-home",
+    "RUSTUP_HOME": "${workspaceFolder}\\.cargo-home\\rustup",
+    "npm_config_cache": "${workspaceFolder}\\.npm-cache"
+  },
+  "rust-analyzer.server.extraEnv": {
+    "CARGO_HOME": "${workspaceFolder}\\.cargo-home",
+    "RUSTUP_HOME": "${workspaceFolder}\\.cargo-home\\rustup"
+  }
+}

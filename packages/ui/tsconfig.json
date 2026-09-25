@@ -1,0 +1,5 @@
+{
+  "extends": "../../apps/desktop/ui/tsconfig.json",
+  "compilerOptions": { "types": [] },
+  "include": ["src"]
+}

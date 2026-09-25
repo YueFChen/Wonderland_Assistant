@@ -1,0 +1,55 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "dev: Vite（Core UI）",
+      "type": "shell",
+      "command": "pnpm --filter @wonderland/desktop-ui run dev",
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "vite",
+        "fileLocation": ["relative", "${workspaceFolder}"],
+        "pattern": [{
+          "regexp": "^(.*?):(\\d+):(\\d+):\\s+(error|warning):\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }],
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "VITE",
+          "endsPattern": "ready in"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "focus": false,
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "prepare: Core Rust 调试",
+      "dependsOn": ["dev: Vite（Core UI）"],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
+      "label": "build: Core 安装包",
+      "type": "shell",
+      "command": "pnpm build",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "CARGO_HOME": "${workspaceFolder}\\.cargo-home",
+          "RUSTUP_HOME": "${workspaceFolder}\\.cargo-home\\rustup",
+          "npm_config_cache": "${workspaceFolder}\\.npm-cache"
+        }
+      },
+      "problemMatcher": [],
+      "group": { "kind": "build", "isDefault": true }
+    }
+  ]
+}

@@ -1,0 +1,247 @@
+/*
+ * Shared theme tokens and component styles.
+ *
+ */
+
+@theme {
+  /* 品牌色阶：取自应用图标主色（紫罗兰 → 靛蓝），两套主题共用 */
+  --color-brand-200: #ded7ff;
+  --color-brand-300: #c7b9ff;
+  --color-brand-400: #a78bfa;
+  --color-brand-500: #8b5cf6;
+  --color-brand-600: #6d4aff;
+  --color-brand-700: #4f46e5;
+
+  /* 语义文字色：随主题切换 */
+  --color-ink: var(--app-ink);
+  --color-ink-muted: var(--app-ink-muted);
+  --color-ink-faint: var(--app-ink-faint);
+
+  /* 玻璃拟态表面：随主题切换 */
+  --color-glass-subtle: var(--app-glass-subtle);
+  --color-glass: var(--app-glass);
+  --color-glass-hover: var(--app-glass-hover);
+  --color-glass-line: var(--app-glass-line);
+  --color-glass-line-strong: var(--app-glass-line-strong);
+
+  /* 状态色 */
+  --color-status-ready-from: #10b981;
+  --color-status-ready-to: #059669;
+  --color-status-dev-from: #6b7280;
+  --color-status-dev-to: #4b5563;
+
+  /* 圆角与模糊 */
+  --radius-tile: 0.75rem;
+  --radius-card: 1rem;
+  --blur-glass: 20px;
+
+  /* 入场动效 */
+  --animate-rise: rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(12px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
+
+@layer base {
+  /*
+   * Dark theme defaults. Set `data-theme="light"` to use the light palette.
+   */
+  :root {
+    color-scheme: dark;
+
+    /* 文字 */
+    --app-ink: rgb(255 255 255 / 0.92);
+    --app-ink-muted: rgb(255 255 255 / 0.62);
+    --app-ink-faint: rgb(255 255 255 / 0.55);
+    /* 供插件按任意透明度取用：rgb(var(--app-ink-rgb) / 0.5) */
+    --app-ink-rgb: 255 255 255;
+    --app-surface-rgb: 255 255 255;
+
+    /* 表面与描边 */
+    --app-glass-subtle: rgb(255 255 255 / 0.05);
+    --app-glass: rgb(255 255 255 / 0.09);
+    --app-glass-hover: rgb(255 255 255 / 0.16);
+    --app-glass-line: rgb(255 255 255 / 0.12);
+    --app-glass-line-strong: rgb(255 255 255 / 0.2);
+    /* 输入框等需要实底的地方 */
+    --app-field: #252236;
+    --app-field-border: rgb(255 255 255 / 0.14);
+
+    /* 强调色 */
+    --app-accent: #a78bfa;
+    --app-accent-ink: #ded0ff;
+    --app-accent-soft: rgb(167 139 250 / 0.18);
+    --app-accent-line: rgb(167 139 250 / 0.45);
+
+    /* 状态 */
+    --app-danger: #ffb9b9;
+    --app-danger-soft: rgb(224 100 100 / 0.12);
+    --app-danger-line: rgb(224 100 100 / 0.4);
+    --app-success: #a9ecce;
+    --app-success-soft: rgb(74 196 138 / 0.12);
+    --app-success-line: rgb(74 196 138 / 0.4);
+
+    /* 页面与背景光晕 */
+    --app-page: #0b0b12;
+    --app-glow-1: rgb(109 74 255 / 0.34);
+    --app-glow-2: rgb(79 70 229 / 0.3);
+    --app-glow-3: rgb(139 92 246 / 0.16);
+    --app-title-from: #ffffff;
+    --app-title-to: rgb(255 255 255 / 0.72);
+  }
+
+  [data-theme="light"] {
+    color-scheme: light;
+
+    --app-ink: rgb(26 24 46 / 0.92);
+    --app-ink-muted: rgb(26 24 46 / 0.72);
+    --app-ink-faint: rgb(26 24 46 / 0.62);
+    --app-ink-rgb: 26 24 46;
+    --app-surface-rgb: 26 24 46;
+
+    --app-glass-subtle: rgb(26 24 46 / 0.04);
+    --app-glass: rgb(255 255 255 / 0.66);
+    --app-glass-hover: rgb(255 255 255 / 0.92);
+    --app-glass-line: rgb(26 24 46 / 0.12);
+    --app-glass-line-strong: rgb(26 24 46 / 0.2);
+    --app-field: #ffffff;
+    --app-field-border: rgb(26 24 46 / 0.14);
+
+    --app-accent: #6d4aff;
+    --app-accent-ink: #4f46e5;
+    --app-accent-soft: rgb(109 74 255 / 0.12);
+    --app-accent-line: rgb(109 74 255 / 0.4);
+
+    --app-danger: #b4232f;
+    --app-danger-soft: rgb(180 35 47 / 0.08);
+    --app-danger-line: rgb(180 35 47 / 0.32);
+    --app-success: #0f7a4f;
+    --app-success-soft: rgb(15 122 79 / 0.08);
+    --app-success-line: rgb(15 122 79 / 0.3);
+
+    --app-page: #f3f2fa;
+    --app-glow-1: rgb(109 74 255 / 0.18);
+    --app-glow-2: rgb(79 70 229 / 0.14);
+    --app-glow-3: rgb(139 92 246 / 0.1);
+    --app-title-from: #1b1830;
+    --app-title-to: rgb(27 24 48 / 0.68);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background-color: var(--app-page);
+    color: var(--app-ink);
+    font-family: "Inter", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+
+  /* 原生选项弹层不继承 select 的玻璃背景，显式提供两套主题的实底与文字色。 */
+  select,
+  select option {
+    background-color: var(--app-field);
+    color: var(--app-ink);
+  }
+
+  select:focus-visible {
+    outline: 2px solid var(--app-accent);
+    outline-offset: 2px;
+  }
+
+  /* 细滚动条，贴合当前主题的玻璃面板 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--app-glass-hover) transparent;
+  }
+}
+
+@layer components {
+  /* 玻璃卡片：面板、卡片的基础表面 */
+  .glass-card {
+    background-color: var(--color-glass);
+    backdrop-filter: blur(var(--blur-glass));
+    border: 1px solid var(--color-glass-line);
+  }
+
+  /* 首页主标题：随主题变化的渐变文字 */
+  .brand-text {
+    background-image: linear-gradient(135deg, var(--app-title-from) 0%, var(--app-title-to) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* 背景层：默认深浅叠加的品牌光晕 */
+  .app-backdrop {
+    background-image:
+      radial-gradient(120% 90% at 12% 0%, var(--app-glow-1) 0%, transparent 60%),
+      radial-gradient(100% 80% at 88% 8%, var(--app-glow-2) 0%, transparent 62%),
+      radial-gradient(90% 70% at 50% 100%, var(--app-glow-3) 0%, transparent 70%);
+    background-color: var(--app-page);
+  }
+
+  /* 背景层：自定义背景图之上的压暗层，保证前景文字对比度 */
+  .app-backdrop-scrim {
+    background-image: linear-gradient(
+      135deg,
+      rgb(0 0 0 / 0.6),
+      rgb(0 0 0 / 0.4) 45%,
+      rgb(79 70 229 / 0.5)
+    );
+  }
+
+  /* 模块卡片：可进入时上浮，未就绪时保持静止 */
+  .module-card {
+    transition:
+      transform 0.25s cubic-bezier(0.22, 1, 0.36, 1),
+      background-color 0.25s ease;
+  }
+
+  .module-card[data-actionable="true"]:hover {
+    transform: translateY(-4px);
+    background-color: var(--color-glass-hover);
+  }
+
+  .module-card[data-actionable="true"]:focus-visible {
+    outline: 2px solid var(--color-brand-400);
+    outline-offset: 2px;
+  }
+
+  .module-card[data-actionable="false"] {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  /* 模块图标块：渐变由数据注入 */
+  .module-tile {
+    background-image: var(--module-gradient);
+  }
+
+  /* 状态徽章 */
+  .status-badge--ready {
+    background-image: linear-gradient(
+      135deg,
+      var(--color-status-ready-from),
+      var(--color-status-ready-to)
+    );
+  }
+
+  .status-badge--dev {
+    background-image: linear-gradient(
+      135deg,
+      var(--color-status-dev-from),
+      var(--color-status-dev-to)
+    );
+  }
+}

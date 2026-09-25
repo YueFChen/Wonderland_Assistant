@@ -1,0 +1,18 @@
+{
+  "name": "wonderland-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@11.27.0",
+  "engines": {
+    "node": ">=24.15.0 <25",
+    "pnpm": ">=11.22.0 <12"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @wonderland/desktop run dev",
+    "build": "pnpm --filter @wonderland/desktop run build",
+    "typecheck": "pnpm -r run typecheck",
+    "check:ui-literals": "node scripts/check-ui-literals.mjs",
+    "check:vscode-config": "node scripts/check-vscode-config.mjs"
+  }
+}

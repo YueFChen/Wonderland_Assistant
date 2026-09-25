@@ -1,0 +1,11 @@
+packages:
+  - "apps/desktop"
+  - "apps/desktop/ui"
+  - "packages/*"
+
+storeDir: .pnpm-store
+
+minimumReleaseAgeExclude:
+  - lucide-react@1.47.0
+
+

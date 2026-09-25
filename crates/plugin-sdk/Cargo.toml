@@ -1,0 +1,13 @@
+[package]
+name = "wonderland-plugin-sdk"
+description = "Public host bridge SDK for Wonderland plugin backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"

@@ -1,0 +1,26 @@
+[package]
+name = "wonderland-kernel"
+description = "内核稳定契约：账号契约、AppContext 与统一错误。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+# Platform-specific behavior and I/O are implemented by host crates.
+tracing.workspace = true
+ts-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+# 只为校验 `LogSettings` 的 serde 默认值，不进产物依赖。
+serde_json.workspace = true
+
+[features]
+bindings = ["dep:ts-rs"]
+
+# 内核契约的 TS 绑定由本 crate 自产；`--features bindings` 为运行前提。
+[[example]]
+name = "generate_bindings"
+required-features = ["bindings"]

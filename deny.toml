@@ -1,0 +1,40 @@
+# cargo-deny 供应链与许可证门槛。
+# 安装：cargo install cargo-deny --locked
+# 注意：项目自身许可证为 Apache-2.0（2026-09-17 确定，见根目录 LICENSE）；
+# 下方 allow 列表是第三方依赖许可证的准入策略。
+
+[advisories]
+version = 2
+yanked = "warn"
+# 只对「工作区直接依赖」的 unmaintained 告警报错（默认 all 对整棵依赖树报错）。
+# 现存两处 unmaintained 都不可升级，也都不由我们掌控：
+#   - proc-macro-error：只出现在 Tauri 的 Linux GTK 分支（glib-macros / gtk3-macros）；
+#   - unic-*：经 tauri-utils -> urlpattern 传递引入。
+# 漏洞（vulnerability）与 unsound 告警不受此项影响，始终报错。
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+  # webpki-root-certs（rustls-platform-verifier 携带的 Mozilla 根证书数据）使用该协议，
+  # 属宽松数据许可，可再分发。
+  "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

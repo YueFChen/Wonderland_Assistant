@@ -1,0 +1,68 @@
+.app-titlebar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 70;
+  display: flex;
+  height: 44px;
+  flex-shrink: 0;
+  align-items: center;
+  color: var(--app-ink);
+  pointer-events: none;
+  user-select: none;
+}
+
+.app-titlebar-drag {
+  height: 18px;
+  flex: 1;
+  align-self: flex-start;
+  pointer-events: auto;
+}
+
+.app-titlebar-controls {
+  display: flex;
+  height: 100%;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 4px;
+  padding: 0 10px;
+  pointer-events: auto;
+}
+
+/* 右侧插件面板的标题栏从窗口按钮下方开始，面板底色仍铺到窗口顶端。 */
+.app-window .ws-sidebar {
+  padding-top: 44px;
+}
+
+.app-titlebar-controls button {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--app-ink-muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.app-titlebar-controls button:hover {
+  background: var(--app-glass-hover);
+  color: var(--app-ink);
+}
+
+.app-titlebar-controls .app-titlebar-close:hover {
+  background: var(--app-danger-soft);
+  color: var(--app-danger);
+}
+
+.app-titlebar-controls button:focus-visible {
+  outline: 2px solid var(--app-accent);
+  outline-offset: 2px;
+}
+
+.app-titlebar-controls svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.8;
+}

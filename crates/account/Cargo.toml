@@ -1,0 +1,16 @@
+[package]
+name = "wonderland-account"
+description = "账号体系实现：凭据判定、加密落盘与账号状态（内核体系，不依赖 Tauri）。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wonderland-kernel = { path = "../kernel" }
+wonderland-mihoyo = { path = "../mihoyo" }
+serde.workspace = true
+serde_json.workspace = true
+wonderland-net = { path = "../net" }
+wonderland-secret = { path = "../secret" }
