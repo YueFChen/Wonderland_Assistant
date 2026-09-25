@@ -2,7 +2,10 @@
 target/
 
 # Independent plugin repositories
-plugins/
+plugins/**
+#Plugins README.md
+!plugins/README.md
+
 
 # Node and pnpm
 node_modules/
