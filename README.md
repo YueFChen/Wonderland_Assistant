@@ -1,6 +1,6 @@
 # Wonderland Assistant Core
 
-Wonderland Assistant Core 是 Windows 桌面应用，为《原神》相关工作流和独立插件提供统一入口。插件业务代码独立维护；Core 负责工作区、插件生命周期、权限确认、在线目录和应用更新。
+Wonderland Assistant Core 是 Windows 桌面应用，为《原神 千星奇域》相关工作流和独立插件、应用工具提供统一入口。插件业务代码独立维护；Core 负责工作区、插件生命周期、权限确认、在线目录和应用更新。
 
 ## 功能
 
@@ -59,3 +59,7 @@ Windows 安装包位于 `target/release/bundle/`。签名更新文件和 GitHub 
 - `packages/`：前端绑定、协议类型与共享 UI。
 - `plugins/`：本地插件仓库目录；其中的独立仓库不会并入 Core。
 - `scripts/`：插件模板创建等仓库工具。
+
+## 素材致谢
+
+应用图标素材来自 Pixiv 作者 [Saika2017](https://www.pixiv.net/users/9896587) 发布的作品[《阿晴的霓裾翩跹》](https://www.pixiv.net/artworks/95101974)。
