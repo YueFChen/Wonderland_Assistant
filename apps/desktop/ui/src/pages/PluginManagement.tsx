@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { PluginRuntimeState } from '@wonderland/plugin-protocol'
 import { PackagePlus, Trash2 } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 
 import { pluginApi } from '../plugins/api'
 import { t, type MessageKey } from '../i18n'
@@ -10,20 +11,9 @@ export function PluginManagement({ states, error, setStates }: {
   error: MessageKey | null
   setStates: (states: PluginRuntimeState[]) => void
 }) {
+  const navigate = useNavigate()
   const [busy, setBusy] = useState('')
   const [failure, setFailure] = useState('')
-
-  const install = async () => {
-    setBusy('install')
-    setFailure('')
-    try {
-      setStates(await pluginApi.install())
-    } catch (cause) {
-      setFailure(t('settings.plugins.installFailed', { error: errorText(cause) }))
-    } finally {
-      setBusy('')
-    }
-  }
 
   const remove = async (state: PluginRuntimeState) => {
     if (!window.confirm(t('settings.plugins.removeConfirm', { name: state.manifest.name }))) return
@@ -63,26 +53,24 @@ export function PluginManagement({ states, error, setStates }: {
   }
 
   return (
-    <section className="glass-card rounded-2xl border border-glass-line p-5 sm:p-6">
-      <header className="mb-5 flex flex-wrap items-start justify-between gap-4">
+    <section className="glass-card rounded-2xl border border-glass-line p-4 sm:p-5">
+      <header className="mb-4 flex flex-wrap items-start justify-between gap-3">
         <div className="flex min-w-0 items-start gap-3">
-          <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-brand-600/10 text-brand-400">
-            <PackagePlus className="h-5 w-5" aria-hidden />
+          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-brand-600/10 text-brand-400">
+            <PackagePlus className="h-4 w-4" aria-hidden />
           </span>
           <div className="min-w-0">
-            <h2 className="text-base font-semibold text-ink">{t('settings.plugins.title')}</h2>
+            <h2 className="text-sm font-semibold text-ink">{t('settings.plugins.title')}</h2>
             <p className="mt-1 max-w-2xl text-xs leading-relaxed text-ink-faint">{t('settings.plugins.hint')}</p>
-            <p className="mt-1 text-[11px] text-ink-faint">{t('settings.plugins.installHelp')}</p>
           </div>
         </div>
         <button
           type="button"
-          disabled={busy !== ''}
-          onClick={() => void install()}
-          className="inline-flex items-center gap-2 rounded-lg border border-glass-line bg-glass-subtle px-3 py-2 text-xs font-medium text-ink transition hover:border-brand-500/30 hover:bg-glass-hover disabled:opacity-50"
+          onClick={() => navigate('/workspace/plugins/install')}
+          className="inline-flex items-center gap-2 rounded-lg border border-glass-line bg-glass-subtle px-3 py-2 text-xs font-medium text-ink transition hover:border-brand-500/30 hover:bg-glass-hover"
         >
-          <PackagePlus className="h-4 w-4" aria-hidden />
-          {busy === 'install' ? t('settings.plugins.installing') : t('settings.plugins.install')}
+          <PackagePlus className="h-3.5 w-3.5" aria-hidden />
+          {t('settings.plugins.install')}
         </button>
       </header>
 
@@ -121,16 +109,13 @@ function PluginCard({ state, busy, onToggle, onRemove, onCapabilitiesChange }: {
   const enabled = state.enabled
   const issue = state.lastError?.message ?? state.serviceDependencyIssues?.join(' · ')
   return (
-    <li className="min-w-0 rounded-xl border border-glass-line bg-glass-subtle p-4 transition hover:border-brand-500/25">
+    <li className="min-w-0 rounded-xl border border-glass-line bg-glass-subtle p-3 transition hover:border-brand-500/25">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="truncate text-sm font-semibold text-ink">{state.manifest.name}</h3>
             <span className={`rounded-full border px-2 py-0.5 text-[10px] ${enabled ? 'border-brand-500/25 bg-brand-500/10 text-brand-400' : 'border-glass-line text-ink-faint'}`}>
               {enabled ? t('settings.plugins.enabled') : t('settings.plugins.disabled')}
-            </span>
-            <span className="rounded-full border border-glass-line px-2 py-0.5 text-[10px] text-ink-faint">
-              {state.trusted ? t('settings.plugins.trusted') : t('settings.plugins.untrustedDev')}
             </span>
             {state.installation !== 'installed' && (
               <span className="rounded-full border border-[var(--app-danger-line)] px-2 py-0.5 text-[10px] text-[var(--app-danger)]">

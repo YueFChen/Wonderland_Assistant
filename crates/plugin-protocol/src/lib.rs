@@ -175,8 +175,6 @@ pub struct PluginFailure {
 pub struct PluginRuntimeState {
     pub manifest: PluginManifest,
     pub installation: InstallationState,
-    #[serde(default)]
-    pub trusted: bool,
     pub enabled: bool,
     pub runtime: RuntimeState,
     pub last_error: Option<PluginFailure>,

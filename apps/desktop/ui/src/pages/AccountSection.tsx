@@ -18,7 +18,7 @@ const DANGER_BUTTON_CLASS =
 /**
  * 账号页：账号体系属于内核，页面只展示状态并触发宿主侧流程，不参与登录判定。
  */
-export function AccountPage() {
+export function AccountManagementSection() {
   const { snapshot, error, busy, run } = useAccount()
   const [forgetPending, setForgetPending] = useState<string | null>(null)
 
@@ -39,14 +39,7 @@ export function AccountPage() {
       : t('account.loginHint')
 
   return (
-    <section className="w-full">
-      <div className="mb-6">
-        <h1 className="mb-2 text-xl font-bold text-ink">{t('account.title')}</h1>
-        <p className="text-sm leading-relaxed text-ink-muted">
-          {t('account.description')}
-        </p>
-      </div>
-
+    <section aria-label={t('account.title')} className="w-full">
       <div className="glass-card animate-rise rounded-card p-6">
         <div className="flex items-center gap-4">
           <UserAvatar name={role?.nickname} src={account?.avatar_url} size={64} />
@@ -137,9 +130,6 @@ export function AccountPage() {
 
       <div className="glass-card mt-4 rounded-card p-6">
         <h2 className="mb-1 text-sm font-medium text-ink-muted">{t('account.savedAccounts')}</h2>
-        <p className="mb-4 text-xs leading-relaxed text-ink-faint">
-          {t('account.savedAccountsHint')}
-        </p>
         {snapshot && snapshot.accounts.length > 0 ? (
           <ul className="space-y-4">
             {snapshot.accounts.map((item) => {

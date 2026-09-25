@@ -85,10 +85,10 @@ fn walk_schema(
             visited_refs.remove(reference);
         }
     }
-    if let Some(dialect) = object.get("$schema") {
-        if dialect.as_str() != Some("https://json-schema.org/draft/2020-12/schema") {
-            return Err("Only JSON Schema Draft 2020-12 is supported.".to_owned());
-        }
+    if let Some(dialect) = object.get("$schema")
+        && dialect.as_str() != Some("https://json-schema.org/draft/2020-12/schema")
+    {
+        return Err("Only JSON Schema Draft 2020-12 is supported.".to_owned());
     }
     if let Some(pattern) = object.get("pattern") {
         let pattern = pattern
@@ -116,21 +116,19 @@ fn walk_schema(
             return Err("Schema keyword 'type' contains an unsupported type.".to_owned());
         }
     }
-    if let Some(required) = object.get("required") {
-        if !required
+    if let Some(required) = object.get("required")
+        && !required
             .as_array()
             .is_some_and(|keys| keys.iter().all(Value::is_string))
-        {
-            return Err("Schema keyword 'required' must be an array of strings.".to_owned());
-        }
+    {
+        return Err("Schema keyword 'required' must be an array of strings.".to_owned());
     }
-    if let Some(enum_values) = object.get("enum") {
-        if !enum_values
+    if let Some(enum_values) = object.get("enum")
+        && !enum_values
             .as_array()
             .is_some_and(|values| !values.is_empty())
-        {
-            return Err("Schema keyword 'enum' must be a non-empty array.".to_owned());
-        }
+    {
+        return Err("Schema keyword 'enum' must be a non-empty array.".to_owned());
     }
     for keyword in ["minLength", "maxLength", "minItems", "maxItems"] {
         if object
@@ -181,10 +179,10 @@ fn walk_schema(
         }
     }
     for keyword in ["items", "additionalProperties"] {
-        if let Some(child) = object.get(keyword) {
-            if child.is_object() || child.is_boolean() {
-                walk_schema(child, root, depth + 1, visited_refs)?;
-            }
+        if let Some(child) = object.get(keyword)
+            && (child.is_object() || child.is_boolean())
+        {
+            walk_schema(child, root, depth + 1, visited_refs)?;
         }
     }
     for keyword in ["allOf", "anyOf", "oneOf"] {
@@ -237,15 +235,15 @@ fn validate_at(instance: &Value, schema: &Value, root: &Value, depth: usize) -> 
         }
     }
 
-    if let Some(expected) = object.get("const") {
-        if instance != expected {
-            return Err("Value does not match the required constant.".to_owned());
-        }
+    if let Some(expected) = object.get("const")
+        && instance != expected
+    {
+        return Err("Value does not match the required constant.".to_owned());
     }
-    if let Some(values) = object.get("enum").and_then(Value::as_array) {
-        if !values.iter().any(|value| value == instance) {
-            return Err("Value is not in the allowed enum.".to_owned());
-        }
+    if let Some(values) = object.get("enum").and_then(Value::as_array)
+        && !values.iter().any(|value| value == instance)
+    {
+        return Err("Value is not in the allowed enum.".to_owned());
     }
 
     for (keyword, expected_count) in [("minLength", true), ("maxLength", false)] {

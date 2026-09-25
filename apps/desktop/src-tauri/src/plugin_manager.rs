@@ -11,6 +11,7 @@ use chrono::Utc;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use wonderland_kernel::AppContext;
@@ -25,6 +26,54 @@ use crate::{plugin_package, plugin_runtime::PluginProcess};
 
 const MANAGER_CONFIG_FILE: &str = "plugin-manager.json";
 const LEGACY_CONFIG_FILE: &str = "plugins.json";
+const CATALOG_CACHE_FILE: &str = "plugin-catalog-v1.json";
+const CATALOG_MAX_BYTES: usize = 2 * 1024 * 1024;
+const CATALOG_MAX_ITEMS: usize = 500;
+const PLUGIN_PACKAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginCatalogIndex {
+    schema_version: u32,
+    generated_at: String,
+    plugins: Vec<PluginCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginCatalogEntry {
+    id: String,
+    name: String,
+    description: String,
+    author: String,
+    repository_url: String,
+    version: String,
+    release_notes_url: Option<String>,
+    download_url: String,
+    sha256: String,
+    size_bytes: u64,
+    host_compatibility: HostCompatibility,
+    ui_bridge_compatibility: Option<ProtocolCompatibility>,
+    platform: PluginPlatform,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCatalogSnapshot {
+    generated_at: String,
+    stale: bool,
+    plugins: Vec<PluginCatalogItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginCatalogItem {
+    entry: PluginCatalogEntry,
+    compatible: bool,
+    installed_version: Option<String>,
+    installable: bool,
+}
 
 #[derive(Clone)]
 pub struct PluginManager {
@@ -50,7 +99,6 @@ struct PluginRecord {
     directory: PathBuf,
     contract: Value,
     contract_sha256: String,
-    publisher_key_id: Option<String>,
     process: Option<Arc<PluginProcess>>,
 }
 
@@ -69,7 +117,7 @@ struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             enabled_plugins: BTreeMap::new(),
             granted_capabilities: BTreeMap::new(),
             active_versions: BTreeMap::new(),
@@ -156,6 +204,13 @@ impl PluginManager {
         let old = std::mem::take(&mut state.plugins);
         let mut next = BTreeMap::new();
         let mut preferences_changed = false;
+        let activate_legacy_defaults = state.preferences.schema_version < 2;
+        if state.preferences.schema_version < 3 {
+            let old_grants = std::mem::take(&mut state.preferences.granted_capabilities);
+            state.preferences.granted_capabilities = migrate_capability_grants(old_grants);
+            state.preferences.schema_version = 3;
+            preferences_changed = true;
+        }
 
         for item in scanned {
             match item {
@@ -179,8 +234,7 @@ impl PluginManager {
                         .active_versions
                         .insert(id.clone(), version);
                     let requested = plugin.manifest.capabilities.iter().collect::<BTreeSet<_>>();
-                    let grant_key = capability_grant_key(&id, plugin.publisher_key_id.as_deref());
-                    let activate_legacy_defaults = state.preferences.schema_version < 2;
+                    let grant_key = capability_grant_key(&id);
                     let (granted, grant_added) =
                         match state.preferences.granted_capabilities.entry(grant_key) {
                             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -209,7 +263,6 @@ impl PluginManager {
                     let mut snapshot = PluginRuntimeState {
                         manifest: plugin.manifest.clone(),
                         installation,
-                        trusted: plugin.trusted,
                         enabled: enabled && installation == InstallationState::Installed,
                         runtime: RuntimeState::Stopped,
                         last_error: if installation == InstallationState::Incompatible {
@@ -242,7 +295,6 @@ impl PluginManager {
                             directory: plugin.directory,
                             contract: plugin.contract,
                             contract_sha256: plugin.contract_sha256,
-                            publisher_key_id: plugin.publisher_key_id,
                             process,
                         },
                     );
@@ -257,16 +309,11 @@ impl PluginManager {
                             directory: PathBuf::new(),
                             contract: Value::Null,
                             contract_sha256: String::new(),
-                            publisher_key_id: None,
                             process: None,
                         },
                     );
                 }
             }
-        }
-        if state.preferences.schema_version < 2 {
-            state.preferences.schema_version = 2;
-            preferences_changed = true;
         }
         state.plugins = next;
         update_service_dependency_issues(&mut state.plugins);
@@ -305,10 +352,93 @@ impl PluginManager {
             .collect()
     }
 
+    /// Installs a local package directory passed by a development launch script.
+    /// This entry point is unavailable in release builds and uses the same package
+    /// validation and atomic replacement path as the developer directory picker.
+    #[cfg(debug_assertions)]
+    pub fn install_debug_directory(
+        &self,
+        source: PathBuf,
+    ) -> Result<Vec<PluginRuntimeState>, PluginError> {
+        if !source.is_dir() {
+            return Err(plugin_error(
+                "INVALID_REQUEST",
+                "The configured development plugin directory does not exist.",
+            ));
+        }
+        let manifest = plugin_package::manifest_for_install_source(&source)
+            .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
+        self.install(source, true)?;
+        self.set_enabled(&manifest.id, true)
+    }
+
+    fn install_catalog_package(
+        &self,
+        source: PathBuf,
+        entry: &PluginCatalogEntry,
+    ) -> Result<Vec<PluginRuntimeState>, PluginError> {
+        let manifest = plugin_package::manifest_for_install_source(&source)
+            .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
+        let manifest_capabilities = manifest
+            .capabilities
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let catalog_capabilities = entry.capabilities.iter().cloned().collect::<BTreeSet<_>>();
+        let manifest_matches = manifest.id == entry.id
+            && manifest.name == entry.name
+            && manifest.version == entry.version
+            && manifest_capabilities == catalog_capabilities
+            && manifest.host_compatibility.min_core_version
+                == entry.host_compatibility.min_core_version
+            && manifest.host_compatibility.max_core_version_exclusive
+                == entry.host_compatibility.max_core_version_exclusive
+            && manifest.host_compatibility.protocol.min_version
+                == entry.host_compatibility.protocol.min_version
+            && manifest.host_compatibility.protocol.max_version_exclusive
+                == entry.host_compatibility.protocol.max_version_exclusive
+            && manifest.ui.as_ref().map(|ui| {
+                (
+                    &ui.bridge_compatibility.min_version,
+                    &ui.bridge_compatibility.max_version_exclusive,
+                )
+            }) == entry.ui_bridge_compatibility.as_ref().map(|compatibility| {
+                (
+                    &compatibility.min_version,
+                    &compatibility.max_version_exclusive,
+                )
+            })
+            && manifest.platform.os == entry.platform.os
+            && manifest.platform.architecture == entry.platform.architecture
+            && manifest.platform.abi == entry.platform.abi;
+        if !manifest_matches {
+            return Err(plugin_error(
+                "CATALOG_MISMATCH",
+                "The downloaded package metadata does not match the reviewed catalog entry.",
+            ));
+        }
+        if !plugin_package::manifest_is_compatible(&manifest) {
+            return Err(plugin_error(
+                "INCOMPATIBLE_CORE",
+                "This plugin version is incompatible with the current Core.",
+            ));
+        }
+        self.install_with_capabilities(source, true, Some(&entry.capabilities))
+    }
+
     fn install(
         &self,
         source: PathBuf,
         overwrite: bool,
+    ) -> Result<Vec<PluginRuntimeState>, PluginError> {
+        self.install_with_capabilities(source, overwrite, None)
+    }
+
+    fn install_with_capabilities(
+        &self,
+        source: PathBuf,
+        overwrite: bool,
+        approved_capabilities: Option<&[String]>,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
         let source_manifest = plugin_package::manifest_for_install_source(&source)
             .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
@@ -356,7 +486,7 @@ impl PluginManager {
         };
         let plugin_id = inspected.manifest.id.clone();
         let version = inspected.manifest.version.clone();
-        let grant_key = capability_grant_key(&plugin_id, inspected.publisher_key_id.as_deref());
+        let grant_key = capability_grant_key(&plugin_id);
         if !inspected.compatible && previous_version.is_some() {
             return Err(plugin_error(
                 "INCOMPATIBLE_CORE",
@@ -378,11 +508,18 @@ impl PluginManager {
                 .enabled_plugins
                 .entry(plugin_id.clone())
                 .or_insert(true);
-            state
-                .preferences
-                .granted_capabilities
-                .entry(grant_key)
-                .or_insert_with(|| inspected.manifest.capabilities.clone());
+            if let Some(approved) = approved_capabilities {
+                state
+                    .preferences
+                    .granted_capabilities
+                    .insert(grant_key, approved.to_vec());
+            } else {
+                state
+                    .preferences
+                    .granted_capabilities
+                    .entry(grant_key)
+                    .or_insert_with(|| inspected.manifest.capabilities.clone());
+            }
             persist_preferences(&self.inner.app_data_dir, &state.preferences).map_err(|error| {
                 plugin_error(
                     "INTERNAL",
@@ -398,42 +535,43 @@ impl PluginManager {
                 && snapshot.enabled
                 && snapshot.service_dependency_issues.is_empty()
         });
-        if should_start {
-            if let Err(error) = self.inner.start_one(&plugin_id) {
-                if let Some(previous_version) = previous_version {
-                    let rollback = (|| {
-                        let mut state = self.inner.state.lock().map_err(|_| {
-                            plugin_error("INTERNAL", "Plugin state is unavailable.")
-                        })?;
-                        state
-                            .preferences
-                            .active_versions
-                            .insert(plugin_id.clone(), previous_version);
-                        persist_preferences(&self.inner.app_data_dir, &state.preferences).map_err(
-                            |save_error| {
-                                plugin_error(
-                                    "INTERNAL",
-                                    &format!("Could not persist plugin rollback: {save_error}"),
-                                )
-                            },
-                        )?;
-                        drop(state);
-                        self.refresh()?;
-                        self.inner.start_one(&plugin_id)
-                    })();
-                    if let Err(rollback_error) = rollback {
-                        return Err(plugin_error(
-                            "PLUGIN_START_FAILED",
-                            &format!(
-                                "New plugin version failed to start ({}); rollback also failed ({}).",
-                                error.message, rollback_error.message
-                            ),
-                        ));
-                    }
-                    // Keep the installed package available for inspection and recovery.
-                    return Err(error);
-                }
+        if should_start
+            && let Err(error) = self.inner.start_one(&plugin_id)
+            && let Some(previous_version) = previous_version
+        {
+            let rollback = (|| {
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?;
+                state
+                    .preferences
+                    .active_versions
+                    .insert(plugin_id.clone(), previous_version);
+                persist_preferences(&self.inner.app_data_dir, &state.preferences).map_err(
+                    |save_error| {
+                        plugin_error(
+                            "INTERNAL",
+                            &format!("Could not persist plugin rollback: {save_error}"),
+                        )
+                    },
+                )?;
+                drop(state);
+                self.refresh()?;
+                self.inner.start_one(&plugin_id)
+            })();
+            if let Err(rollback_error) = rollback {
+                return Err(plugin_error(
+                    "PLUGIN_START_FAILED",
+                    &format!(
+                        "New plugin version failed to start ({}); rollback also failed ({}).",
+                        error.message, rollback_error.message
+                    ),
+                ));
             }
+            // Keep the installed package available for inspection and recovery.
+            return Err(error);
         }
         Ok(self.snapshots())
     }
@@ -543,7 +681,7 @@ impl PluginManager {
                 .plugins
                 .get(plugin_id)
                 .ok_or_else(|| not_installed(plugin_id))?;
-            let grant_key = capability_grant_key(plugin_id, record.publisher_key_id.as_deref());
+            let grant_key = capability_grant_key(plugin_id);
             let requested = record
                 .snapshot
                 .manifest
@@ -963,7 +1101,6 @@ impl PluginManagerInner {
                 contract,
                 self.app_data_dir.join("plugin-data").join(plugin_id),
                 self.documents_dir.clone(),
-                snapshot.granted_capabilities.clone(),
                 &contract_sha256,
             )
         })();
@@ -1001,8 +1138,369 @@ pub fn plugins_list(
     Ok(manager.snapshots())
 }
 
-/// Opens a native picker; release builds accept signed .wplug archives, debug builds accept
-/// an unpacked developer package directory so local examples can be tested without a signing key.
+/// Reads the reviewed, public plugin catalog. A validated last-known copy is returned offline.
+#[tauri::command]
+pub async fn plugins_catalog_list(
+    window: WebviewWindow,
+    context: State<'_, AppContext>,
+    manager: State<'_, PluginManager>,
+) -> Result<PluginCatalogSnapshot, PluginError> {
+    ensure_main(&window).map_err(|error| plugin_error("INVALID_REQUEST", &error.message))?;
+    let app_data_dir = context.app_data_dir.clone();
+    let client = wonderland_net::PluginCatalogClient::new()
+        .map_err(|error| plugin_error("CATALOG_UNAVAILABLE", &error.to_string()))?;
+    let (index, stale) = match client.get_index().await {
+        Ok(bytes) => {
+            let index = parse_catalog_index(&bytes)?;
+            let _ = fs::write(app_data_dir.join(CATALOG_CACHE_FILE), &bytes);
+            (index, false)
+        }
+        Err(network_error) => {
+            let cached = fs::read(app_data_dir.join(CATALOG_CACHE_FILE))
+                .map_err(|_| plugin_error("CATALOG_UNAVAILABLE", &network_error.to_string()))?;
+            (parse_catalog_index(&cached)?, true)
+        }
+    };
+    let installed_versions = manager
+        .snapshots()
+        .into_iter()
+        .map(|state| (state.manifest.id, state.manifest.version))
+        .collect::<BTreeMap<_, _>>();
+    let plugins = index
+        .plugins
+        .into_iter()
+        .map(|entry| {
+            let compatible = catalog_entry_is_compatible(&entry);
+            let installed_version = installed_versions.get(&entry.id).cloned();
+            let installable = compatible
+                && installed_version.as_deref().is_none_or(|installed| {
+                    let current = Version::parse(&entry.version);
+                    let installed = Version::parse(installed);
+                    current
+                        .ok()
+                        .zip(installed.ok())
+                        .is_some_and(|(current, installed)| current > installed)
+                });
+            PluginCatalogItem {
+                entry,
+                compatible,
+                installed_version,
+                installable,
+            }
+        })
+        .collect();
+    Ok(PluginCatalogSnapshot {
+        generated_at: index.generated_at,
+        stale,
+        plugins,
+    })
+}
+
+/// Downloads one reviewed catalog version, verifies its digest and manifest, then installs it
+/// through the same package validation and atomic replacement path as a local .wplug file.
+#[tauri::command]
+pub async fn plugins_catalog_install(
+    window: WebviewWindow,
+    context: State<'_, AppContext>,
+    manager: State<'_, PluginManager>,
+    plugin_id: String,
+    version: String,
+    expected_sha256: String,
+    approved_capabilities: Vec<String>,
+) -> Result<Vec<PluginRuntimeState>, PluginError> {
+    ensure_main(&window).map_err(|error| plugin_error("INVALID_REQUEST", &error.message))?;
+    if !valid_plugin_id(&plugin_id) {
+        return Err(plugin_error("INVALID_REQUEST", "Plugin ID is invalid."));
+    }
+    let app_data_dir = context.app_data_dir.clone();
+    let client = wonderland_net::PluginCatalogClient::new()
+        .map_err(|error| plugin_error("CATALOG_UNAVAILABLE", &error.to_string()))?;
+    let catalog_bytes = client
+        .get_index()
+        .await
+        .map_err(|error| plugin_error("CATALOG_UNAVAILABLE", &error.to_string()))?;
+    let index = parse_catalog_index(&catalog_bytes)?;
+    let entry = index
+        .plugins
+        .into_iter()
+        .find(|entry| entry.id == plugin_id && entry.version == version)
+        .ok_or_else(|| {
+            plugin_error(
+                "CATALOG_VERSION_MISSING",
+                "This plugin version is no longer listed in the catalog. Refresh and try again.",
+            )
+        })?;
+    if !catalog_entry_is_compatible(&entry) {
+        return Err(plugin_error(
+            "INCOMPATIBLE_CORE",
+            "This plugin version is incompatible with the current Windows build.",
+        ));
+    }
+    if entry.sha256 != expected_sha256 {
+        return Err(plugin_error(
+            "CATALOG_CHANGED",
+            "The package changed after the catalog was displayed. Refresh the catalog and review it again.",
+        ));
+    }
+    let available_version = Version::parse(&entry.version)
+        .map_err(|_| plugin_error("INVALID_CATALOG", "Plugin version is invalid."))?;
+    if let Some(installed) = manager
+        .snapshots()
+        .into_iter()
+        .find(|state| state.manifest.id == entry.id)
+        .and_then(|state| Version::parse(&state.manifest.version).ok())
+        && available_version <= installed
+    {
+        return Err(plugin_error(
+            "CATALOG_VERSION_NOT_NEWER",
+            "The catalog does not contain a newer plugin version.",
+        ));
+    }
+    let approved = approved_capabilities
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let requested = entry.capabilities.iter().cloned().collect::<BTreeSet<_>>();
+    if approved.len() != approved_capabilities.len() || approved != requested {
+        return Err(plugin_error(
+            "CAPABILITY_APPROVAL_REQUIRED",
+            "Confirm every capability requested by the catalog entry before installing.",
+        ));
+    }
+
+    let package_bytes = client
+        .download_package(&entry.download_url)
+        .await
+        .map_err(|error| plugin_error("DOWNLOAD_FAILED", &error.to_string()))?;
+    let digest = hex::encode(Sha256::digest(&package_bytes));
+    if package_bytes.len() as u64 != entry.size_bytes || digest != entry.sha256 {
+        return Err(plugin_error(
+            "PACKAGE_CHECKSUM_MISMATCH",
+            "The downloaded package does not match the reviewed catalog checksum.",
+        ));
+    }
+
+    let download_dir = app_data_dir.join("plugin-downloads");
+    fs::create_dir_all(&download_dir)
+        .map_err(|error| plugin_error("LOCAL_IO", &format!("Cannot prepare download: {error}")))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let source = download_dir.join(format!(
+        "{}-{}-{}-{}.wplug",
+        entry.id,
+        entry.version,
+        std::process::id(),
+        nonce
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&source)
+        .map_err(|error| plugin_error("LOCAL_IO", &format!("Cannot save download: {error}")))?;
+    file.write_all(&package_bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| plugin_error("LOCAL_IO", &format!("Cannot save download: {error}")))?;
+    drop(file);
+
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = manager.install_catalog_package(source.clone(), &entry);
+        let _ = fs::remove_file(source);
+        result
+    })
+    .await
+    .map_err(|error| plugin_error("INTERNAL", &format!("Plugin installation failed: {error}")))?
+}
+
+fn parse_catalog_index(bytes: &[u8]) -> Result<PluginCatalogIndex, PluginError> {
+    if bytes.len() > CATALOG_MAX_BYTES {
+        return Err(plugin_error(
+            "INVALID_CATALOG",
+            "Plugin catalog is too large.",
+        ));
+    }
+    let index: PluginCatalogIndex = serde_json::from_slice(bytes)
+        .map_err(|_| plugin_error("INVALID_CATALOG", "Plugin catalog format is invalid."))?;
+    if index.schema_version != 1
+        || index.plugins.len() > CATALOG_MAX_ITEMS
+        || index.generated_at.len() > 64
+        || chrono::DateTime::parse_from_rfc3339(&index.generated_at).is_err()
+    {
+        return Err(plugin_error(
+            "INVALID_CATALOG",
+            "Plugin catalog metadata is invalid.",
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for entry in &index.plugins {
+        validate_catalog_entry(entry)?;
+        if !ids.insert(entry.id.as_str()) {
+            return Err(plugin_error(
+                "INVALID_CATALOG",
+                "Plugin catalog contains duplicate IDs.",
+            ));
+        }
+    }
+    Ok(index)
+}
+
+fn validate_catalog_entry(entry: &PluginCatalogEntry) -> Result<(), PluginError> {
+    let version = Version::parse(&entry.version).ok();
+    let min_core = Version::parse(&entry.host_compatibility.min_core_version).ok();
+    let max_core = Version::parse(&entry.host_compatibility.max_core_version_exclusive).ok();
+    let min_protocol = Version::parse(&entry.host_compatibility.protocol.min_version).ok();
+    let max_protocol =
+        Version::parse(&entry.host_compatibility.protocol.max_version_exclusive).ok();
+    let release_prefix = format!("{}/releases/download/", entry.repository_url);
+    let release_tail = entry.download_url.strip_prefix(&release_prefix);
+    let release_path_valid = release_tail.is_some_and(|tail| {
+        let mut pieces = tail.split('/');
+        let tag = pieces.next().unwrap_or_default();
+        let file = pieces.next().unwrap_or_default();
+        pieces.next().is_none()
+            && !tag.is_empty()
+            && (tag == entry.version || tag == format!("v{}", entry.version))
+            && tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            && file
+                == format!(
+                    "{}-{}-windows-{}.wplug",
+                    entry.id, entry.version, entry.platform.architecture
+                )
+    });
+    let capabilities: BTreeSet<_> = entry.capabilities.iter().collect();
+    let valid_release_notes = entry.release_notes_url.as_ref().is_none_or(|url| {
+        let prefix = format!("{}/releases/tag/", entry.repository_url);
+        url.strip_prefix(&prefix).is_some_and(|tag| {
+            !tag.is_empty()
+                && tag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        })
+    });
+    if !valid_plugin_id(&entry.id)
+        || entry.name.trim().is_empty()
+        || entry.name.chars().count() > 120
+        || entry.description.chars().count() > 2000
+        || entry.author.trim().is_empty()
+        || entry.author.chars().count() > 120
+        || !valid_github_repository_url(&entry.repository_url)
+        || version.is_none()
+        || version
+            .as_ref()
+            .is_some_and(|version| !version.build.is_empty())
+        || min_core.is_none()
+        || max_core.is_none()
+        || min_core
+            .as_ref()
+            .zip(max_core.as_ref())
+            .is_some_and(|(min, max)| min >= max)
+        || min_protocol.is_none()
+        || max_protocol.is_none()
+        || min_protocol
+            .as_ref()
+            .zip(max_protocol.as_ref())
+            .is_some_and(|(min, max)| min >= max)
+        || entry
+            .ui_bridge_compatibility
+            .as_ref()
+            .is_some_and(|compatibility| {
+                let min = Version::parse(&compatibility.min_version);
+                let max = Version::parse(&compatibility.max_version_exclusive);
+                min.is_err()
+                    || max.is_err()
+                    || min.ok().zip(max.ok()).is_some_and(|(min, max)| min >= max)
+            })
+        || entry.platform.os != "windows"
+        || !["x86_64", "aarch64"].contains(&entry.platform.architecture.as_str())
+        || entry.platform.abi != "msvc"
+        || !release_path_valid
+        || !wonderland_net::is_valid_plugin_release_url(&entry.download_url)
+        || entry.sha256.len() != 64
+        || !entry
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || entry.size_bytes == 0
+        || entry.size_bytes > PLUGIN_PACKAGE_MAX_BYTES
+        || capabilities.len() != entry.capabilities.len()
+        || entry
+            .capabilities
+            .iter()
+            .any(|capability| capability.trim().is_empty() || capability.chars().count() > 128)
+        || !valid_release_notes
+    {
+        return Err(plugin_error(
+            "INVALID_CATALOG",
+            "A plugin catalog entry contains invalid metadata.",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_github_repository_url(raw: &str) -> bool {
+    let Some(path) = raw.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let parts = path.split('/').collect::<Vec<_>>();
+    parts.len() == 2
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        })
+}
+
+fn catalog_entry_is_compatible(entry: &PluginCatalogEntry) -> bool {
+    let Ok(core) = Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return false;
+    };
+    let Ok(protocol) = Version::parse(wonderland_plugin_protocol::PROTOCOL_VERSION) else {
+        return false;
+    };
+    let Ok(min_core) = Version::parse(&entry.host_compatibility.min_core_version) else {
+        return false;
+    };
+    let Ok(max_core) = Version::parse(&entry.host_compatibility.max_core_version_exclusive) else {
+        return false;
+    };
+    let Ok(min_protocol) = Version::parse(&entry.host_compatibility.protocol.min_version) else {
+        return false;
+    };
+    let Ok(max_protocol) = Version::parse(&entry.host_compatibility.protocol.max_version_exclusive)
+    else {
+        return false;
+    };
+    let ui_compatible = entry
+        .ui_bridge_compatibility
+        .as_ref()
+        .is_none_or(|compatibility| {
+            let (Ok(current), Ok(min), Ok(max)) = (
+                Version::parse(wonderland_plugin_protocol::UI_BRIDGE_VERSION),
+                Version::parse(&compatibility.min_version),
+                Version::parse(&compatibility.max_version_exclusive),
+            ) else {
+                return false;
+            };
+            current >= min && current < max
+        });
+    entry.platform.os == "windows"
+        && (cfg!(target_arch = "x86_64") && entry.platform.architecture == "x86_64"
+            || cfg!(target_arch = "aarch64") && entry.platform.architecture == "aarch64")
+        && entry.platform.abi == "msvc"
+        && core >= min_core
+        && core < max_core
+        && protocol >= min_protocol
+        && protocol < max_protocol
+        && ui_compatible
+}
+
+/// Opens a native picker; release builds accept .wplug archives, while debug builds also accept
+/// an unpacked developer package directory.
 #[tauri::command]
 pub async fn plugins_install(
     window: WebviewWindow,
@@ -1014,9 +1512,7 @@ pub async fn plugins_install(
     let source = tauri::async_runtime::spawn_blocking(move || {
         let dialog = picker_app.dialog().file();
         if cfg!(debug_assertions) {
-            dialog
-                .set_title("选择未签名的插件开发目录")
-                .blocking_pick_folder()
+            dialog.set_title("选择插件开发目录").blocking_pick_folder()
         } else {
             dialog
                 .add_filter("Wonderland Plugin", &["wplug"])
@@ -1156,7 +1652,7 @@ fn load_preferences(app_data_dir: &Path) -> (Preferences, Option<String>) {
             .and_then(|bytes| {
                 serde_json::from_slice::<Preferences>(&bytes).map_err(|error| error.to_string())
             }) {
-            Ok(preferences) if (1..=2).contains(&preferences.schema_version) => (preferences, None),
+            Ok(preferences) if (1..=3).contains(&preferences.schema_version) => (preferences, None),
             Ok(_) => backup_invalid_config(&current, "Unsupported plugin manager config version."),
             Err(error) => backup_invalid_config(
                 &current,
@@ -1322,7 +1818,6 @@ fn invalid_snapshot(id: &str, message: &str) -> PluginRuntimeState {
             requires: Vec::new(),
         },
         installation: InstallationState::Invalid,
-        trusted: false,
         enabled: false,
         runtime: RuntimeState::Stopped,
         last_error: Some(failure("INVALID_PACKAGE", message)),
@@ -1512,9 +2007,34 @@ fn ensure_main(window: &WebviewWindow) -> Result<(), PluginError> {
     })
 }
 
-fn capability_grant_key(plugin_id: &str, publisher_key_id: Option<&str>) -> String {
-    format!(
-        "{plugin_id}@{}",
-        publisher_key_id.unwrap_or("untrusted-development")
-    )
+fn capability_grant_key(plugin_id: &str) -> String {
+    plugin_id.to_owned()
+}
+
+fn migrate_capability_grants(
+    grants: BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut merged: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (key, capabilities) in grants {
+        let plugin_id = key
+            .split_once('@')
+            .map(|(plugin_id, _)| plugin_id)
+            .filter(|plugin_id| !plugin_id.is_empty())
+            .unwrap_or(&key)
+            .to_owned();
+        let capabilities = capabilities.into_iter().collect::<BTreeSet<_>>();
+        match merged.entry(plugin_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(capabilities);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let intersection = entry.get().intersection(&capabilities).cloned().collect();
+                *entry.get_mut() = intersection;
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(plugin_id, capabilities)| (plugin_id, capabilities.into_iter().collect()))
+        .collect()
 }

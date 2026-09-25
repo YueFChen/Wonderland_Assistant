@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,10 +64,10 @@ impl PluginProcess {
         contract: Value,
         data_dir: PathBuf,
         documents_dir: PathBuf,
-        granted_capabilities: Vec<String>,
         contract_sha256: &str,
     ) -> Result<Arc<Self>, PluginError> {
         let plugin_id = state.manifest.id.clone();
+        let granted_capabilities = state.granted_capabilities.clone();
         let mut command = Command::new(executable);
         command
             .current_dir(
@@ -88,6 +90,10 @@ impl PluginProcess {
                 command.env(key, value);
             }
         }
+        // Plugin backends are console executables. A GUI host must suppress the
+        // console window while keeping their piped stdio protocol available.
+        #[cfg(windows)]
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         let mut child = command.spawn().map_err(|error| PluginError {
             code: "PLUGIN_START_FAILED".to_owned(),
             message: format!("Unable to start plugin backend: {error}"),
@@ -116,7 +122,10 @@ impl PluginProcess {
             plugin_id: plugin_id.clone(),
             granted_capabilities: granted_capabilities.iter().cloned().collect(),
             data_dir,
-            export_dir: documents_dir.join("Wonderland Assistant").join(&plugin_id).join("Exports"),
+            export_dir: documents_dir
+                .join("Wonderland Assistant")
+                .join(&plugin_id)
+                .join("Exports"),
             picked_files: Mutex::new(HashMap::new()),
         });
 
@@ -351,7 +360,7 @@ fn read_stdout(
             .take((MAX_FRAME_BYTES + 1) as u64)
             .read_until(b'\n', &mut line);
         let count = match result {
-            Ok(count) if count == 0 => {
+            Ok(0) => {
                 break plugin_error("PLUGIN_CRASHED", "Plugin stdout closed.");
             }
             Ok(count) => count,
@@ -391,14 +400,12 @@ fn read_stdout(
             first_frame = false;
             let hello =
                 serde_json::from_value::<PluginHello>(frame).map_err(|error| error.to_string());
-            if let Some(process) = process.upgrade() {
-                if let Ok(mut waiter) = process.hello_waiter.lock() {
-                    if let Some(waiter) = waiter.take() {
-                        let _ = waiter.send(
-                            hello.map_err(|message| format!("Invalid plugin handshake: {message}")),
-                        );
-                    }
-                }
+            if let Some(process) = process.upgrade()
+                && let Ok(mut waiter) = process.hello_waiter.lock()
+                && let Some(waiter) = waiter.take()
+            {
+                let _ = waiter
+                    .send(hello.map_err(|message| format!("Invalid plugin handshake: {message}")));
             }
             continue;
         }
@@ -541,10 +548,10 @@ fn read_stdout(
 
     if let Some(process) = process.upgrade() {
         process.alive.store(false, Ordering::Release);
-        if let Ok(mut waiter) = process.hello_waiter.lock() {
-            if let Some(waiter) = waiter.take() {
-                let _ = waiter.send(Err(exit_error.message.clone()));
-            }
+        if let Ok(mut waiter) = process.hello_waiter.lock()
+            && let Some(waiter) = waiter.take()
+        {
+            let _ = waiter.send(Err(exit_error.message.clone()));
         }
         process.fail_pending(exit_error);
     }
@@ -562,7 +569,10 @@ impl PluginProcess {
             "core.account.authed_get" => "account.authed_get",
             "core.network.public" => "network.public",
             "core.network.model" => "network.model",
-            "core.secrets.plugin.get" | "core.secrets.plugin.set" | "core.secrets.plugin.delete" | "core.secrets.plugin.has" => "secrets.plugin",
+            "core.secrets.plugin.get"
+            | "core.secrets.plugin.set"
+            | "core.secrets.plugin.delete"
+            | "core.secrets.plugin.has" => "secrets.plugin",
             "core.files.pick" | "core.files.read" => "files.pick",
             "core.files.export" | "core.files.export_dir" => "files.export",
             "core.files.reveal_own" => "files.reveal_own",
@@ -582,7 +592,10 @@ impl PluginProcess {
             ));
         }
         if method == "core.network.model" && !self.granted_capabilities.contains("secrets.plugin") {
-            return Err(plugin_error("UNAUTHORIZED", "Model requests require the secrets.plugin capability."));
+            return Err(plugin_error(
+                "UNAUTHORIZED",
+                "Model requests require the secrets.plugin capability.",
+            ));
         }
 
         match method {
@@ -711,9 +724,13 @@ impl PluginProcess {
             .filter(|handle| !handle.is_empty() && handle.len() <= 128)
             .ok_or_else(|| plugin_error("INVALID_INPUT", "File handle is invalid."))?;
         if params.get("offset").is_some() || params.get("chunkBytes").is_some() {
-            let offset = params.get("offset").and_then(Value::as_u64)
+            let offset = params
+                .get("offset")
+                .and_then(Value::as_u64)
                 .ok_or_else(|| plugin_error("INVALID_INPUT", "File chunk offset is invalid."))?;
-            let chunk_bytes = params.get("chunkBytes").and_then(Value::as_u64)
+            let chunk_bytes = params
+                .get("chunkBytes")
+                .and_then(Value::as_u64)
                 .filter(|size| (1..=MAX_PICKED_FILE_CHUNK_BYTES).contains(size))
                 .ok_or_else(|| plugin_error("INVALID_INPUT", "File chunk size is invalid."))?;
             return self.read_picked_file_chunk(handle, offset, chunk_bytes);
@@ -733,7 +750,10 @@ impl PluginProcess {
                 &format!("Cannot inspect selected file: {error}"),
             )
         })?;
-        if !metadata.is_file() || metadata.len() > picked.max_bytes || metadata.len() > MAX_PICKED_FILE_INLINE_BYTES {
+        if !metadata.is_file()
+            || metadata.len() > picked.max_bytes
+            || metadata.len() > MAX_PICKED_FILE_INLINE_BYTES
+        {
             return Err(plugin_error(
                 "RESOURCE_LIMIT",
                 "Selected file exceeds its size limit.",
@@ -761,17 +781,28 @@ impl PluginProcess {
         }))
     }
 
-    fn read_picked_file_chunk(&self, handle: &str, offset: u64, chunk_bytes: u64) -> Result<Value, PluginError> {
-        let mut picked_files = self.picked_files.lock()
+    fn read_picked_file_chunk(
+        &self,
+        handle: &str,
+        offset: u64,
+        chunk_bytes: u64,
+    ) -> Result<Value, PluginError> {
+        let mut picked_files = self
+            .picked_files
+            .lock()
             .map_err(|_| plugin_error("INTERNAL", "File handle table is unavailable."))?;
-        let picked = picked_files.get(handle)
+        let picked = picked_files
+            .get(handle)
             .ok_or_else(|| plugin_error("UNAUTHORIZED", "File handle is invalid or expired."))?;
         if Instant::now() > picked.expires_at {
             picked_files.remove(handle);
             return Err(plugin_error("UNAUTHORIZED", "File handle has expired."));
         }
         if offset > picked.size || offset > picked.max_bytes {
-            return Err(plugin_error("INVALID_INPUT", "File chunk offset is outside the selected file."));
+            return Err(plugin_error(
+                "INVALID_INPUT",
+                "File chunk offset is outside the selected file.",
+            ));
         }
         let path = picked.path.clone();
         let name = picked.name.clone();
@@ -782,16 +813,23 @@ impl PluginProcess {
         let read_size = remaining.min(chunk_bytes);
         let is_final = offset + read_size >= expected_size;
         drop(picked_files);
-        let metadata = fs::metadata(&path).map_err(|_| plugin_error("INTERNAL", "Selected file is unavailable."))?;
+        let metadata = fs::metadata(&path)
+            .map_err(|_| plugin_error("INTERNAL", "Selected file is unavailable."))?;
         if !metadata.is_file() || metadata.len() != expected_size || metadata.len() > max_bytes {
-            return Err(plugin_error("RESOURCE_LIMIT", "Selected file changed or exceeds its size limit."));
+            return Err(plugin_error(
+                "RESOURCE_LIMIT",
+                "Selected file changed or exceeds its size limit.",
+            ));
         }
-        let mut file = fs::File::open(&path).map_err(|_| plugin_error("INTERNAL", "Selected file cannot be read."))?;
-        file.seek(SeekFrom::Start(offset)).map_err(|_| plugin_error("INTERNAL", "Selected file cannot be read."))?;
+        let mut file = fs::File::open(&path)
+            .map_err(|_| plugin_error("INTERNAL", "Selected file cannot be read."))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| plugin_error("INTERNAL", "Selected file cannot be read."))?;
         let mut bytes = vec![0; read_size as usize];
-        file.read_exact(&mut bytes).map_err(|_| plugin_error("INTERNAL", "Selected file cannot be read."))?;
-        if is_final {
-            if let Ok(mut table) = self.picked_files.lock() { table.remove(handle); }
+        file.read_exact(&mut bytes)
+            .map_err(|_| plugin_error("INTERNAL", "Selected file cannot be read."))?;
+        if is_final && let Ok(mut table) = self.picked_files.lock() {
+            table.remove(handle);
         }
         Ok(json!({
             "name": name,
@@ -848,28 +886,50 @@ impl PluginProcess {
 
     fn export_dir(&self) -> Result<Value, PluginError> {
         fs::create_dir_all(&self.export_dir).map_err(|error| {
-            plugin_error("INTERNAL", &format!("Cannot create export directory: {error}"))
+            plugin_error(
+                "INTERNAL",
+                &format!("Cannot create export directory: {error}"),
+            )
         })?;
         Ok(json!({ "path": self.export_dir.to_string_lossy() }))
     }
 
     fn secret_path(&self, key: &str) -> Result<PathBuf, PluginError> {
-        if key.is_empty() || key.len() > 120 || key == "." || key == ".."
-            || !key.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')) {
-            return Err(plugin_error("INVALID_INPUT", "Plugin secret key is invalid."));
+        if key.is_empty()
+            || key.len() > 120
+            || key == "."
+            || key == ".."
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(plugin_error(
+                "INVALID_INPUT",
+                "Plugin secret key is invalid.",
+            ));
         }
-        let app_data = self.data_dir.parent().and_then(Path::parent)
+        let app_data = self
+            .data_dir
+            .parent()
+            .and_then(Path::parent)
             .ok_or_else(|| plugin_error("INTERNAL", "Plugin secret directory is unavailable."))?;
-        Ok(app_data.join("plugin-secrets").join(&self.plugin_id).join(format!("{key}.dpapi")))
+        Ok(app_data
+            .join("plugin-secrets")
+            .join(&self.plugin_id)
+            .join(format!("{key}.dpapi")))
     }
 
     fn secret_get(&self, params: &Value) -> Result<Value, PluginError> {
-        let key = params.get("key").and_then(Value::as_str)
+        let key = params
+            .get("key")
+            .and_then(Value::as_str)
             .ok_or_else(|| plugin_error("INVALID_INPUT", "Plugin secret key is invalid."))?;
         let path = self.secret_path(key)?;
         let sealed = match fs::read(path) {
             Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(json!({ "value": null })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(json!({ "value": null }));
+            }
             Err(_) => return Err(plugin_error("INTERNAL", "Plugin secret is unavailable.")),
         };
         let plain = wonderland_secret::unseal(&sealed)
@@ -880,25 +940,39 @@ impl PluginProcess {
     }
 
     fn secret_set(&self, params: &Value) -> Result<Value, PluginError> {
-        let key = params.get("key").and_then(Value::as_str)
+        let key = params
+            .get("key")
+            .and_then(Value::as_str)
             .ok_or_else(|| plugin_error("INVALID_INPUT", "Plugin secret key is invalid."))?;
-        let value = params.get("value").and_then(Value::as_str)
+        let value = params
+            .get("value")
+            .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty() && value.len() <= 16_384)
             .ok_or_else(|| plugin_error("INVALID_INPUT", "Plugin secret value is invalid."))?;
         let path = self.secret_path(key)?;
-        let parent = path.parent().ok_or_else(|| plugin_error("INTERNAL", "Plugin secret directory is unavailable."))?;
-        fs::create_dir_all(parent).map_err(|_| plugin_error("INTERNAL", "Plugin secret directory cannot be created."))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| plugin_error("INTERNAL", "Plugin secret directory is unavailable."))?;
+        fs::create_dir_all(parent)
+            .map_err(|_| plugin_error("INTERNAL", "Plugin secret directory cannot be created."))?;
         let sealed = wonderland_secret::seal(value.as_bytes())
             .map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be protected."))?;
         let temp = path.with_extension("tmp");
-        fs::write(&temp, sealed).map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be written."))?;
-        if path.exists() { fs::remove_file(&path).map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be replaced."))?; }
-        fs::rename(&temp, &path).map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be committed."))?;
+        fs::write(&temp, sealed)
+            .map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be written."))?;
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be replaced."))?;
+        }
+        fs::rename(&temp, &path)
+            .map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be committed."))?;
         Ok(json!({ "ok": true }))
     }
 
     fn secret_delete(&self, params: &Value) -> Result<Value, PluginError> {
-        let key = params.get("key").and_then(Value::as_str)
+        let key = params
+            .get("key")
+            .and_then(Value::as_str)
             .ok_or_else(|| plugin_error("INVALID_INPUT", "Plugin secret key is invalid."))?;
         match fs::remove_file(self.secret_path(key)?) {
             Ok(()) => Ok(json!({ "ok": true })),
@@ -908,33 +982,58 @@ impl PluginProcess {
     }
 
     fn secret_has(&self, params: &Value) -> Result<Value, PluginError> {
-        let key = params.get("key").and_then(Value::as_str)
+        let key = params
+            .get("key")
+            .and_then(Value::as_str)
             .ok_or_else(|| plugin_error("INVALID_INPUT", "Plugin secret key is invalid."))?;
         Ok(json!({ "exists": self.secret_path(key)?.is_file() }))
     }
 
     fn network_model(&self, params: &Value) -> Result<Value, PluginError> {
-        let secret_id = params.get("secretId").and_then(Value::as_str)
+        let secret_id = params
+            .get("secretId")
+            .and_then(Value::as_str)
             .filter(|value| !value.is_empty() && value.len() <= 120)
             .ok_or_else(|| plugin_error("INVALID_INPUT", "Model secret reference is invalid."))?;
-        let base_url = params.get("baseUrl").and_then(Value::as_str)
+        let base_url = params
+            .get("baseUrl")
+            .and_then(Value::as_str)
             .filter(|value| value.len() <= 2048)
             .ok_or_else(|| plugin_error("INVALID_INPUT", "Model endpoint is invalid."))?;
-        let allow_loopback = params.get("allowLoopback").and_then(Value::as_bool).unwrap_or(false);
-        let timeout_seconds = params.get("timeoutSeconds").and_then(Value::as_u64)
+        let allow_loopback = params
+            .get("allowLoopback")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let timeout_seconds = params
+            .get("timeoutSeconds")
+            .and_then(Value::as_u64)
             .filter(|value| (10..=600).contains(value))
             .ok_or_else(|| plugin_error("INVALID_INPUT", "Model timeout is invalid."))?;
-        let path = params.get("path").and_then(Value::as_str)
-            .filter(|value| value.starts_with('/') && !value.starts_with("//") && value.len() <= 256)
+        let path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value.starts_with('/') && !value.starts_with("//") && value.len() <= 256
+            })
             .ok_or_else(|| plugin_error("INVALID_INPUT", "Model request path is invalid."))?;
-        let body = params.get("body").and_then(Value::as_str)
+        let body = params
+            .get("body")
+            .and_then(Value::as_str)
             .filter(|value| value.len() <= 4 * 1024 * 1024)
             .ok_or_else(|| plugin_error("RESOURCE_LIMIT", "Model request body is too large."))?;
-        let sealed = fs::read(self.secret_path(secret_id)?)
-            .map_err(|_| plugin_error("UNAUTHORIZED", "The selected model profile has no saved API key."))?;
-        let api_key = String::from_utf8(wonderland_secret::unseal(&sealed)
-            .map_err(|_| plugin_error("INTERNAL", "The selected model API key cannot be decrypted."))?)
-            .map_err(|_| plugin_error("INTERNAL", "The selected model API key is invalid."))?;
+        let sealed = fs::read(self.secret_path(secret_id)?).map_err(|_| {
+            plugin_error(
+                "UNAUTHORIZED",
+                "The selected model profile has no saved API key.",
+            )
+        })?;
+        let api_key = String::from_utf8(wonderland_secret::unseal(&sealed).map_err(|_| {
+            plugin_error(
+                "INTERNAL",
+                "The selected model API key cannot be decrypted.",
+            )
+        })?)
+        .map_err(|_| plugin_error("INTERNAL", "The selected model API key is invalid."))?;
         let endpoint = wonderland_net::ModelEndpoint {
             base_url: base_url.to_owned(),
             timeout: Duration::from_secs(timeout_seconds),
@@ -954,10 +1053,20 @@ impl PluginProcess {
             Some("knowledge_cache") if self.plugin_id == "knowledge_library" => {
                 let context = app.state::<wonderland_kernel::AppContext>();
                 let path = context.app_data_dir.join("plugins/knowledge/zh-cn/v1");
-                fs::create_dir_all(&path).map_err(|error| plugin_error("INTERNAL", &format!("Cannot create knowledge cache directory: {error}")))?;
+                fs::create_dir_all(&path).map_err(|error| {
+                    plugin_error(
+                        "INTERNAL",
+                        &format!("Cannot create knowledge cache directory: {error}"),
+                    )
+                })?;
                 return crate::reveal::open_dir(&path)
                     .map(|_| json!({ "ok": true }))
-                    .map_err(|error| plugin_error("INTERNAL", &format!("Cannot open knowledge cache directory: {error}")));
+                    .map_err(|error| {
+                        plugin_error(
+                            "INTERNAL",
+                            &format!("Cannot open knowledge cache directory: {error}"),
+                        )
+                    });
             }
             _ => return Err(plugin_error("INVALID_INPUT", "Reveal scope is invalid.")),
         };
@@ -977,19 +1086,20 @@ impl PluginProcess {
     }
 
     fn deliver(&self, request_id: &str, result: Result<Value, PluginError>) {
-        if let Ok(mut pending) = self.pending.lock() {
-            if let Some(sender) = pending.remove(request_id) {
-                let _ = sender.send(result);
-            }
+        if let Ok(mut pending) = self.pending.lock()
+            && let Some(sender) = pending.remove(request_id)
+        {
+            let _ = sender.send(result);
         }
     }
 }
 
 fn account_snapshot(app: &AppHandle) -> Result<Value, PluginError> {
     let context = app.state::<wonderland_kernel::AppContext>();
-    let account = context.account.as_ref().ok_or_else(|| {
-        plugin_error("NOT_RUNNING", "Core account service is unavailable.")
-    })?;
+    let account = context
+        .account
+        .as_ref()
+        .ok_or_else(|| plugin_error("NOT_RUNNING", "Core account service is unavailable."))?;
     serde_json::to_value(account.snapshot())
         .map_err(|_| plugin_error("INTERNAL", "Cannot serialize the Core account snapshot."))
 }
@@ -998,7 +1108,12 @@ fn knowledge_local_model(app: &AppHandle) -> Result<Value, PluginError> {
     let context = app.state::<wonderland_kernel::AppContext>();
     let cache_dir = context.app_data_dir.join("plugins/knowledge/zh-cn/v1");
     let models_dir = cache_dir.join("models");
-    fs::create_dir_all(&models_dir).map_err(|error| plugin_error("INTERNAL", &format!("Cannot create the approved knowledge model directory: {error}")))?;
+    fs::create_dir_all(&models_dir).map_err(|error| {
+        plugin_error(
+            "INTERNAL",
+            &format!("Cannot create the approved knowledge model directory: {error}"),
+        )
+    })?;
     Ok(json!({ "cacheDir": cache_dir, "modelsDir": models_dir }))
 }
 
@@ -1007,16 +1122,36 @@ fn knowledge_local_model(app: &AppHandle) -> Result<Value, PluginError> {
 fn open_official(params: &Value) -> Result<Value, PluginError> {
     let url = match params.get("target").and_then(Value::as_str) {
         Some("document") => {
-            let path_id = params.get("pathId").and_then(Value::as_str)
-                .filter(|value| !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "Official document identifier is invalid."))?;
+            let path_id = params
+                .get("pathId")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 128
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                })
+                .ok_or_else(|| {
+                    plugin_error("INVALID_INPUT", "Official document identifier is invalid.")
+                })?;
             format!("https://act.mihoyo.com/ys/ugc/tutorial/detail/{path_id}")
         }
         Some("onnx") => "https://github.com/microsoft/onnxruntime/releases".to_owned(),
         Some("model") => "https://huggingface.co/BAAI/bge-small-zh-v1.5".to_owned(),
-        _ => return Err(plugin_error("INVALID_INPUT", "Official browser destination is invalid.")),
+        _ => {
+            return Err(plugin_error(
+                "INVALID_INPUT",
+                "Official browser destination is invalid.",
+            ));
+        }
     };
-    crate::reveal::open_url(&url).map_err(|error| plugin_error("INTERNAL", &format!("Cannot open official browser destination: {error}")))?;
+    crate::reveal::open_url(&url).map_err(|error| {
+        plugin_error(
+            "INTERNAL",
+            &format!("Cannot open official browser destination: {error}"),
+        )
+    })?;
     Ok(json!({ "ok": true }))
 }
 
@@ -1038,69 +1173,122 @@ fn account_authed_get(app: &AppHandle, params: &Value) -> Result<Value, PluginEr
         .ok_or_else(|| plugin_error("INVALID_INPUT", "Account request query is invalid."))?
         .iter()
         .map(|item| {
-            let pair = item.as_array().filter(|pair| pair.len() == 2)
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "Account request query is invalid."))?;
-            let key = pair[0].as_str().filter(|value| value.len() <= 100)
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "Account request query is invalid."))?;
-            let value = pair[1].as_str().filter(|value| value.len() <= 512)
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "Account request query is invalid."))?;
+            let pair = item
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(|| {
+                    plugin_error("INVALID_INPUT", "Account request query is invalid.")
+                })?;
+            let key = pair[0]
+                .as_str()
+                .filter(|value| value.len() <= 100)
+                .ok_or_else(|| {
+                    plugin_error("INVALID_INPUT", "Account request query is invalid.")
+                })?;
+            let value = pair[1]
+                .as_str()
+                .filter(|value| value.len() <= 512)
+                .ok_or_else(|| {
+                    plugin_error("INVALID_INPUT", "Account request query is invalid.")
+                })?;
             Ok((key.to_owned(), value.to_owned()))
         })
         .collect::<Result<Vec<_>, PluginError>>()?;
     let context = app.state::<wonderland_kernel::AppContext>();
-    let account = context.account.as_ref().ok_or_else(|| {
-        plugin_error("NOT_RUNNING", "Core account service is unavailable.")
-    })?;
+    let account = context
+        .account
+        .as_ref()
+        .ok_or_else(|| plugin_error("NOT_RUNNING", "Core account service is unavailable."))?;
     let bytes = tauri::async_runtime::block_on(account.authed_get(account_key, path, &query))
-        .map_err(|error| plugin_error(
-            match error {
-                wonderland_kernel::KernelError::NotLoggedIn => "PLUGIN_MY_WONDERLAND_NOT_LOGGED_IN",
-                wonderland_kernel::KernelError::AccountNotFound(_) => "INVALID_INPUT",
-                wonderland_kernel::KernelError::SessionExpired => "PLUGIN_MY_WONDERLAND_SESSION_EXPIRED",
-                wonderland_kernel::KernelError::InvalidInput => "UNAUTHORIZED",
-                wonderland_kernel::KernelError::Timeout => "TIMEOUT",
-                wonderland_kernel::KernelError::Http(_) => "PLUGIN_MY_WONDERLAND_HTTP_ERROR",
-                _ => "INTERNAL",
-            },
-            "Core account request failed.",
-        ))?;
+        .map_err(|error| {
+            plugin_error(
+                match error {
+                    wonderland_kernel::KernelError::NotLoggedIn => {
+                        "PLUGIN_MY_WONDERLAND_NOT_LOGGED_IN"
+                    }
+                    wonderland_kernel::KernelError::AccountNotFound(_) => "INVALID_INPUT",
+                    wonderland_kernel::KernelError::SessionExpired => {
+                        "PLUGIN_MY_WONDERLAND_SESSION_EXPIRED"
+                    }
+                    wonderland_kernel::KernelError::InvalidInput => "UNAUTHORIZED",
+                    wonderland_kernel::KernelError::Timeout => "TIMEOUT",
+                    wonderland_kernel::KernelError::Http(_) => "PLUGIN_MY_WONDERLAND_HTTP_ERROR",
+                    _ => "INTERNAL",
+                },
+                "Core account request failed.",
+            )
+        })?;
     Ok(json!({ "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
 }
 
 fn network_public(params: &Value) -> Result<Value, PluginError> {
-    let method = params.get("method").and_then(Value::as_str)
+    let method = params
+        .get("method")
+        .and_then(Value::as_str)
         .filter(|method| matches!(*method, "GET" | "POST"))
         .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network method is invalid."))?;
-    let url = params.get("url").and_then(Value::as_str)
+    let url = params
+        .get("url")
+        .and_then(Value::as_str)
         .filter(|url| url.len() <= 2048 && url.starts_with("https://"))
         .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network URL is invalid."))?;
-    let headers = params.get("headers").and_then(Value::as_array)
+    let headers = params
+        .get("headers")
+        .and_then(Value::as_array)
         .filter(|headers| headers.len() <= 16)
         .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network headers are invalid."))?
         .iter()
         .map(|item| {
-            let pair = item.as_array().filter(|pair| pair.len() == 2)
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network headers are invalid."))?;
-            let name = pair[0].as_str().ok_or_else(|| plugin_error("INVALID_INPUT", "Public network headers are invalid."))?;
-            let value = pair[1].as_str().ok_or_else(|| plugin_error("INVALID_INPUT", "Public network headers are invalid."))?;
+            let pair = item
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(|| {
+                    plugin_error("INVALID_INPUT", "Public network headers are invalid.")
+                })?;
+            let name = pair[0].as_str().ok_or_else(|| {
+                plugin_error("INVALID_INPUT", "Public network headers are invalid.")
+            })?;
+            let value = pair[1].as_str().ok_or_else(|| {
+                plugin_error("INVALID_INPUT", "Public network headers are invalid.")
+            })?;
             let normalized = name.to_ascii_lowercase();
-            if !matches!(normalized.as_str(), "user-agent" | "origin" | "referer" | "x-rpc-client_type" | "x-rpc-language" | "accept")
-                || value.len() > 1024 || value.chars().any(char::is_control) {
-                return Err(plugin_error("INVALID_INPUT", "Public network header is not allowed."));
+            if !matches!(
+                normalized.as_str(),
+                "user-agent"
+                    | "origin"
+                    | "referer"
+                    | "x-rpc-client_type"
+                    | "x-rpc-language"
+                    | "accept"
+            ) || value.len() > 1024
+                || value.chars().any(char::is_control)
+            {
+                return Err(plugin_error(
+                    "INVALID_INPUT",
+                    "Public network header is not allowed.",
+                ));
             }
             Ok((normalized, value.to_owned()))
         })
         .collect::<Result<Vec<_>, PluginError>>()?;
-    let query = params.get("query").and_then(Value::as_array)
+    let query = params
+        .get("query")
+        .and_then(Value::as_array)
         .filter(|items| items.len() <= 32)
         .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network query is invalid."))?
         .iter()
         .map(|item| {
-            let pair = item.as_array().filter(|pair| pair.len() == 2)
+            let pair = item
+                .as_array()
+                .filter(|pair| pair.len() == 2)
                 .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network query is invalid."))?;
-            let key = pair[0].as_str().filter(|value| value.len() <= 100)
+            let key = pair[0]
+                .as_str()
+                .filter(|value| value.len() <= 100)
                 .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network query is invalid."))?;
-            let value = pair[1].as_str().filter(|value| value.len() <= 512)
+            let value = pair[1]
+                .as_str()
+                .filter(|value| value.len() <= 512)
                 .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network query is invalid."))?;
             Ok((key.to_owned(), value.to_owned()))
         })
@@ -1109,45 +1297,79 @@ fn network_public(params: &Value) -> Result<Value, PluginError> {
         "GET" => tauri::async_runtime::block_on(
             wonderland_net::HttpClient::new()
                 .map_err(|_| plugin_error("INTERNAL", "Public network client is unavailable."))?
-                .get_bytes(url, &headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect::<Vec<_>>(), &query),
+                .get_bytes(
+                    url,
+                    &headers
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str()))
+                        .collect::<Vec<_>>(),
+                    &query,
+                ),
         ),
         "POST" => {
             if !query.is_empty() {
-                return Err(plugin_error("INVALID_INPUT", "POST query parameters must be part of the URL."));
+                return Err(plugin_error(
+                    "INVALID_INPUT",
+                    "POST query parameters must be part of the URL.",
+                ));
             }
-            let body = params.get("body").and_then(Value::as_str)
+            let body = params
+                .get("body")
+                .and_then(Value::as_str)
                 .filter(|body| body.len() <= 1_048_576)
                 .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network body is invalid."))?;
             tauri::async_runtime::block_on(
                 wonderland_net::HttpClient::new()
                     .map_err(|_| plugin_error("INTERNAL", "Public network client is unavailable."))?
-                    .post_json(url, &headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect::<Vec<_>>(), body),
+                    .post_json(
+                        url,
+                        &headers
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_str()))
+                            .collect::<Vec<_>>(),
+                        body,
+                    ),
             )
         }
         _ => unreachable!(),
     }
-    .map_err(|error| plugin_error(
-        match error {
-            wonderland_kernel::KernelError::Timeout => "TIMEOUT",
-            wonderland_kernel::KernelError::InvalidInput => "UNAUTHORIZED",
-            wonderland_kernel::KernelError::Http(_) => "PLUGIN_NETWORK_HTTP_ERROR",
-            _ => "PLUGIN_NETWORK_REQUEST_FAILED",
-        },
-        "Public network request failed.",
-    ))?;
+    .map_err(|error| {
+        plugin_error(
+            match error {
+                wonderland_kernel::KernelError::Timeout => "TIMEOUT",
+                wonderland_kernel::KernelError::InvalidInput => "UNAUTHORIZED",
+                wonderland_kernel::KernelError::Http(_) => "PLUGIN_NETWORK_HTTP_ERROR",
+                _ => "PLUGIN_NETWORK_REQUEST_FAILED",
+            },
+            "Public network request failed.",
+        )
+    })?;
     Ok(json!({ "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
 }
 
 fn model_service_error(error: wonderland_net::ModelError) -> PluginError {
     match error {
-        wonderland_net::ModelError::Transient { status: Some(status), .. } => plugin_error(
+        wonderland_net::ModelError::Transient {
+            status: Some(status),
+            ..
+        } => plugin_error(
             "PLUGIN_TRANSLATOR_MODEL_TRANSIENT",
             &format!("Model service returned HTTP {status}."),
         ),
-        wonderland_net::ModelError::Transient { status: None, .. } => plugin_error("TIMEOUT", "Model service timed out or could not connect."),
-        wonderland_net::ModelError::Invalid(_) => plugin_error("PLUGIN_TRANSLATOR_MODEL_INVALID", "Model service response was invalid."),
-        wonderland_net::ModelError::Config(_) => plugin_error("INVALID_INPUT", "Model endpoint configuration is invalid."),
-        wonderland_net::ModelError::Indeterminate => plugin_error("PLUGIN_TRANSLATOR_MODEL_INDETERMINATE", "Model request completed without a confirmed response."),
+        wonderland_net::ModelError::Transient { status: None, .. } => {
+            plugin_error("TIMEOUT", "Model service timed out or could not connect.")
+        }
+        wonderland_net::ModelError::Invalid(_) => plugin_error(
+            "PLUGIN_TRANSLATOR_MODEL_INVALID",
+            "Model service response was invalid.",
+        ),
+        wonderland_net::ModelError::Config(_) => {
+            plugin_error("INVALID_INPUT", "Model endpoint configuration is invalid.")
+        }
+        wonderland_net::ModelError::Indeterminate => plugin_error(
+            "PLUGIN_TRANSLATOR_MODEL_INDETERMINATE",
+            "Model request completed without a confirmed response.",
+        ),
     }
 }
 
@@ -1188,7 +1410,14 @@ fn file_mime_type(extension: &str) -> Option<&'static str> {
 
 fn safe_export_name(name: &str) -> bool {
     name.len() <= 180
-        && matches!(Path::new(name).extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).as_deref(), Some("json" | "csv" | "xlsx"))
+        && matches!(
+            Path::new(name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("json" | "csv" | "xlsx")
+        )
         && Path::new(name).file_name().and_then(|file| file.to_str()) == Some(name)
         && !name
             .chars()

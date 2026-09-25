@@ -9,7 +9,10 @@ export interface WorkspaceLayoutState {
   collapsed: boolean
   pinnedIds: string[]
   hiddenIds: string[]
+  /** Ordering for the pinned workspace rail. */
   orderIds: string[]
+  /** Independent, freely arranged order for cards in All Activities. */
+  activityOrderIds: string[]
   openContributionIds: string[]
   activeContributionId: string | null
   activeSidebarContributionId: string | null
@@ -21,6 +24,7 @@ const EMPTY_LAYOUT: WorkspaceLayoutState = {
   pinnedIds: [],
   hiddenIds: [],
   orderIds: [],
+  activityOrderIds: [],
   openContributionIds: [],
   activeContributionId: null,
   activeSidebarContributionId: null,
@@ -36,6 +40,9 @@ export function readWorkspaceLayout(): WorkspaceLayoutState {
       pinnedIds: readIds(value.pinnedIds),
       hiddenIds: readIds(value.hiddenIds),
       orderIds: readIds(value.orderIds),
+      activityOrderIds: Array.isArray(value.activityOrderIds)
+        ? readIds(value.activityOrderIds)
+        : readIds(value.orderIds),
       openContributionIds: readIds(value.openContributionIds).slice(-MAX_OPEN_ACTIVITY_SURFACES),
       activeContributionId: typeof value.activeContributionId === 'string' && value.activeContributionId.length <= 128
         ? value.activeContributionId
@@ -128,9 +135,18 @@ export function useWorkspaceLayout() {
     })
   }, [update])
 
+  const reorderActivities = useCallback((orderedIds: readonly string[]) => {
+    update((current) => {
+      const ordered = unique(orderedIds)
+      const orderedSet = new Set(ordered)
+      const retained = current.activityOrderIds.filter((id) => !orderedSet.has(id))
+      return { ...current, activityOrderIds: [...ordered, ...retained] }
+    })
+  }, [update])
+
   const reset = useCallback(() => update(() => ({ ...EMPTY_LAYOUT })), [update])
 
-  return { layout, toggleCollapsed, togglePinned, toggleHidden, move, reset, update }
+  return { layout, toggleCollapsed, togglePinned, toggleHidden, move, reorderActivities, reset, update }
 }
 
 export function orderContributions<T extends { id: string; defaultOrder: number }>(
@@ -157,6 +173,7 @@ function normalizeLayout(layout: WorkspaceLayoutState): WorkspaceLayoutState {
     pinnedIds: unique(layout.pinnedIds),
     hiddenIds: unique(layout.hiddenIds),
     orderIds: unique(layout.orderIds),
+    activityOrderIds: unique(layout.activityOrderIds),
     openContributionIds: unique(layout.openContributionIds).slice(-MAX_OPEN_ACTIVITY_SURFACES),
     activeContributionId: layout.activeContributionId,
     activeSidebarContributionId: layout.activeSidebarContributionId,

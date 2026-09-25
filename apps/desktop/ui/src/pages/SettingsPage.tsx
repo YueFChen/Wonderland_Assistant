@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type {
   LogLevel,
   LogSettings,
@@ -10,7 +10,10 @@ import { Check, FolderOpen, HardDrive, ImagePlus, Monitor, Moon, Palette, Sun, T
 import { loggingApi } from '../logging/api'
 import { useTheme, type ResolvedTheme } from '../theme/ThemeProvider'
 import { userDataApi } from '../user-data/api'
+import { setStartupMemoryEnabled, startupMemoryEnabled } from '../startupMemory'
 import { t, type MessageKey } from '../i18n'
+import { AccountManagementSection } from './AccountSection'
+import { CoreUpdateCard } from '../components/CoreUpdateCard'
 
 /** 主题档位。自定义档的控件保持深色，与后端 `ThemeMode` 的语义一致。 */
 const MODES: { value: ThemeMode; labelKey: MessageKey; hintKey: MessageKey; icon: LucideIcon }[] = [
@@ -34,7 +37,7 @@ const LOG_LEVELS: { value: LogLevel; labelKey: MessageKey; hintKey: MessageKey }
   { value: 'trace', labelKey: 'settings.logLevel.trace', hintKey: 'settings.logLevel.traceHint' },
 ]
 
-/** 设置页：外观、用户数据与日志配置。 */
+/** 设置页：按账号、应用行为、外观、数据与诊断分组。 */
 export function SettingsPage() {
   const [userData, setUserData] = useState<UserDataState | null>(null)
   const [userDataFailure, setUserDataFailure] = useState('')
@@ -62,36 +65,93 @@ export function SettingsPage() {
 
   return (
     <section className="w-full">
-      <header className="mb-6">
+      <header className="mb-7">
         <h1 className="text-xl font-bold text-ink">{t('settings.title')}</h1>
-        <p className="mt-1.5 max-w-2xl text-sm leading-relaxed text-ink-muted">
-          {t('settings.description')}
-        </p>
+        <p className="mt-1 text-sm text-ink-faint">{t('settings.description')}</p>
       </header>
 
-      <div className="space-y-5">
-        {needsRestart && (
-          <div role="status" className="glass-card rounded-card border border-brand-400/60 p-4 sm:p-5">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div className="min-w-0 space-y-1">
-                <p className="font-semibold text-ink">{t('settings.restart.title')}</p>
-                {userData?.pending_path && <p className="break-all text-xs text-ink-muted">{t('settings.restart.data', { path: userData.pending_path })}</p>}
-              </div>
-              <button type="button" onClick={() => void restart()} className="rounded-lg bg-brand-600 px-4 py-2 text-sm text-white hover:bg-brand-500">
-                {t('settings.restart.now')}
-              </button>
+      <div className="space-y-7">
+        <SettingsGroup title={t('settings.section.account')}>
+          <AccountManagementSection />
+        </SettingsGroup>
+
+        <SettingsGroup title={t('settings.section.app')} hint={t('settings.section.appHint')}>
+          <div className="grid grid-cols-1 items-stretch gap-4 md:grid-cols-2">
+            <StartupMemoryCard />
+            <CoreUpdateCard />
+          </div>
+        </SettingsGroup>
+
+        <SettingsGroup title={t('settings.section.appearance')}>
+          <AppearanceCard />
+        </SettingsGroup>
+
+        <SettingsGroup title={t('settings.section.maintenance')} hint={t('settings.section.maintenanceHint')}>
+          <div className="settings-layout">
+            <div className="settings-card-grid">
+              <UserDataCard state={userData} setState={setUserData} loadFailure={userDataFailure} />
+              <LoggingCard />
             </div>
-            {restartFailure && <p role="alert" className="mt-2 text-sm text-[var(--app-danger)]">{restartFailure}</p>}
           </div>
-        )}
-        <AppearanceCard />
-        <div className="settings-layout">
-          <div className="settings-card-grid">
-            <UserDataCard state={userData} setState={setUserData} loadFailure={userDataFailure} />
-            <LoggingCard />
-          </div>
-        </div>
+          {needsRestart && (
+            <div role="status" className="glass-card mt-4 rounded-card border border-brand-400/60 p-4 sm:p-5">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div className="min-w-0 space-y-1">
+                  <p className="font-semibold text-ink">{t('settings.restart.title')}</p>
+                  {userData?.pending_path && <p className="break-all text-xs text-ink-muted">{t('settings.restart.data', { path: userData.pending_path })}</p>}
+                </div>
+                <button type="button" onClick={() => void restart()} className="rounded-lg bg-brand-600 px-4 py-2 text-sm text-white hover:bg-brand-500">
+                  {t('settings.restart.now')}
+                </button>
+              </div>
+              {restartFailure && <p role="alert" className="mt-2 text-sm text-[var(--app-danger)]">{restartFailure}</p>}
+            </div>
+          )}
+        </SettingsGroup>
       </div>
+    </section>
+  )
+}
+
+function SettingsGroup({ title, hint, children }: {
+  title: string
+  hint?: string
+  children: ReactNode
+}) {
+  return (
+    <section className="min-w-0">
+      <div className="mb-3">
+        <h2 className="text-sm font-semibold text-ink">{title}</h2>
+        {hint && <p className="mt-1 text-xs leading-relaxed text-ink-faint">{hint}</p>}
+      </div>
+      {children}
+    </section>
+  )
+}
+
+function StartupMemoryCard() {
+  const [enabled, setEnabled] = useState(startupMemoryEnabled)
+
+  const changeEnabled = (next: boolean) => {
+    setEnabled(next)
+    setStartupMemoryEnabled(next)
+  }
+
+  return (
+    <section className="glass-card flex h-full items-center rounded-card p-5">
+      <label htmlFor="resume-last-work-page" className="flex w-full cursor-pointer items-center justify-between gap-4">
+        <span className="min-w-0">
+          <span className="block text-sm font-semibold text-ink">{t('settings.startupMemory.title')}</span>
+          <span className="mt-1 block text-xs leading-relaxed text-ink-muted">{t('settings.startupMemory.description')}</span>
+        </span>
+        <input
+          id="resume-last-work-page"
+          type="checkbox"
+          checked={enabled}
+          onChange={(event) => changeEnabled(event.target.checked)}
+          className="h-4 w-4 shrink-0 accent-[var(--app-accent)]"
+        />
+      </label>
     </section>
   )
 }
@@ -420,6 +480,14 @@ function BackgroundPicker() {
   const [dragOver, setDragOver] = useState(false)
   const [pendingDelete, setPendingDelete] = useState('')
   const [failure, setFailure] = useState('')
+  const [opacity, setOpacity] = useState(settings.background_opacity)
+  const opacityRef = useRef(settings.background_opacity)
+  const savingOpacity = useRef(false)
+
+  useEffect(() => {
+    opacityRef.current = settings.background_opacity
+    setOpacity(settings.background_opacity)
+  }, [settings.background_opacity])
 
   useEffect(() => {
     for (const asset of backgrounds) ensureThumbnail(asset.id)
@@ -441,6 +509,27 @@ function BackgroundPicker() {
   }
 
   const importFile = (file: File) => void run('add', () => addBackground(file))
+  const previewOpacity = (next: number) => {
+    opacityRef.current = next
+    setOpacity(next)
+    document.documentElement.style.setProperty('--app-background-opacity', String(next / 100))
+  }
+  const saveOpacity = async () => {
+    const next = opacityRef.current
+    if (savingOpacity.current || busy !== '' || next === settings.background_opacity) return
+    savingOpacity.current = true
+    setBusy('opacity')
+    setFailure('')
+    try {
+      await setTheme({ ...settings, mode: 'custom', background_opacity: next })
+    } catch (cause) {
+      previewOpacity(settings.background_opacity)
+      setFailure(errorText(cause))
+    } finally {
+      savingOpacity.current = false
+      setBusy('')
+    }
+  }
 
   return (
     <div className="rounded-card border border-glass-line bg-glass-subtle p-4">
@@ -596,6 +685,7 @@ function BackgroundPicker() {
                 setTheme({
                   mode: 'custom',
                   background: { kind: 'color', hex: event.target.value },
+                  background_opacity: settings.background_opacity,
                 }),
               )
             }
@@ -616,7 +706,11 @@ function BackgroundPicker() {
                 style={{ backgroundColor: preset }}
                 onClick={() =>
                   void run('color', () =>
-                    setTheme({ mode: 'custom', background: { kind: 'color', hex: preset } }),
+                    setTheme({
+                      mode: 'custom',
+                      background: { kind: 'color', hex: preset },
+                      background_opacity: settings.background_opacity,
+                    }),
                   )
                 }
               />
@@ -624,6 +718,33 @@ function BackgroundPicker() {
           </span>
         </div>
       )}
+
+      <div className="mt-4 rounded-lg border border-glass-line bg-glass-subtle px-3 py-3">
+        <div className="flex items-center justify-between gap-3">
+          <label htmlFor="custom-background-opacity" className="text-xs font-medium text-ink-muted">
+            {t('settings.background.opacity')}
+          </label>
+          <output htmlFor="custom-background-opacity" className="min-w-10 text-right font-mono text-xs text-ink-faint">
+            {opacity}%
+          </output>
+        </div>
+        <input
+          id="custom-background-opacity"
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          value={opacity}
+          disabled={busy !== ''}
+          aria-label={t('settings.background.opacity')}
+          className="mt-3 w-full accent-brand-600 disabled:opacity-50"
+          onChange={(event) => previewOpacity(Number(event.target.value))}
+          onPointerUp={() => void saveOpacity()}
+          onKeyUp={() => void saveOpacity()}
+          onBlur={() => void saveOpacity()}
+        />
+        <p className="mt-1.5 text-[11px] text-ink-faint">{t('settings.background.opacityHint')}</p>
+      </div>
 
       {failure && (
         <p role="alert" className="mt-4 text-sm text-[var(--app-danger)]">

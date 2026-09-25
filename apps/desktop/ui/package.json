@@ -13,14 +13,16 @@
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.12.0",
+    "@wonderland/core-bindings": "workspace:*",
+    "@wonderland/plugin-protocol": "workspace:*",
+    "@wonderland/plugin-ui-sdk": "workspace:*",
     "@wonderland/ui": "workspace:*",
     "lucide-react": "1.47.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
-    "react-router-dom": "7.18.4",
-    "@wonderland/core-bindings": "workspace:*",
-    "@wonderland/plugin-protocol": "workspace:*",
-    "@wonderland/plugin-ui-sdk": "workspace:*"
+    "react-router-dom": "7.18.4"
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.3.3",

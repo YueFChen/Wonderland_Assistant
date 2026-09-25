@@ -1,0 +1,72 @@
+/* Runtime theme variables for isolated plugin iframes; contains no Tailwind directives. */
+:root {
+  color-scheme: dark;
+  --app-ink: rgb(255 255 255 / 0.92);
+  --app-ink-muted: rgb(255 255 255 / 0.62);
+  --app-ink-faint: rgb(255 255 255 / 0.55);
+  --app-ink-rgb: 255 255 255;
+  --app-surface-rgb: 255 255 255;
+
+  --app-glass-subtle: rgb(255 255 255 / 0.05);
+  --app-glass: rgb(255 255 255 / 0.09);
+  --app-glass-hover: rgb(255 255 255 / 0.16);
+  --app-glass-line: rgb(255 255 255 / 0.12);
+  --app-glass-line-strong: rgb(255 255 255 / 0.2);
+  --app-field: #252236;
+  --app-field-border: rgb(255 255 255 / 0.14);
+
+  --app-accent: #a78bfa;
+  --app-accent-ink: #ded0ff;
+  --app-accent-soft: rgb(167 139 250 / 0.18);
+  --app-accent-line: rgb(167 139 250 / 0.45);
+
+  --app-danger: #ffb9b9;
+  --app-danger-soft: rgb(224 100 100 / 0.12);
+  --app-danger-line: rgb(224 100 100 / 0.4);
+  --app-success: #a9ecce;
+  --app-success-soft: rgb(74 196 138 / 0.12);
+  --app-success-line: rgb(74 196 138 / 0.4);
+
+  --app-page: #0b0b12;
+  --app-glow-1: rgb(109 74 255 / 0.34);
+  --app-glow-2: rgb(79 70 229 / 0.3);
+  --app-glow-3: rgb(139 92 246 / 0.16);
+  --app-title-from: #ffffff;
+  --app-title-to: rgb(255 255 255 / 0.72);
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --app-ink: rgb(26 24 46 / 0.92);
+  --app-ink-muted: rgb(26 24 46 / 0.72);
+  --app-ink-faint: rgb(26 24 46 / 0.62);
+  --app-ink-rgb: 26 24 46;
+  --app-surface-rgb: 26 24 46;
+
+  --app-glass-subtle: rgb(26 24 46 / 0.04);
+  --app-glass: rgb(255 255 255 / 0.66);
+  --app-glass-hover: rgb(255 255 255 / 0.92);
+  --app-glass-line: rgb(26 24 46 / 0.12);
+  --app-glass-line-strong: rgb(26 24 46 / 0.2);
+  --app-field: #ffffff;
+  --app-field-border: rgb(26 24 46 / 0.14);
+
+  --app-accent: #6d4aff;
+  --app-accent-ink: #4f46e5;
+  --app-accent-soft: rgb(109 74 255 / 0.12);
+  --app-accent-line: rgb(109 74 255 / 0.4);
+
+  --app-danger: #b4232f;
+  --app-danger-soft: rgb(180 35 47 / 0.08);
+  --app-danger-line: rgb(180 35 47 / 0.32);
+  --app-success: #0f7a4f;
+  --app-success-soft: rgb(15 122 79 / 0.08);
+  --app-success-line: rgb(15 122 79 / 0.3);
+
+  --app-page: #f3f2fa;
+  --app-glow-1: rgb(109 74 255 / 0.18);
+  --app-glow-2: rgb(79 70 229 / 0.14);
+  --app-glow-3: rgb(139 92 246 / 0.1);
+  --app-title-from: #1b1830;
+  --app-title-to: rgb(27 24 48 / 0.68);
+}

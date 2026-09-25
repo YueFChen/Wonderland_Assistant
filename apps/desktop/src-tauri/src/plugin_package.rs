@@ -1,12 +1,10 @@
-//! Plugin package scanning, validation, signature verification, and atomic installation.
+//! Plugin package scanning, validation, and atomic installation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use base64::Engine;
-use ring::signature::{ED25519, UnparsedPublicKey};
 use semver::Version;
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,19 +19,11 @@ const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_CONTRACT_BYTES: u64 = 8 * 1024 * 1024;
-const FIRST_PARTY_KEY_ID: &str = "first-party-2026";
-
-// The public key is provided at build time; release packages require a configured key.
-const FIRST_PARTY_PUBLIC_KEY_HEX: Option<&str> =
-    option_env!("WONDERLAND_PLUGIN_FIRST_PARTY_PUBLIC_KEY_HEX");
-
 #[derive(Debug, Clone)]
 pub(crate) struct InspectedPlugin {
     pub manifest: PluginManifest,
     pub contract: Value,
     pub contract_sha256: String,
-    pub publisher_key_id: Option<String>,
-    pub trusted: bool,
     pub compatible: bool,
     pub directory: PathBuf,
 }
@@ -52,17 +42,9 @@ struct ChecksumFile {
     sha256: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Signature {
-    algorithm: String,
-    key_id: String,
-    signature: String,
-}
-
 pub(crate) fn inspect_directory(
     directory: &Path,
-    allow_unsigned_development: bool,
+    allow_missing_checksums: bool,
 ) -> Result<InspectedPlugin, String> {
     ensure_real_directory(directory)?;
     validate_tree(directory)?;
@@ -80,15 +62,13 @@ pub(crate) fn inspect_directory(
     validate_contract(&contract)?;
     validate_provided_service_methods(&manifest, &contract)?;
 
-    let publisher_key_id = verify_package_files(directory, allow_unsigned_development)?;
+    verify_package_checksums(directory, allow_missing_checksums)?;
     let contract_sha256 = digest_hex(&contract_bytes);
     Ok(InspectedPlugin {
         compatible: is_compatible(&manifest),
         manifest,
         contract,
         contract_sha256,
-        trusted: publisher_key_id.is_some(),
-        publisher_key_id,
         directory: directory.to_owned(),
     })
 }
@@ -471,19 +451,14 @@ fn copy_package_tree(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_package_files(
-    directory: &Path,
-    allow_unsigned_development: bool,
-) -> Result<Option<String>, String> {
+fn verify_package_checksums(directory: &Path, allow_missing_checksums: bool) -> Result<(), String> {
     let checksums_path = directory.join("checksums.json");
-    let signature_path = directory.join("signature.json");
     let checksums_exists = checksums_path.is_file();
-    let signature_exists = signature_path.is_file();
-    if !checksums_exists && !signature_exists && allow_unsigned_development {
-        return Ok(None);
+    if !checksums_exists && allow_missing_checksums {
+        return Ok(());
     }
-    if !checksums_exists || !signature_exists {
-        return Err("A signed package must include checksums.json and signature.json.".to_owned());
+    if !checksums_exists {
+        return Err("Plugin package must include checksums.json.".to_owned());
     }
 
     let checksum_bytes = read_bounded(&checksums_path, 4 * 1024 * 1024)?;
@@ -513,7 +488,6 @@ fn verify_package_files(
 
     let mut actual = list_package_files(directory)?;
     actual.remove("checksums.json");
-    actual.remove("signature.json");
     let expected: BTreeSet<String> = listed.keys().cloned().collect();
     if actual != expected {
         return Err("Checksum path set does not match the package contents.".to_owned());
@@ -525,29 +499,7 @@ fn verify_package_files(
         }
     }
 
-    let signature_bytes = read_bounded(&signature_path, 32 * 1024)?;
-    let signature: Signature = serde_json::from_slice(&signature_bytes)
-        .map_err(|error| format!("signature.json is invalid: {error}"))?;
-    if signature.algorithm != "Ed25519" || signature.key_id != FIRST_PARTY_KEY_ID {
-        return Err("Plugin package uses an unknown signer.".to_owned());
-    }
-    let key_id = signature.key_id.clone();
-    let key_hex = FIRST_PARTY_PUBLIC_KEY_HEX.ok_or_else(|| {
-        "The Core build has no first-party plugin verification key configured.".to_owned()
-    })?;
-    let key = hex::decode(key_hex)
-        .map_err(|_| "The Core plugin verification key is malformed.".to_owned())?;
-    if key.len() != 32 {
-        return Err("The Core plugin verification key must be 32 bytes.".to_owned());
-    }
-    let key_fingerprint = digest_hex(&key);
-    let signature = base64::engine::general_purpose::STANDARD
-        .decode(signature.signature.as_bytes())
-        .map_err(|_| "Plugin signature is not valid base64.".to_owned())?;
-    UnparsedPublicKey::new(&ED25519, key)
-        .verify(&checksum_bytes, &signature)
-        .map_err(|_| "Plugin signature verification failed.".to_owned())?;
-    Ok(Some(format!("{key_id}:{key_fingerprint}")))
+    Ok(())
 }
 
 fn validate_tree(directory: &Path) -> Result<(), String> {
@@ -563,13 +515,7 @@ fn validate_tree(directory: &Path) -> Result<(), String> {
             ));
         }
         if !relative.contains('/')
-            && ![
-                "manifest.json",
-                "contract.json",
-                "checksums.json",
-                "signature.json",
-            ]
-            .contains(&relative.as_str())
+            && !["manifest.json", "contract.json", "checksums.json"].contains(&relative.as_str())
         {
             return Err("Plugin package contains an unsupported root file.".to_owned());
         }
@@ -671,21 +617,20 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
     if manifest.name.trim().is_empty() || manifest.name.chars().count() > 120 {
         return Err("Plugin name is invalid.".to_owned());
     }
-    if let Some(description) = &manifest.description {
-        if description.chars().count() > 500 {
-            return Err("Plugin description is too long.".to_owned());
-        }
+    if let Some(description) = &manifest.description
+        && description.chars().count() > 500
+    {
+        return Err("Plugin description is too long.".to_owned());
     }
-    if let Some(icon) = &manifest.icon {
-        if icon.is_empty()
+    if let Some(icon) = &manifest.icon
+        && (icon.is_empty()
             || icon.len() > 64
             || !icon.as_bytes()[0].is_ascii_lowercase()
             || !icon
                 .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
-            return Err("Plugin icon key is invalid.".to_owned());
-        }
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
+    {
+        return Err("Plugin icon key is invalid.".to_owned());
     }
     Version::parse(&manifest.version)
         .map_err(|_| "Plugin version is not valid semantic versioning.".to_owned())?;
@@ -1108,10 +1053,8 @@ fn allowed_capabilities() -> BTreeSet<&'static str> {
 }
 
 fn allowed_package_file(path: &str) -> bool {
-    matches!(
-        path,
-        "manifest.json" | "contract.json" | "checksums.json" | "signature.json"
-    ) || path.starts_with("ui/")
+    matches!(path, "manifest.json" | "contract.json" | "checksums.json")
+        || path.starts_with("ui/")
         || path.starts_with("backend/")
 }
 

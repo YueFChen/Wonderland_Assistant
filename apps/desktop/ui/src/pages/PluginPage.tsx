@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { X } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { listen } from '@tauri-apps/api/event'
@@ -8,7 +8,7 @@ import { t } from '../i18n'
 import { pluginApi, usePlugins, type PluginEventPayload } from '../plugins/api'
 import { buildContributionRegistry, findContribution } from '../plugins/contributions'
 import type { WorkspaceContribution } from '../plugins/contributions'
-import { MAX_OPEN_ACTIVITY_SURFACES, readWorkspaceLayout, rememberOpenContribution, setActiveSidebarContribution, useWorkspaceLayout } from '../plugins/workspaceLayout'
+import { MAX_OPEN_ACTIVITY_SURFACES, readWorkspaceLayout, setActiveSidebarContribution, useWorkspaceLayout } from '../plugins/workspaceLayout'
 import { useTheme, type ResolvedTheme } from '../theme/ThemeProvider'
 
 const MAX_CALLS_PER_SECOND = 30
@@ -38,70 +38,187 @@ export function PluginPage() {
   const { layout, update } = useWorkspaceLayout()
   const { resolved } = useTheme()
   const registry = useMemo(() => buildContributionRegistry(states), [states])
+  const activityIds = useMemo(() => new Set(registry.filter((item) => item.kind === 'activity').map((item) => item.id)), [registry])
+  const tabButtons = useRef(new Map<string, HTMLButtonElement>())
+  const closingRouteTabId = useRef<string | null>(null)
   const activeId = `${pluginId}/${contributionId}`
   const activeContribution = findContribution(registry, activeId)
 
   useEffect(() => {
+    if (closingRouteTabId.current && closingRouteTabId.current !== activeId) {
+      closingRouteTabId.current = null
+    }
     if (activeContribution?.kind === 'view' && activeContribution.status === 'ready') {
       if (layout.activeSidebarContributionId !== activeId) setActiveSidebarContribution(activeId)
       navigate('/workspace', { replace: true })
       return
     }
-    if (activeContribution?.kind === 'activity' && activeContribution.status === 'ready') {
-      if (!layout.openContributionIds.includes(activeId)) {
-        rememberOpenContribution(activeId)
-      } else if (layout.activeContributionId !== activeId) {
-        update((state) => state.activeContributionId === activeId
-          ? state
-          : { ...state, activeContributionId: activeId })
-      }
+    if (!states) return
+
+    const current = readWorkspaceLayout()
+    const closingCurrentTab = closingRouteTabId.current === activeId
+    const openIds = current.openContributionIds.filter((id) => activityIds.has(id))
+    if (activeContribution?.kind === 'activity' && !closingCurrentTab && !openIds.includes(activeId)) {
+      openIds.push(activeId)
     }
-  }, [activeContribution?.kind, activeContribution?.status, activeId, layout.activeContributionId, layout.activeSidebarContributionId, layout.openContributionIds, navigate, update])
+    const nextOpenIds = openIds.slice(-MAX_OPEN_ACTIVITY_SURFACES)
+    const routeActiveId = activeContribution?.kind === 'activity' && !closingCurrentTab
+      ? activeId
+      : null
+    const nextActiveId = routeActiveId
+      ?? (current.activeContributionId && nextOpenIds.includes(current.activeContributionId)
+        ? current.activeContributionId
+        : null)
+    const openIdsChanged = current.openContributionIds.length !== nextOpenIds.length
+      || current.openContributionIds.some((id, index) => id !== nextOpenIds[index])
+    if (openIdsChanged || current.activeContributionId !== nextActiveId) {
+      update((state) => ({
+        ...state,
+        openContributionIds: nextOpenIds,
+        activeContributionId: nextActiveId,
+      }))
+    }
+
+    if (!activeContribution && pluginId && contributionId) {
+      navigate('/workspace', { replace: true })
+    }
+  }, [activeContribution?.kind, activeContribution?.status, activeId, activityIds, contributionId, layout.activeContributionId, layout.activeSidebarContributionId, layout.openContributionIds, navigate, pluginId, states, update])
 
   const openTabs = useMemo(() => {
-    const ids = [...layout.openContributionIds]
-    if (activeContribution?.kind === 'activity' && activeContribution.status === 'ready' && !ids.includes(activeId)) ids.push(activeId)
+    const ids = layout.openContributionIds.filter((id) => activityIds.has(id))
+    if (
+      activeContribution?.kind === 'activity'
+      && closingRouteTabId.current !== activeId
+      && !ids.includes(activeId)
+    ) ids.push(activeId)
     return ids
       .slice(-MAX_OPEN_ACTIVITY_SURFACES)
       .map((id) => findContribution(registry, id))
       .filter((item): item is WorkspaceContribution => item !== undefined && item.kind === 'activity')
-  }, [activeContribution?.kind, activeContribution?.status, activeId, layout.openContributionIds, registry])
+  }, [activeContribution?.kind, activeId, activityIds, layout.openContributionIds, registry])
 
   const closeTab = useCallback((id: string) => {
-    const current = readWorkspaceLayout()
-    const nextIds = current.openContributionIds.filter((item) => item !== id)
-    const nextActive = nextIds.map((nextId) => findContribution(registry, nextId)).find((item) => item?.status === 'ready')
-    update((state) => ({
-      ...state,
-      openContributionIds: nextIds,
-      activeContributionId: id === activeId ? nextActive?.id ?? null : state.activeContributionId,
-    }))
-    if (id === activeId) {
-      navigate(nextActive?.href ?? '/workspace')
+    const routeActivityId = activeContribution?.kind === 'activity' ? activeId : null
+    const closesRouteTab = id === routeActivityId
+    const before = readWorkspaceLayout().openContributionIds.filter((item) => activityIds.has(item))
+    if (routeActivityId && !before.includes(routeActivityId)) before.push(routeActivityId)
+    if (!before.includes(id)) return
+
+    if (closesRouteTab) closingRouteTabId.current = id
+    let nextActive: WorkspaceContribution | undefined
+    let focusTabId: string | null = null
+    update((state) => {
+      const orderedIds = state.openContributionIds.filter((item) => activityIds.has(item))
+      if (routeActivityId && !orderedIds.includes(routeActivityId)) orderedIds.push(routeActivityId)
+      const visibleIds = orderedIds.slice(-MAX_OPEN_ACTIVITY_SURFACES)
+      const closedIndex = visibleIds.indexOf(id)
+      if (closedIndex < 0) return state
+
+      const remainingIds = visibleIds.filter((item) => item !== id)
+      const fallbackIds = [
+        ...visibleIds.slice(closedIndex + 1),
+        ...visibleIds.slice(0, closedIndex).reverse(),
+      ].filter((item) => item !== id)
+      nextActive = fallbackIds
+        .map((item) => findContribution(registry, item))
+        .find((item): item is WorkspaceContribution => item?.kind === 'activity')
+
+      const routeStillOpen = routeActivityId !== null
+        && routeActivityId !== id
+        && remainingIds.includes(routeActivityId)
+      const storedActiveStillOpen = state.activeContributionId !== null
+        && state.activeContributionId !== id
+        && remainingIds.includes(state.activeContributionId)
+      const activeContributionId = closesRouteTab
+        ? nextActive?.id ?? null
+        : routeStillOpen
+          ? routeActivityId
+          : storedActiveStillOpen
+            ? state.activeContributionId
+            : nextActive?.id ?? null
+      focusTabId = closesRouteTab
+        ? nextActive?.id ?? null
+        : fallbackIds.find((item) => remainingIds.includes(item)) ?? activeContributionId
+
+      return {
+        ...state,
+        openContributionIds: remainingIds,
+        activeContributionId,
+      }
+    })
+
+    if (closesRouteTab) {
+      navigate(nextActive?.href ?? '/workspace', { replace: true })
     }
-  }, [activeId, navigate, registry, update])
+    const nextFocusId = focusTabId
+    if (nextFocusId) {
+      requestAnimationFrame(() => tabButtons.current.get(nextFocusId)?.focus())
+    }
+  }, [activeContribution?.kind, activeId, activityIds, navigate, registry, update])
 
   const selectTab = useCallback((item: WorkspaceContribution) => {
-    update((state) => state.activeContributionId === item.id
-      ? state
-      : { ...state, activeContributionId: item.id })
-    navigate(item.href)
+    update((state) => {
+      const openContributionIds = state.openContributionIds.includes(item.id)
+        ? state.openContributionIds
+        : [...state.openContributionIds, item.id].slice(-MAX_OPEN_ACTIVITY_SURFACES)
+      return state.activeContributionId === item.id
+        && openContributionIds === state.openContributionIds
+        ? state
+        : { ...state, openContributionIds, activeContributionId: item.id }
+    })
+    navigate(item.href, { replace: true })
   }, [navigate, update])
+
+  const handleTabKeyDown = useCallback((event: ReactKeyboardEvent<HTMLButtonElement>, item: WorkspaceContribution) => {
+    if (event.key === 'Delete') {
+      event.preventDefault()
+      closeTab(item.id)
+      return
+    }
+
+    const index = openTabs.findIndex((tab) => tab.id === item.id)
+    if (index < 0 || openTabs.length < 2) return
+
+    let targetIndex: number | null = null
+    if (event.key === 'ArrowRight') targetIndex = (index + 1) % openTabs.length
+    if (event.key === 'ArrowLeft') targetIndex = (index - 1 + openTabs.length) % openTabs.length
+    if (event.key === 'Home') targetIndex = 0
+    if (event.key === 'End') targetIndex = openTabs.length - 1
+    if (targetIndex === null) return
+
+    event.preventDefault()
+    const target = openTabs[targetIndex]
+    selectTab(target)
+    requestAnimationFrame(() => tabButtons.current.get(target.id)?.focus())
+  }, [closeTab, openTabs, selectTab])
 
   if (error) return <p role="alert" className="text-sm text-[var(--app-danger)]">{t(error)}</p>
   if (!states) return <p role="status" className="text-sm text-ink-muted">{t('pluginPage.loading')}</p>
   if (!activeContribution) return <p className="text-sm text-ink-muted">{t('pluginPage.notInstalled')}</p>
-  if (activeContribution.status !== 'ready') {
-    return <ContributionUnavailable contribution={activeContribution} />
+  if (activeContribution.kind !== 'activity') {
+    return activeContribution.status === 'ready'
+      ? null
+      : <ContributionUnavailable contribution={activeContribution} />
   }
-  if (activeContribution.kind !== 'activity') return null
 
   return (
     <section className="plugin-page-surface flex h-full min-h-[28rem] min-w-0 flex-col">
-      <div className="plugin-surface-tabs" role="tablist" aria-label={t('pluginPage.tabs')}>
+      <div className="plugin-surface-tabs" role="tablist" aria-orientation="horizontal" aria-label={t('pluginPage.tabs')}>
         {openTabs.map((item) => (
           <div key={item.id} role="presentation" className={`plugin-surface-tab${item.id === activeId ? ' is-active' : ''}`}>
-            <button type="button" role="tab" aria-selected={item.id === activeId} onClick={() => selectTab(item)} title={item.title}>
+            <button
+              ref={(node) => {
+                if (node) tabButtons.current.set(item.id, node)
+                else tabButtons.current.delete(item.id)
+              }}
+              type="button"
+              role="tab"
+              aria-selected={item.id === activeId}
+              tabIndex={item.id === activeId ? 0 : -1}
+              onClick={() => selectTab(item)}
+              onKeyDown={(event) => handleTabKeyDown(event, item)}
+              title={item.title}
+            >
               <span className="max-w-52 truncate">{item.title}</span>
             </button>
             <button type="button" className="plugin-surface-tab-close" aria-label={t('pluginPage.closeTab', { title: item.title })} title={t('pluginPage.closeTab', { title: item.title })} onClick={() => closeTab(item.id)}>
@@ -112,14 +229,16 @@ export function PluginPage() {
       </div>
       <div className="relative min-h-0 flex-1">
         {openTabs.map((item) => (
-          <PluginSurface
-            key={item.id}
-            contribution={item}
-            active={item.id === activeId}
-            resolvedTheme={resolved}
-            surface="activity"
-            onOpenView={setActiveSidebarContribution}
-          />
+          item.status !== 'ready'
+            ? item.id === activeId && <ContributionUnavailable key={item.id} contribution={item} />
+            : <PluginSurface
+              key={item.id}
+              contribution={item}
+              active={item.id === activeId}
+              resolvedTheme={resolved}
+              surface="activity"
+              onOpenView={setActiveSidebarContribution}
+            />
         ))}
       </div>
     </section>
@@ -167,6 +286,7 @@ export function PluginSurface({
   const frame = useRef<HTMLIFrameElement>(null)
   const nonce = useRef(crypto.randomUUID())
   const activeCalls = useRef<number[]>([])
+  const pendingCalls = useRef(new Set<string>())
   const subscribedTopics = useRef(new Set<string>())
   const [url, setUrl] = useState('')
   const [loaderFailure, setLoaderFailure] = useState('')
@@ -174,6 +294,13 @@ export function PluginSurface({
   const [bridgeError, setBridgeError] = useState('')
   const followsTheme = contribution.integrations.includes('theme.followHost')
   const providesSidebar = contribution.integrations.includes('workspace.sidebar')
+
+  useEffect(() => () => {
+    for (const requestId of pendingCalls.current) {
+      void pluginApi.cancel(state.manifest.id, requestId).catch(() => undefined)
+    }
+    pendingCalls.current.clear()
+  }, [state.manifest.id])
 
   const sendToPlugin = useCallback((message: Record<string, unknown>) => {
     frame.current?.contentWindow?.postMessage({
@@ -272,9 +399,12 @@ export function PluginSurface({
         return
       }
       activeCalls.current.push(now)
-      void pluginApi.callWithId<unknown>(state.manifest.id, message.method, message.params ?? {}, message.requestId).promise
+      const request = pluginApi.callWithId<unknown>(state.manifest.id, message.method, message.params ?? {}, message.requestId)
+      pendingCalls.current.add(request.requestId)
+      void request.promise
         .then((result) => sendToPlugin({ type: 'result', requestId: message.requestId, result }))
         .catch((cause) => sendToPlugin({ type: 'error', requestId: message.requestId, error: toErrorValue(cause) }))
+        .finally(() => pendingCalls.current.delete(request.requestId))
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)

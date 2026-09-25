@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 mod failure;
 pub use failure::PluginFailure;
 mod account;
-pub use account::{AccountSnapshot, AccountSummary, AccountStatus, GameRoleSummary};
+pub use account::{AccountSnapshot, AccountStatus, AccountSummary, GameRoleSummary};
 mod request;
 pub use request::{ActiveRequestGuard, RequestTracker};
 
@@ -37,45 +37,73 @@ pub struct PluginError {
 
 impl PluginError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { code: code.into(), message: message.into(), details: None }
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct HostClient {
     writer: Arc<Mutex<BufWriter<std::io::Stdout>>>,
-    pending: Arc<Mutex<HashMap<String, mpsc::SyncSender<Result<Value, PluginError>>>>>,
+    pending: PendingCalls,
     next_id: Arc<AtomicU64>,
 }
 
+type PendingCalls = Arc<Mutex<HashMap<String, mpsc::SyncSender<Result<Value, PluginError>>>>>;
+
 impl HostClient {
     fn new(writer: Arc<Mutex<BufWriter<std::io::Stdout>>>) -> Self {
-        Self { writer, pending: Arc::new(Mutex::new(HashMap::new())), next_id: Arc::new(AtomicU64::new(1)) }
+        Self {
+            writer,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
     }
 
     /// Make a capability-gated Core service request.
     pub fn call_core(&self, method: &str, params: Value) -> Result<Value, PluginError> {
         let id = format!("p-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (sender, receiver) = mpsc::sync_channel(1);
-        self.pending.lock().map_err(|_| PluginError::new("INTERNAL", "Plugin service table is unavailable."))?
+        self.pending
+            .lock()
+            .map_err(|_| PluginError::new("INTERNAL", "Plugin service table is unavailable."))?
             .insert(id.clone(), sender);
         let request = json!({"protocol": PROTOCOL, "version": VERSION, "type": "request", "id": id, "method": method, "params": params});
         if let Err(error) = write_frame(&self.writer, &request) {
             self.pending.lock().ok().and_then(|mut p| p.remove(&id));
-            return Err(PluginError::new("PLUGIN_CRASHED", format!("Cannot send Core service request: {error}")));
+            return Err(PluginError::new(
+                "PLUGIN_CRASHED",
+                format!("Cannot send Core service request: {error}"),
+            ));
         }
         match receiver.recv_timeout(SERVICE_TIMEOUT) {
             Ok(result) => result,
             Err(_) => {
                 self.pending.lock().ok().and_then(|mut p| p.remove(&id));
-                Err(PluginError::new("TIMEOUT", "Core service request timed out."))
+                Err(PluginError::new(
+                    "TIMEOUT",
+                    "Core service request timed out.",
+                ))
             }
         }
     }
 
-    pub fn emit(&self, topic: &str, request_id: Option<&str>, payload: Value) -> Result<(), PluginError> {
+    pub fn emit(
+        &self,
+        topic: &str,
+        request_id: Option<&str>,
+        payload: Value,
+    ) -> Result<(), PluginError> {
         let frame = json!({"protocol": PROTOCOL, "version": VERSION, "type": "event", "topic": topic, "requestId": request_id, "payload": payload});
-        write_frame(&self.writer, &frame).map_err(|error| PluginError::new("PLUGIN_CRASHED", format!("Cannot emit plugin event: {error}")))
+        write_frame(&self.writer, &frame).map_err(|error| {
+            PluginError::new(
+                "PLUGIN_CRASHED",
+                format!("Cannot emit plugin event: {error}"),
+            )
+        })
     }
 }
 
@@ -87,7 +115,10 @@ pub fn serve<F>(
     dispatch: F,
 ) -> Result<(), String>
 where
-    F: Fn(HostClient, String, Value, Option<String>) -> Result<Value, PluginError> + Send + Sync + 'static,
+    F: Fn(HostClient, String, Value, Option<String>) -> Result<Value, PluginError>
+        + Send
+        + Sync
+        + 'static,
 {
     let writer = Arc::new(Mutex::new(BufWriter::new(std::io::stdout())));
     let host = HostClient::new(writer.clone());
@@ -120,28 +151,47 @@ where
         }
         match frame.get("type").and_then(Value::as_str) {
             Some("result") | Some("error") => {
-                let id = frame.get("id").and_then(Value::as_str).ok_or("Core reply has no id")?.to_owned();
-                let sender = host.pending.lock().map_err(|_| "Plugin service table is unavailable")?.remove(&id);
+                let id = frame
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("Core reply has no id")?
+                    .to_owned();
+                let sender = host
+                    .pending
+                    .lock()
+                    .map_err(|_| "Plugin service table is unavailable")?
+                    .remove(&id);
                 if let Some(sender) = sender {
-                    let result: Result<Value, PluginError> = if frame.get("type").and_then(Value::as_str) == Some("result") {
-                        frame.get("result").cloned().ok_or_else(|| PluginError::new("INVALID_RESPONSE", "Core result has no value."))
-                    } else {
-                        match serde_json::from_value::<PluginError>(
-                            frame.get("error").cloned().unwrap_or(Value::Null),
-                        ) {
-                            Ok(error) => Err(error),
-                            Err(_) => Err(PluginError::new(
-                                "INVALID_RESPONSE",
-                                "Core error frame is malformed.",
-                            )),
-                        }
-                    };
+                    let result: Result<Value, PluginError> =
+                        if frame.get("type").and_then(Value::as_str) == Some("result") {
+                            frame.get("result").cloned().ok_or_else(|| {
+                                PluginError::new("INVALID_RESPONSE", "Core result has no value.")
+                            })
+                        } else {
+                            match serde_json::from_value::<PluginError>(
+                                frame.get("error").cloned().unwrap_or(Value::Null),
+                            ) {
+                                Ok(error) => Err(error),
+                                Err(_) => Err(PluginError::new(
+                                    "INVALID_RESPONSE",
+                                    "Core error frame is malformed.",
+                                )),
+                            }
+                        };
                     let _ = sender.send(result);
                 }
             }
             Some("request") => {
-                let id = frame.get("id").and_then(Value::as_str).ok_or("Core request has no id")?.to_owned();
-                let method = frame.get("method").and_then(Value::as_str).ok_or("Core request has no method")?.to_owned();
+                let id = frame
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("Core request has no id")?
+                    .to_owned();
+                let method = frame
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .ok_or("Core request has no method")?
+                    .to_owned();
                 let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
                 let request_id = Some(id.clone());
                 let host = host.clone();
@@ -149,8 +199,12 @@ where
                 let writer = writer.clone();
                 thread::spawn(move || {
                     let response = match dispatch(host, method, params, request_id) {
-                        Ok(result) => json!({"protocol": PROTOCOL, "version": VERSION, "type": "result", "id": id, "result": result}),
-                        Err(error) => json!({"protocol": PROTOCOL, "version": VERSION, "type": "error", "id": id, "error": error}),
+                        Ok(result) => {
+                            json!({"protocol": PROTOCOL, "version": VERSION, "type": "result", "id": id, "result": result})
+                        }
+                        Err(error) => {
+                            json!({"protocol": PROTOCOL, "version": VERSION, "type": "error", "id": id, "error": error})
+                        }
                     };
                     let _ = write_frame(&writer, &response);
                 });
@@ -161,7 +215,12 @@ where
                     let dispatch = dispatch.clone();
                     let request_id = id.to_owned();
                     thread::spawn(move || {
-                        let _ = dispatch(host, "__cancel".to_owned(), json!({ "requestId": request_id }), None);
+                        let _ = dispatch(
+                            host,
+                            "__cancel".to_owned(),
+                            json!({ "requestId": request_id }),
+                            None,
+                        );
                     });
                 }
             }
@@ -172,21 +231,38 @@ where
 
 fn read_frame<R: BufRead>(input: &mut R) -> Result<Value, String> {
     let mut line = Vec::new();
-    let count = (&mut *input).take(MAX_FRAME_BYTES + 1).read_until(b'\n', &mut line).map_err(|error| error.to_string())?;
-    if count == 0 { return Err("end of stream".to_owned()); }
-    if count as u64 > MAX_FRAME_BYTES || line.last() != Some(&b'\n') { return Err("frame exceeded the protocol size limit".to_owned()); }
+    let count = (&mut *input)
+        .take(MAX_FRAME_BYTES + 1)
+        .read_until(b'\n', &mut line)
+        .map_err(|error| error.to_string())?;
+    if count == 0 {
+        return Err("end of stream".to_owned());
+    }
+    if count as u64 > MAX_FRAME_BYTES || line.last() != Some(&b'\n') {
+        return Err("frame exceeded the protocol size limit".to_owned());
+    }
     line.pop();
-    if line.last() == Some(&b'\r') { line.pop(); }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
     serde_json::from_slice(&line).map_err(|error| error.to_string())
 }
 
-fn write_frame(writer: &Arc<Mutex<BufWriter<std::io::Stdout>>>, frame: &Value) -> std::io::Result<()> {
-    let mut writer = writer.lock().map_err(|_| std::io::Error::other("stdout lock poisoned"))?;
+fn write_frame(
+    writer: &Arc<Mutex<BufWriter<std::io::Stdout>>>,
+    frame: &Value,
+) -> std::io::Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| std::io::Error::other("stdout lock poisoned"))?;
     serde_json::to_writer(&mut *writer, frame)?;
     writer.write_all(b"\n")?;
     writer.flush()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

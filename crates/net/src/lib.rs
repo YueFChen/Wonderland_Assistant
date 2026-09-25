@@ -9,6 +9,10 @@ use wonderland_kernel::logging::{debug, warn};
 
 /// 出站请求超时。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const PLUGIN_CATALOG_URL: &str =
+    "https://yuefchen.github.io/Wonderland_Plugin_Catalog/catalog/v1/index.json";
+const PLUGIN_CATALOG_MAX_BYTES: usize = 2 * 1024 * 1024;
+const PLUGIN_PACKAGE_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 /// 固定 UA：米哈游接口对 UA 敏感，不使用随机值以免触发风控。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
@@ -166,6 +170,143 @@ impl HttpClient {
     }
 }
 
+/// Fixed-origin catalog and release downloader. Redirects are limited to GitHub's release
+/// asset hosts so catalog URLs cannot turn this client into an arbitrary network proxy.
+#[derive(Clone)]
+pub struct PluginCatalogClient {
+    index: reqwest::Client,
+    package: reqwest::Client,
+}
+
+impl PluginCatalogClient {
+    pub fn new() -> Result<Self, KernelError> {
+        let index = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent("WonderlandAssistant/PluginCatalog")
+            .build()
+            .map_err(|error| KernelError::Transport(format!("HTTP 客户端初始化失败：{error}")))?;
+        let package = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 || !is_allowed_release_redirect(attempt.url()) {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
+            .timeout(Duration::from_secs(120))
+            .user_agent("WonderlandAssistant/PluginCatalog")
+            .build()
+            .map_err(|error| KernelError::Transport(format!("HTTP 客户端初始化失败：{error}")))?;
+        Ok(Self { index, package })
+    }
+
+    pub async fn get_index(&self) -> Result<Vec<u8>, KernelError> {
+        let response = self
+            .index
+            .get(PLUGIN_CATALOG_URL)
+            .send()
+            .await
+            .map_err(classify)?;
+        read_limited_response(response, PLUGIN_CATALOG_MAX_BYTES).await
+    }
+
+    pub async fn download_package(&self, url: &str) -> Result<Vec<u8>, KernelError> {
+        if !is_valid_plugin_release_url(url) {
+            return Err(KernelError::InvalidInput);
+        }
+        let response = self.package.get(url).send().await.map_err(classify)?;
+        read_limited_response(response, PLUGIN_PACKAGE_MAX_BYTES).await
+    }
+}
+
+/// Only accept immutable versioned GitHub Release asset URLs, never arbitrary HTTPS URLs.
+pub fn is_valid_plugin_release_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(parts) = url.path_segments() else {
+        return false;
+    };
+    let parts = parts.collect::<Vec<_>>();
+    parts.len() == 6
+        && parts[2] == "releases"
+        && parts[3] == "download"
+        && !parts[0].is_empty()
+        && !parts[1].is_empty()
+        && !parts[4].is_empty()
+        && parts[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && parts[1]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        && parts[4]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        && parts[5].ends_with(".wplug")
+        && parts[5]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+
+fn is_allowed_release_redirect(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host == "github.com"
+        || host == "release-assets.githubusercontent.com"
+        || host == "objects.githubusercontent.com"
+        || (host.starts_with("github-production-release-asset-")
+            && host.ends_with(".s3.amazonaws.com"))
+}
+
+async fn read_limited_response(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, KernelError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(KernelError::Http(status.as_u16()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(KernelError::InvalidInput);
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err(KernelError::InvalidInput);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(body),
+            Err(error) => return Err(classify(error)),
+        }
+    }
+}
+
 /// 错误分类：区分超时、连接失败与其它，便于前端判别。
 fn classify(error: reqwest::Error) -> KernelError {
     if error.is_timeout() {
@@ -176,7 +317,6 @@ fn classify(error: reqwest::Error) -> KernelError {
         KernelError::Transport("请求失败".to_owned())
     }
 }
-
 
 /// 模型生成远慢于普通接口，默认给足两分钟；按端点可覆盖。
 const MODEL_TIMEOUT: Duration = Duration::from_secs(120);

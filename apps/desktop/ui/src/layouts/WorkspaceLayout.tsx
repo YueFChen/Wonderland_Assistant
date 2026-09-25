@@ -12,6 +12,7 @@ import { buildContributionRegistry, findContribution, openContribution } from '.
 import { pluginIcon } from '../plugins/icons'
 import { usePlugins } from '../plugins/api'
 import { orderContributions, setActiveSidebarContribution, useWorkspaceLayout } from '../plugins/workspaceLayout'
+import { rememberLastWorkPage } from '../startupMemory'
 import { t } from '../i18n'
 import { useTheme } from '../theme/ThemeProvider'
 import './workspace.css'
@@ -22,7 +23,8 @@ const OPEN_PALETTE_EVENT = 'wonderland:open-command-palette'
 /** Core owns the Workspace shell; activities stay in isolated plugin frames in the main surface. */
 export function WorkspaceLayout() {
   const navigate = useNavigate()
-  const { pathname } = useLocation()
+  const location = useLocation()
+  const { pathname } = location
   const { snapshot } = useAccount()
   const { states } = usePlugins()
   const { layout, toggleCollapsed } = useWorkspaceLayout()
@@ -63,6 +65,10 @@ export function WorkspaceLayout() {
     }
   }, [])
 
+  useEffect(() => {
+    rememberLastWorkPage(`${location.pathname}${location.search}`)
+  }, [location.pathname, location.search])
+
   const account = currentAccount(snapshot)
   const role = firstRole(account)
   const nickname = displayName(account)
@@ -79,7 +85,7 @@ export function WorkspaceLayout() {
         <aside className="workspace-rail" data-collapsed={layout.collapsed} aria-label={t('workspace.title')}>
           <div className="workspace-rail-head">
             <Link
-              to="/workspace/account"
+              to="/workspace/settings"
               className="workspace-rail-account"
               aria-label={layout.collapsed ? (nickname ?? t('common.notLoggedIn')) : undefined}
               title={layout.collapsed ? (nickname ?? t('common.notLoggedIn')) : undefined}

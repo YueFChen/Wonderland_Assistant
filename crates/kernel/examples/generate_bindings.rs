@@ -27,6 +27,12 @@ fn main() {
         UserDataLocationKind,
         UserDataState
     );
+    let out = out
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../packages/core-bindings/src/index.ts");
     if std::env::args().any(|a| a == "--check") {

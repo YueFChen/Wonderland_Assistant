@@ -29,12 +29,35 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Yuef Chen",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "headerImage": "installer/nsis-header.bmp",
+        "sidebarImage": "installer/nsis-sidebar.bmp",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "languages": ["SimpChinese", "English"]
+      },
+      "wix": {
+        "bannerPath": "installer/wix-banner.bmp",
+        "dialogImagePath": "installer/wix-dialog.bmp",
+        "language": "zh-CN"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI4NEQyOUZCMDc5QUZDNApSV1RFcjNtd245S0VBdkFwYkkzZHVjMjdGV3FaWkN1dmFmWHpmOHg1M3oyR3ZiZTRla2tFMm9Oawo=",
+      "endpoints": [
+        "https://github.com/YueFChen/Wonderland_Assistant/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

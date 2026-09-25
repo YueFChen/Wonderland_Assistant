@@ -12,6 +12,7 @@ import {
 import type { BackgroundAsset, ThemeMode, ThemeSettings, ThemeState } from '@wonderland/core-bindings'
 
 import { themeApi } from './api'
+import { paletteFromColor, paletteFromImage, type AutoPalette } from './autoPalette'
 import { t } from '../i18n'
 
 /** Resolved light or dark theme. */
@@ -40,7 +41,7 @@ interface ThemeContextValue {
 const ThemeContext = createContext<ThemeContextValue | null>(null)
 
 /** Default theme settings. */
-const INITIAL: ThemeSettings = { mode: 'dark', background: null }
+const INITIAL: ThemeSettings = { mode: 'dark', background: null, background_opacity: 100 }
 const THEME_CACHE_KEY = 'wonderland.theme.mode'
 
 function cachedMode(): ThemeMode {
@@ -64,6 +65,7 @@ const MAX_BACKGROUND_BYTES = 20 * 1024 * 1024
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<ThemeState>(() => ({ settings: { ...INITIAL, mode: cachedMode() }, background_url: null }))
   const [backgrounds, setBackgrounds] = useState<BackgroundAsset[]>([])
+  const [customPalette, setCustomPalette] = useState<AutoPalette | null>(null)
   const [ready, setReady] = useState(false)
   const [systemDark, setSystemDark] = useState(
     () => window.matchMedia('(prefers-color-scheme: dark)').matches,
@@ -100,16 +102,63 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const { settings, background_url: backgroundUrl } = state
+  const customSourceKey = settings.background?.kind === 'image'
+    ? `image:${settings.background.id}`
+    : settings.background?.kind === 'color'
+      ? `color:${settings.background.hex}`
+      : 'none'
+  const activeCustomPalette = customPalette?.sourceKey === customSourceKey ? customPalette : null
+
+  useEffect(() => {
+    if (settings.mode !== 'custom') {
+      setCustomPalette(null)
+      return
+    }
+    if (settings.background?.kind === 'image') {
+      if (!backgroundUrl) {
+        setCustomPalette(null)
+        return
+      }
+      let live = true
+      setCustomPalette(null)
+      void paletteFromImage(customSourceKey, backgroundUrl)
+        .then((palette) => { if (live) setCustomPalette(palette) })
+        .catch(() => {
+          if (live) setCustomPalette(paletteFromColor(customSourceKey, '#302744'))
+        })
+      return () => { live = false }
+    }
+    setCustomPalette(paletteFromColor(
+      customSourceKey,
+      settings.background?.kind === 'color' ? settings.background.hex : '#1b1830',
+    ))
+  }, [settings.mode, customSourceKey, backgroundUrl])
+
   const resolved: ResolvedTheme =
     settings.mode === 'light'
       ? 'light'
       : settings.mode === 'system' && !systemDark
         ? 'light'
-        : 'dark'
+        : settings.mode === 'custom'
+          ? activeCustomPalette?.mode ?? 'dark'
+          : 'dark'
 
   useLayoutEffect(() => {
-    document.documentElement.dataset.theme = resolved
-  }, [resolved])
+    const root = document.documentElement
+    root.dataset.theme = resolved
+    root.style.setProperty(
+      '--app-background-opacity',
+      String(Math.min(100, Math.max(0, settings.background_opacity)) / 100),
+    )
+    for (const property of Object.keys(customPalette?.variables ?? {})) {
+      root.style.removeProperty(property)
+    }
+    if (settings.mode === 'custom' && activeCustomPalette) {
+      for (const [property, value] of Object.entries(activeCustomPalette.variables)) {
+        root.style.setProperty(property, value)
+      }
+    }
+  }, [resolved, settings.mode, settings.background_opacity, customPalette, activeCustomPalette])
 
   useEffect(() => {
     if (settings.mode !== 'custom' || settings.background?.kind !== 'image') return

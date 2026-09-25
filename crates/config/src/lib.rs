@@ -147,6 +147,9 @@ impl SettingsService for FsSettingsService {
     }
 
     fn set_theme(&self, settings: ThemeSettings) -> Result<ThemeState, KernelError> {
+        if settings.background_opacity > 100 {
+            return Err(KernelError::InvalidInput);
+        }
         match &settings.background {
             Some(BackgroundKind::Color { hex }) if !valid_hex(hex) => {
                 return Err(KernelError::InvalidInput);
@@ -192,6 +195,7 @@ impl SettingsService for FsSettingsService {
         let id = self.next_id(&extension)?;
         write_atomic(&self.theme_dir.join(&id), &bytes)?;
         let result = self.update(|file| {
+            let background_opacity = file.theme.background_opacity;
             file.backgrounds.insert(
                 0,
                 BackgroundRecord {
@@ -202,6 +206,7 @@ impl SettingsService for FsSettingsService {
             file.theme = ThemeSettings {
                 mode: ThemeMode::Custom,
                 background: Some(BackgroundKind::Image { id: id.clone() }),
+                background_opacity,
             };
             Ok(())
         });
@@ -218,9 +223,11 @@ impl SettingsService for FsSettingsService {
         }
         let id = id.to_owned();
         self.update(|file| {
+            let background_opacity = file.theme.background_opacity;
             file.theme = ThemeSettings {
                 mode: ThemeMode::Custom,
                 background: Some(BackgroundKind::Image { id: id.clone() }),
+                background_opacity,
             };
             Ok(())
         })?;
@@ -237,16 +244,19 @@ impl SettingsService for FsSettingsService {
                 Some(BackgroundKind::Image { id: current }) if *current == id
             );
             if selected {
+                let background_opacity = file.theme.background_opacity;
                 file.theme = match file.backgrounds.first() {
                     Some(record) => ThemeSettings {
                         mode: ThemeMode::Custom,
                         background: Some(BackgroundKind::Image {
                             id: record.id.clone(),
                         }),
+                        background_opacity,
                     },
                     None => ThemeSettings {
                         mode: ThemeMode::Dark,
                         background: None,
+                        background_opacity,
                     },
                 };
             }
@@ -403,6 +413,7 @@ mod tests {
         let bad_color = ThemeSettings {
             mode: ThemeMode::Custom,
             background: Some(BackgroundKind::Color { hex: "red".into() }),
+            background_opacity: 100,
         };
         assert_eq!(
             settings.set_theme(bad_color),
@@ -425,6 +436,7 @@ mod tests {
             background: Some(BackgroundKind::Image {
                 id: "bg-9.png".into(),
             }),
+            background_opacity: 100,
         };
         assert_eq!(settings.set_theme(missing), Err(KernelError::InvalidInput));
         fs::remove_dir_all(root).unwrap();

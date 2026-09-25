@@ -12,9 +12,49 @@ export interface PluginEventPayload {
   payload: unknown
 }
 
+export interface PluginCatalogEntry {
+  id: string
+  name: string
+  description: string
+  author: string
+  repositoryUrl: string
+  version: string
+  releaseNotesUrl: string | null
+  downloadUrl: string
+  sha256: string
+  sizeBytes: number
+  hostCompatibility: {
+    minCoreVersion: string
+    maxCoreVersionExclusive: string
+    protocol: { minVersion: string; maxVersionExclusive: string }
+  }
+  uiBridgeCompatibility: { minVersion: string; maxVersionExclusive: string } | null
+  platform: { os: string; architecture: string; abi: string }
+  capabilities: string[]
+}
+
+export interface PluginCatalogSnapshot {
+  generatedAt: string
+  stale: boolean
+  plugins: Array<{
+    entry: PluginCatalogEntry
+    compatible: boolean
+    installedVersion: string | null
+    installable: boolean
+  }>
+}
+
 /** Core 只暴露稳定的插件宿主命令，不按插件业务拆分 Tauri IPC。 */
 export const pluginApi = {
   states: () => invoke<PluginRuntimeState[]>('plugins_list'),
+  catalog: () => invoke<PluginCatalogSnapshot>('plugins_catalog_list'),
+  installCatalog: (pluginId: string, version: string, expectedSha256: string, approvedCapabilities: string[]) =>
+    invoke<PluginRuntimeState[]>('plugins_catalog_install', {
+      pluginId,
+      version,
+      expectedSha256,
+      approvedCapabilities,
+    }),
   install: () => invoke<PluginRuntimeState[]>('plugins_install'),
   remove: (pluginId: string, removePluginData = false) =>
     invoke<PluginRuntimeState[]>('plugins_remove', { pluginId, removePluginData }),

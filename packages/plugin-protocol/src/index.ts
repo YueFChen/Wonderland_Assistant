@@ -16,7 +16,7 @@ export type PluginFailure = { code: string, message: string,
  * RFC 3339 UTC timestamp.
  */
 occurredAt: string, };
-export type PluginRuntimeState = { manifest: PluginManifest, installation: InstallationState, trusted: boolean, enabled: boolean, runtime: RuntimeState, lastError: PluginFailure | null, grantedCapabilities: Array<string>, serviceDependencyIssues?: Array<string>, };
+export type PluginRuntimeState = { manifest: PluginManifest, installation: InstallationState, enabled: boolean, runtime: RuntimeState, lastError: PluginFailure | null, grantedCapabilities: Array<string>, serviceDependencyIssues?: Array<string>, };
 export type PluginError = { code: string, message: string, details: unknown, };
 export type HostHello = { protocol: string, version: string, type: string, role: string, pluginId: string, coreVersion: string, grantedCapabilities: Array<string>, };
 export type PluginHello = { protocol: string, version: string, type: string, role: string, pluginId: string, pluginVersion: string, contractSha256: string, };

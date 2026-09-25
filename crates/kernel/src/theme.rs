@@ -45,7 +45,7 @@ pub struct BackgroundAsset {
 }
 
 /// 主题设置。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(ts_rs::TS))]
 pub struct ThemeSettings {
     #[serde(default)]
@@ -55,6 +55,23 @@ pub struct ThemeSettings {
     /// 切换主题档位时保留自定义背景载荷。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<BackgroundKind>,
+    /// 自定义背景的不透明度，范围为 0 到 100。
+    #[serde(default = "default_background_opacity")]
+    pub background_opacity: u8,
+}
+
+impl Default for ThemeSettings {
+    fn default() -> Self {
+        Self {
+            mode: ThemeMode::default(),
+            background: None,
+            background_opacity: default_background_opacity(),
+        }
+    }
+}
+
+fn default_background_opacity() -> u8 {
+    100
 }
 
 /// 主题设置 + 解析出的背景图 URL，供前端直接渲染。

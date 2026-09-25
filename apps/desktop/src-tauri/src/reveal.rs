@@ -49,6 +49,9 @@ mod platform {
     }
 
     pub(super) fn open_url(_url: &str) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "打开链接当前只实现了 Windows"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "打开链接当前只实现了 Windows",
+        ))
     }
 }

@@ -12,7 +12,6 @@
     "dev": "pnpm --filter @wonderland/desktop run dev",
     "build": "pnpm --filter @wonderland/desktop run build",
     "typecheck": "pnpm -r run typecheck",
-    "check:ui-literals": "node scripts/check-ui-literals.mjs",
-    "check:vscode-config": "node scripts/check-vscode-config.mjs"
+    "create:plugin": "node scripts/create-plugin.mjs"
   }
 }

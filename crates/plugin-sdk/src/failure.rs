@@ -61,7 +61,13 @@ impl fmt::Display for PluginFailure {
             Self::Timeout => write!(f, "请求超时，请重试"),
             Self::Connection => write!(f, "网络连接失败，请重试"),
             Self::Http(code) => write!(f, "服务返回 HTTP {code}"),
-            Self::Business { code, message } => if message.is_empty() { write!(f, "官方接口返回业务码 {code}") } else { write!(f, "官方接口返回业务码 {code}：{message}") },
+            Self::Business { code, message } => {
+                if message.is_empty() {
+                    write!(f, "官方接口返回业务码 {code}")
+                } else {
+                    write!(f, "官方接口返回业务码 {code}：{message}")
+                }
+            }
             Self::InvalidResponse => write!(f, "官方接口数据结构已变化或分页不完整"),
             Self::InvalidInput => write!(f, "请求参数无效或角色不属于此账号"),
             Self::PluginDisabled => write!(f, "插件本次启动未启用"),

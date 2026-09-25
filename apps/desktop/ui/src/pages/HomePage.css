@@ -1,0 +1,11 @@
+.home-wordmark {
+  font-family: "Cinzel", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+  font-variant: small-caps;
+  font-feature-settings: "smcp" 1, "c2sc" 1;
+  font-weight: 700;
+  letter-spacing: -0.045em;
+  text-shadow:
+    0 2px 0 rgb(255 255 255 / 0.12),
+    0 8px 24px var(--app-accent-soft);
+  -webkit-text-stroke: 0.25px var(--app-accent-line);
+}

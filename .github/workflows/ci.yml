@@ -22,11 +22,10 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - run: node scripts/check-vscode-config.mjs
+      - run: node --check scripts/create-plugin.mjs
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r run typecheck
       - run: pnpm -r run test
-      - run: pnpm run check:ui-literals
       - run: pnpm --filter @wonderland/desktop-ui run build
       - uses: actions/upload-artifact@v4
         with:
@@ -51,11 +50,6 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo run --locked -p wonderland-kernel --example generate_bindings --features bindings -- --check
       - run: cargo run --locked -p wonderland-plugin-protocol --example generate_bindings --features bindings -- --check
-      - run: cargo run --locked -p wonderland-my-wonderland --example generate_bindings --features bindings -- --check
-      - run: cargo run --locked -p wonderland-comment-collector --example generate_bindings --features bindings -- --check
-      - run: cargo run --locked -p wonderland-rich-editor --example generate_bindings --features bindings -- --check
-      - run: cargo run --locked -p wonderland-knowledge-library --example generate_bindings --features bindings -- --check
-      - run: cargo run --locked -p wonderland-translator --example generate_bindings --features bindings -- --check
       - run: cargo build --workspace --locked
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4

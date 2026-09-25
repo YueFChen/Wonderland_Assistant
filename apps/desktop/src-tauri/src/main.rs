@@ -2,6 +2,7 @@
 
 mod account_window;
 mod commands;
+mod game_launcher;
 mod logging;
 mod plugin_manager;
 mod plugin_package;
@@ -12,6 +13,8 @@ mod state;
 mod theme;
 mod user_data;
 
+#[cfg(debug_assertions)]
+use std::path::PathBuf;
 use tauri::Manager;
 use wonderland_logging::Logging;
 
@@ -28,6 +31,8 @@ fn main() {
             )
         })
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let (context, logging) = state::bootstrap(app.handle())?;
             if let Some(logging) = logging {
@@ -36,6 +41,17 @@ fn main() {
             let plugin_manager =
                 plugin_manager::PluginManager::load(&context, app.handle().clone())
                     .map_err(|error| std::io::Error::other(error.message))?;
+            #[cfg(debug_assertions)]
+            if let Some(source) = std::env::var_os("WONDERLAND_DEV_PLUGIN_DIR") {
+                plugin_manager
+                    .install_debug_directory(PathBuf::from(source))
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "Cannot install the configured development plugin: {}",
+                            error.message
+                        ))
+                    })?;
+            }
             plugin_manager.start_enabled();
             app.manage(plugin_manager);
             app.manage(context);
@@ -43,6 +59,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             plugin_manager::plugins_list,
+            plugin_manager::plugins_catalog_list,
+            plugin_manager::plugins_catalog_install,
             plugin_manager::plugins_install,
             plugin_manager::plugins_remove,
             plugin_manager::plugins_set_enabled,
@@ -56,6 +74,9 @@ fn main() {
             commands::account_login_cancel,
             commands::account_switch,
             commands::account_remove,
+            game_launcher::game_launcher_get,
+            game_launcher::game_launcher_select,
+            game_launcher::game_launcher_launch,
             theme::theme_get,
             theme::theme_set,
             theme::theme_backgrounds,

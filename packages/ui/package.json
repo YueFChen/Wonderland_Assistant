@@ -1,6 +1,6 @@
 {
   "name": "@wonderland/ui",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "Apache-2.0",
   "description": "共享设计系统：Tailwind v4 主题令牌与可复用组件配方。",
@@ -11,7 +11,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./i18n": "./src/i18n/index.ts",
-    "./theme.css": "./src/theme.css"
+    "./theme.css": "./src/theme.css",
+    "./plugin-theme.css": "./src/plugin-theme.css"
   },
   "peerDependencies": {
     "react": "19.3.0",

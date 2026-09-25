@@ -36,6 +36,9 @@ wonderland-net = { path = "../../../crates/net" }
 wonderland-secret = { path = "../../../crates/secret" }
 wonderland-plugin-protocol = { path = "../../../crates/plugin-protocol" }
 zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
+winreg = "0.55"
