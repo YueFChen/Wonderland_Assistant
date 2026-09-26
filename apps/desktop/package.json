@@ -1,6 +1,6 @@
 {
   "name": "@wonderland/desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "license": "Apache-2.0",
   "description": "Tauri 应用包：持有 CLI 与宿主编排脚本，前端源码在 ui/。",

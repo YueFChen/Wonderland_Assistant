@@ -5325,7 +5325,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wonderland-account"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5338,7 +5338,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -5349,7 +5349,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5381,7 +5381,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-kernel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5391,7 +5391,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-logging"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "regex",
  "tracing",
@@ -5402,7 +5402,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-mihoyo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "wonderland-kernel",
@@ -5411,7 +5411,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest",
  "serde",
@@ -5422,7 +5422,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-plugin-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5431,7 +5431,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-plugin-sdk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5441,11 +5441,11 @@ dependencies = [
 
 [[package]]
 name = "wonderland-secret"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "wonderland-user-data"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
