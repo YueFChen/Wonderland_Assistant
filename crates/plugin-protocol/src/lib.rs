@@ -9,7 +9,7 @@ use ts_rs::TS;
 
 pub const PROTOCOL_ID: &str = "wonderland-plugin";
 pub const PROTOCOL_VERSION: &str = "1.0.0";
-pub const UI_BRIDGE_VERSION: &str = "1.0.0";
+pub const UI_BRIDGE_VERSION: &str = "1.1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
@@ -38,7 +38,7 @@ pub struct PluginManifest {
 }
 
 /// A versioned service contract offered to other plugins through a future Core broker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
@@ -50,7 +50,7 @@ pub struct PluginService {
 
 /// A service contract range required by this plugin. `optional` lets the plugin report
 /// reduced functionality without preventing its backend from starting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
@@ -59,6 +59,19 @@ pub struct PluginServiceRequirement {
     pub min_version: String,
     pub max_version_exclusive: String,
     pub optional: bool,
+    pub methods: Vec<String>,
+}
+
+/// Result of resolving a declared plugin service requirement to its unique active provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
+pub struct PluginServiceResolution {
+    pub service_id: String,
+    pub provider_id: String,
+    pub version: String,
+    pub methods: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +127,30 @@ pub struct PluginUiContribution {
     pub default_order: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<PluginUiCommand>,
+}
+
+/// A command the plugin UI explicitly accepts from the Core CLI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
+pub struct PluginUiCommand {
+    pub id: String,
+    pub title: String,
+    #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
+    pub input_schema: Value,
+    pub effect: PluginUiCommandEffect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", ts(rename_all = "snake_case"))]
+pub enum PluginUiCommandEffect {
+    ReadOnly,
+    Mutating,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +205,17 @@ pub struct PluginFailure {
     pub occurred_at: String,
 }
 
+/// Installation provenance shown to the user; this is not a publisher signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
+pub struct PluginInstallSource {
+    pub kind: String,
+    pub origin: String,
+    pub author: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -179,8 +227,13 @@ pub struct PluginRuntimeState {
     pub runtime: RuntimeState,
     pub last_error: Option<PluginFailure>,
     pub granted_capabilities: Vec<String>,
+    #[serde(default)]
+    pub installation_source: Option<PluginInstallSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_dependency_issues: Vec<String>,
+    /// Expected per-plugin persistent data directory managed by Core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_data_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

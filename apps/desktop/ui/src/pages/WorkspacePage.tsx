@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { ArrowRight, ArrowLeftRight, ArrowUp, ArrowDown, GripVertical, Pin, Search, Puzzle, RotateCcw, Eye, EyeOff } from 'lucide-react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 
 import { pluginIcon } from '../plugins/icons'
 import { buildContributionRegistry, openContribution } from '../plugins/contributions'
@@ -12,12 +12,14 @@ import './WorkspacePage.css'
 
 /** Workspace launcher exposes one primary Activity per plugin; auxiliary Views stay in Core-owned slots. */
 export function WorkspacePage() {
+  const location = useLocation()
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const managingPlugins = searchParams.get('view') === 'plugins'
   const { states, error, setStates } = usePlugins()
   const { layout, togglePinned, toggleHidden, move, reorderActivities, reset } = useWorkspaceLayout()
   const [pluginAuthors, setPluginAuthors] = useState<Record<string, string>>({})
+  const [recoveryNotice, setRecoveryNotice] = useState('')
   const [draggedActivityId, setDraggedActivityId] = useState<string | null>(null)
   const [dropTargetId, setDropTargetId] = useState<string | null>(null)
   const [previewOrderIds, setPreviewOrderIds] = useState<string[] | null>(null)
@@ -44,6 +46,17 @@ export function WorkspacePage() {
       })
     return () => { live = false }
   }, [managingPlugins])
+  useEffect(() => {
+    const routeState = location.state as {
+      pluginPageRecovery?: { pluginId?: unknown; contributionId?: unknown }
+    } | null
+    const recovery = routeState?.pluginPageRecovery
+    if (typeof recovery?.pluginId !== 'string' || typeof recovery.contributionId !== 'string') return
+    setRecoveryNotice(t('workspace.recovery.unavailable', {
+      pluginId: recovery.pluginId,
+      contributionId: recovery.contributionId,
+    }))
+  }, [location.state])
   const activityDrag = useRef<{
     pointerId: number
     sourceId: string
@@ -208,6 +221,12 @@ export function WorkspacePage() {
       </header>
 
       {error && !managingPlugins && <p role="alert" className="mb-5 rounded-lg border border-[var(--app-danger)]/30 bg-[var(--app-danger)]/10 px-4 py-3 text-sm text-[var(--app-danger)]">{t(error)}</p>}
+      {recoveryNotice && !managingPlugins && (
+        <div role="status" className="mb-5 flex flex-wrap items-center gap-3 rounded-lg border border-glass-line bg-glass px-4 py-3 text-sm text-ink-muted">
+          <p className="min-w-0 flex-1">{recoveryNotice}</p>
+          <button type="button" onClick={() => setRecoveryNotice('')} className="shrink-0 rounded-md px-2 py-1 text-ink hover:bg-glass-hover">{t('common.dismiss')}</button>
+        </div>
+      )}
 
       {managingPlugins ? (
         <PluginManagement states={states} error={error} setStates={setStates} />

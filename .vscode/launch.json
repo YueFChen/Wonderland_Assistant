@@ -10,8 +10,7 @@
       "env": {
         "CARGO_HOME": "${workspaceFolder}\\.cargo-home",
         "RUSTUP_HOME": "${workspaceFolder}\\.cargo-home\\rustup",
-        "npm_config_cache": "${workspaceFolder}\\.npm-cache",
-        "WONDERLAND_PLUGIN_UI_ISOLATION_TEST": "1"
+        "npm_config_cache": "${workspaceFolder}\\.npm-cache"
       }
     },
     {
@@ -26,8 +25,7 @@
       "env": {
         "CARGO_HOME": "${workspaceFolder}\\.cargo-home",
         "RUSTUP_HOME": "${workspaceFolder}\\.cargo-home\\rustup",
-        "npm_config_cache": "${workspaceFolder}\\.npm-cache",
-        "WONDERLAND_PLUGIN_UI_ISOLATION_TEST": "1"
+        "npm_config_cache": "${workspaceFolder}\\.npm-cache"
       },
       "sourceLanguages": ["rust"],
       "preLaunchTask": "prepare: Core Rust 调试"

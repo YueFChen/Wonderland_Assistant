@@ -15,12 +15,18 @@ export function PluginManagement({ states, error, setStates }: {
   const [busy, setBusy] = useState('')
   const [failure, setFailure] = useState('')
 
-  const remove = async (state: PluginRuntimeState) => {
-    if (!window.confirm(t('settings.plugins.removeConfirm', { name: state.manifest.name }))) return
+  const remove = async (state: PluginRuntimeState, removePluginData: boolean) => {
+    const confirmation = removePluginData
+      ? t('settings.plugins.removeDataConfirm', {
+          name: state.manifest.name,
+          path: state.pluginDataDirectory ?? '—',
+        })
+      : t('settings.plugins.removeConfirm', { name: state.manifest.name })
+    if (!window.confirm(confirmation)) return
     setBusy(state.manifest.id)
     setFailure('')
     try {
-      setStates(await pluginApi.remove(state.manifest.id))
+      setStates(await pluginApi.remove(state.manifest.id, removePluginData))
     } catch (cause) {
       setFailure(t('settings.plugins.removeFailed', { error: errorText(cause) }))
     } finally {
@@ -89,7 +95,7 @@ export function PluginManagement({ states, error, setStates }: {
               state={state}
               busy={busy === state.manifest.id}
               onToggle={(enabled) => void setEnabled(state, enabled)}
-              onRemove={() => void remove(state)}
+              onRemove={(removePluginData) => void remove(state, removePluginData)}
               onCapabilitiesChange={(capabilities) => void setCapabilities(state, capabilities)}
             />
           ))}
@@ -103,7 +109,7 @@ function PluginCard({ state, busy, onToggle, onRemove, onCapabilitiesChange }: {
   state: PluginRuntimeState
   busy: boolean
   onToggle: (enabled: boolean) => void
-  onRemove: () => void
+  onRemove: (removePluginData: boolean) => void
   onCapabilitiesChange: (capabilities: string[]) => void
 }) {
   const enabled = state.enabled
@@ -124,6 +130,18 @@ function PluginCard({ state, busy, onToggle, onRemove, onCapabilitiesChange }: {
             )}
           </div>
           <p className="mt-1 break-all text-[11px] text-ink-faint">{state.manifest.id} · v{state.manifest.version}</p>
+          <p className="mt-1 break-all text-[11px] text-ink-faint">
+            {state.installationSource?.kind === 'catalog'
+              ? t('settings.plugins.source.catalog', { author: state.installationSource.author ?? '', origin: state.installationSource.origin })
+              : state.installationSource?.kind === 'local'
+                ? t('settings.plugins.source.local', { origin: state.installationSource.origin })
+                : t('settings.plugins.source.unknown')}
+          </p>
+          {state.pluginDataDirectory && (
+            <p className="mt-1 break-all font-mono text-[10px] text-ink-faint">
+              {t('settings.plugins.dataDirectory', { path: state.pluginDataDirectory })}
+            </p>
+          )}
           <p className={`mt-2 text-xs ${issue ? 'text-[var(--app-danger)]' : 'text-ink-muted'}`}>
             {issue ?? t(`settings.plugins.runtime.${state.runtime}`)}
           </p>
@@ -134,12 +152,18 @@ function PluginCard({ state, busy, onToggle, onRemove, onCapabilitiesChange }: {
           )}
           {!state.manifest.ui && <p className="mt-1 text-[11px] text-ink-faint">{t('settings.plugins.serviceOnly')}</p>}
         </div>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
           <Switch label={state.manifest.name} checked={enabled} disabled={busy || state.installation !== 'installed'} onChange={onToggle} />
           {state.installation !== 'invalid' && (
-            <button type="button" disabled={busy} onClick={onRemove} className="rounded-lg p-2 text-ink-faint transition hover:bg-[var(--app-danger)]/10 hover:text-[var(--app-danger)] disabled:opacity-50" aria-label={t('settings.plugins.remove')} title={t('settings.plugins.remove')}>
-              <Trash2 className="h-4 w-4" aria-hidden />
-            </button>
+            <>
+              <button type="button" disabled={busy} onClick={() => onRemove(false)} className="rounded-lg border border-glass-line px-2 py-1.5 text-[11px] text-ink-muted transition hover:bg-glass-hover disabled:opacity-50">
+                {t('settings.plugins.remove')}
+              </button>
+              <button type="button" disabled={busy} onClick={() => onRemove(true)} className="inline-flex items-center gap-1 rounded-lg border border-[var(--app-danger-line)] px-2 py-1.5 text-[11px] text-[var(--app-danger)] transition hover:bg-[var(--app-danger)]/10 disabled:opacity-50">
+                <Trash2 className="h-3 w-3" aria-hidden />
+                {t('settings.plugins.removeAndDeleteData')}
+              </button>
+            </>
           )}
         </div>
       </div>

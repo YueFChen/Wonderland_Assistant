@@ -65,6 +65,31 @@ jobs:
             Where-Object { $_.Extension -in '.msi', '.exe' })
           if ($bundles.Count -eq 0) { throw 'Windows installer missing from target/release/bundle' }
           $bundles | Select-Object -ExpandProperty FullName
+      - name: Install package and verify shipped wla CLI
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -Path 'target/release/bundle/nsis' -Filter '*.exe' -File)
+          if ($installers.Count -eq 0) { throw 'NSIS installer missing from target/release/bundle/nsis' }
+          $installRoot = Join-Path $env:TEMP "WonderlandAssistant-InstallCheck-$env:GITHUB_RUN_ID"
+          $installerProcess = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installRoot") -Wait -PassThru -WindowStyle Hidden
+          if ($installerProcess.ExitCode -ne 0) { throw "Silent installer returned $($installerProcess.ExitCode)." }
+          $targetTriple = ((rustc -vV | Select-String '^host: (.+)$').Matches.Groups[1].Value)
+          $cli = Join-Path $installRoot "resources/binaries/wla-$targetTriple.exe"
+          if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) { throw "Installed wla sidecar missing at '$cli'." }
+          $appVersion = (Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $reportedVersion = (& $cli --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne "wla $appVersion") { throw "CLI version mismatch: '$reportedVersion'." }
+          $profile = Join-Path $env:TEMP "WonderlandAssistant-CliCheck-$env:GITHUB_RUN_ID"
+          $statusOutput = & $cli --data-dir $profile core status
+          if ($LASTEXITCODE -ne 0) { throw 'Installed CLI core status command failed.' }
+          $status = ($statusOutput -join "`n") | ConvertFrom-Json
+          if (-not $status.ok -or $status.data.version -ne $appVersion -or $status.data.desktopRunning) { throw 'Installed CLI returned an invalid core status response.' }
+          $stdout = Join-Path $env:TEMP "WonderlandAssistant-CliCheck-$env:GITHUB_RUN_ID.out"
+          $stderr = Join-Path $env:TEMP "WonderlandAssistant-CliCheck-$env:GITHUB_RUN_ID.err"
+          $invalid = Start-Process -FilePath $cli -ArgumentList @('--data-dir', $profile, 'invalid-command') -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          if ($invalid.ExitCode -ne 2) { throw "Invalid CLI command returned exit code $($invalid.ExitCode), expected 2." }
+          $failure = Get-Content -LiteralPath $stderr -Raw | ConvertFrom-Json
+          if ($failure.ok -or $failure.error.code -ne 'INVALID_REQUEST') { throw 'Installed CLI returned an invalid error contract.' }
 
   supply-chain:
     name: Supply chain（cargo-deny）

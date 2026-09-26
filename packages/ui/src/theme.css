@@ -26,14 +26,7 @@
   --color-glass-line: var(--app-glass-line);
   --color-glass-line-strong: var(--app-glass-line-strong);
 
-  /* 状态色 */
-  --color-status-ready-from: #10b981;
-  --color-status-ready-to: #059669;
-  --color-status-dev-from: #6b7280;
-  --color-status-dev-to: #4b5563;
-
   /* 圆角与模糊 */
-  --radius-tile: 0.75rem;
   --radius-card: 1rem;
   --blur-glass: 20px;
 
@@ -119,47 +112,7 @@
     ));
   }
 
-  /* 模块卡片：可进入时上浮，未就绪时保持静止 */
-  .module-card {
-    transition:
-      transform 0.25s cubic-bezier(0.22, 1, 0.36, 1),
-      background-color 0.25s ease;
-  }
-
-  .module-card[data-actionable="true"]:hover {
-    transform: translateY(-4px);
-    background-color: var(--color-glass-hover);
-  }
-
-  .module-card[data-actionable="true"]:focus-visible {
-    outline: 2px solid var(--color-brand-400);
-    outline-offset: 2px;
-  }
-
-  .module-card[data-actionable="false"] {
-    opacity: 0.55;
-    cursor: not-allowed;
-  }
-
-  /* 模块图标块：渐变由数据注入 */
-  .module-tile {
-    background-image: var(--module-gradient);
-  }
-
-  /* 状态徽章 */
-  .status-badge--ready {
-    background-image: linear-gradient(
-      135deg,
-      var(--color-status-ready-from),
-      var(--color-status-ready-to)
-    );
-  }
-
-  .status-badge--dev {
-    background-image: linear-gradient(
-      135deg,
-      var(--color-status-dev-from),
-      var(--color-status-dev-to)
-    );
+  .user-avatar-fallback {
+    background-image: linear-gradient(135deg, var(--color-brand-600), var(--color-brand-700));
   }
 }

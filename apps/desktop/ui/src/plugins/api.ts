@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useEffect, useState } from 'react'
-import type { PluginRuntimeState } from '@wonderland/plugin-protocol'
+import type { PluginRuntimeState, PluginService, PluginServiceRequirement } from '@wonderland/plugin-protocol'
 
 import type { MessageKey } from '../i18n'
 
@@ -31,6 +31,8 @@ export interface PluginCatalogEntry {
   uiBridgeCompatibility: { minVersion: string; maxVersionExclusive: string } | null
   platform: { os: string; architecture: string; abi: string }
   capabilities: string[]
+  provides: PluginService[]
+  requires: PluginServiceRequirement[]
 }
 
 export interface PluginCatalogSnapshot {
@@ -48,12 +50,9 @@ export interface PluginCatalogSnapshot {
 export const pluginApi = {
   states: () => invoke<PluginRuntimeState[]>('plugins_list'),
   catalog: () => invoke<PluginCatalogSnapshot>('plugins_catalog_list'),
-  installCatalog: (pluginId: string, version: string, expectedSha256: string, approvedCapabilities: string[]) =>
+  installCatalog: (pluginId: string, version: string, expectedSha256: string, approvedCapabilities: string[], approvedSourceChange: boolean) =>
     invoke<PluginRuntimeState[]>('plugins_catalog_install', {
-      pluginId,
-      version,
-      expectedSha256,
-      approvedCapabilities,
+      request: { pluginId, version, expectedSha256, approvedCapabilities, approvedSourceChange },
     }),
   install: () => invoke<PluginRuntimeState[]>('plugins_install'),
   remove: (pluginId: string, removePluginData = false) =>
@@ -101,10 +100,16 @@ export function usePlugins() {
         })
     }
     refresh()
+    let unlisten: (() => void) | undefined
+    void listen('plugins:changed', refresh).then((stop) => {
+      if (live) unlisten = stop
+      else stop()
+    })
     const timer = window.setInterval(refresh, 2_000)
     return () => {
       live = false
       window.clearInterval(timer)
+      unlisten?.()
     }
   }, [])
 

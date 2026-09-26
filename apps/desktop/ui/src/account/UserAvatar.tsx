@@ -1,9 +1,5 @@
 import { UserRound } from 'lucide-react'
-import type { CSSProperties } from 'react'
 import { useEffect, useState } from 'react'
-
-/** 账号体系固定一色，与各工具模块的渐变区分开。 */
-const AVATAR_GRADIENT = 'linear-gradient(135deg, #6d4aff, #4f46e5)'
 
 /** 远端头像的加载尝试次数与重试间隔。 */
 const MAX_IMAGE_ATTEMPTS = 3
@@ -48,14 +44,8 @@ export function UserAvatar({ name, src, size = 40 }: UserAvatarProps) {
 
   return (
     <div
-      className="module-tile relative flex shrink-0 items-center justify-center overflow-hidden rounded-full"
-      style={
-        {
-          '--module-gradient': AVATAR_GRADIENT,
-          width: size,
-          height: size,
-        } as CSSProperties
-      }
+      className="user-avatar-fallback relative flex shrink-0 items-center justify-center overflow-hidden rounded-full"
+      style={{ width: size, height: size }}
     >
       {initial ? (
         <span className="font-bold text-white" style={{ fontSize: size * 0.42 }} aria-hidden>

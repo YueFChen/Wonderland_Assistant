@@ -7,6 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "wonderland-desktop"
+path = "src/main.rs"
+
+[[bin]]
+name = "wla"
+path = "src/bin/wla.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -40,5 +48,5 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 winreg = "0.55"

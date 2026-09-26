@@ -111,6 +111,14 @@ pending_path: string | null,
  */
 last_migration_path: string | null,
 /**
+ * 迁移成功后未能清理的旧目录；新目录已激活，旧路径可能只剩部分文件。
+ */
+last_migration_source: string | null,
+/**
+ * 迁移已完成但旧目录清理未完全成功时的提示。
+ */
+last_migration_warning: string | null,
+/**
  * 上次启动迁移失败的原因；失败时仍从原目录启动，不丢数据。
  */
 last_migration_error: string | null, };

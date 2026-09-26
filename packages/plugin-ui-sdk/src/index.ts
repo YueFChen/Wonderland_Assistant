@@ -1,6 +1,6 @@
 /** Browser-only client for the versioned UI Host Bridge. It never imports Core React state. */
 export const UI_BRIDGE_PROTOCOL = 'wonderland-plugin-ui'
-export const UI_BRIDGE_VERSION = '1.0.0'
+export const UI_BRIDGE_VERSION = '1.1.0'
 
 export interface PluginUiEvent {
   pluginId: string
@@ -11,6 +11,12 @@ export interface PluginUiEvent {
 
 export interface HostTheme {
   resolved: 'light' | 'dark'
+}
+
+export interface PluginUiCommandRequest {
+  requestId: string
+  commandId: string
+  input: unknown
 }
 
 /** Read-only payload returned by the Core `account.read` capability. */
@@ -39,6 +45,7 @@ export interface PluginHostClient {
   subscribe(topic: string, listener: (event: PluginUiEvent) => void): Promise<() => void>
   followHostTheme(listener: (theme: HostTheme) => void): Promise<() => void>
   onSurfaceLifecycle(listener: (state: 'active' | 'inactive') => void): Promise<() => void>
+  onCommand(listener: (command: PluginUiCommandRequest) => unknown | Promise<unknown>): Promise<() => void>
   openWorkspaceView(viewId: string): Promise<void>
 }
 
@@ -51,15 +58,30 @@ interface HostEnvelope {
   type?: string
   requestId?: string
   result?: unknown
-  error?: { code?: string; message?: string }
+  error?: { code?: string; message?: string; details?: unknown }
   event?: PluginUiEvent
   context?: { theme?: HostTheme }
   state?: 'active' | 'inactive'
+  commandId?: string
+  input?: unknown
 }
 
 interface PendingCall {
   resolve: (value: unknown) => void
   reject: (cause: Error) => void
+}
+
+export class PluginHostError extends Error {
+  readonly code: string
+  readonly details: unknown
+
+  constructor(code: string, message: string, details: unknown = null) {
+    super(message)
+    this.name = 'PluginHostError'
+    this.code = code
+    this.details = details
+    Object.setPrototypeOf(this, new.target.prototype)
+  }
 }
 
 /** Create one client for the current sandbox frame using its Core-injected contribution ID. */
@@ -71,6 +93,7 @@ export function createPluginHostClient(pluginId: string): PluginHostClient {
   const eventListeners = new Map<string, Set<(event: PluginUiEvent) => void>>()
   const themeListeners = new Set<(theme: HostTheme) => void>()
   const lifecycleListeners = new Set<(state: 'active' | 'inactive') => void>()
+  const commandListeners = new Set<(command: PluginUiCommandRequest) => unknown | Promise<unknown>>()
   const requestedTopics = new Set<string>()
   let nonce = ''
   let resolveReady: (() => void) | undefined
@@ -121,12 +144,49 @@ export function createPluginHostClient(pluginId: string): PluginHostClient {
       for (const listener of eventListeners.get(message.event.topic) ?? []) listener(message.event)
       return
     }
+    if (
+      message.type === 'command'
+      && typeof message.requestId === 'string'
+      && typeof message.commandId === 'string'
+    ) {
+      const listener = commandListeners.values().next().value
+      if (!listener) {
+        send({
+          type: 'command_error',
+          requestId: message.requestId,
+          error: { code: 'UI_COMMAND_UNHANDLED', message: 'This plugin UI does not handle the declared command.' },
+        })
+        return
+      }
+      void Promise.resolve()
+        .then(() => listener({
+          requestId: message.requestId!,
+          commandId: message.commandId!,
+          input: message.input,
+        }))
+        .then((result) => send({ type: 'command_result', requestId: message.requestId, result }))
+        .catch((cause: unknown) => send({
+          type: 'command_error',
+          requestId: message.requestId,
+          error: {
+            code: cause instanceof PluginHostError ? cause.code : 'UI_COMMAND_FAILED',
+            message: cause instanceof Error ? cause.message : String(cause),
+          },
+        }))
+      return
+    }
     if (typeof message.requestId !== 'string') return
     const request = pending.get(message.requestId)
     if (!request) return
     pending.delete(message.requestId)
     if (message.type === 'result') request.resolve(message.result)
-    if (message.type === 'error') request.reject(new Error(message.error?.message ?? message.error?.code ?? 'Plugin call failed.'))
+    if (message.type === 'error') {
+      request.reject(new PluginHostError(
+        message.error?.code ?? 'PLUGIN_ERROR',
+        message.error?.message ?? message.error?.code ?? 'Plugin call failed.',
+        message.error?.details,
+      ))
+    }
   }
   window.addEventListener('message', onMessage)
 
@@ -168,6 +228,12 @@ export function createPluginHostClient(pluginId: string): PluginHostClient {
     }
   }
 
+  const onCommand = async (listener: (command: PluginUiCommandRequest) => unknown | Promise<unknown>) => {
+    commandListeners.add(listener)
+    await ready
+    return () => commandListeners.delete(listener)
+  }
+
   return {
     ready,
     async call<T>(method: string, params: unknown = {}) {
@@ -193,6 +259,7 @@ export function createPluginHostClient(pluginId: string): PluginHostClient {
     subscribe,
     followHostTheme,
     onSurfaceLifecycle,
+    onCommand,
     async openWorkspaceView(viewId: string) {
       await ready
       send({ type: 'open_sidebar', viewId })

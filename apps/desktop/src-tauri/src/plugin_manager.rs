@@ -1,16 +1,20 @@
 //! Generic plugin host commands and lifecycle state.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+#[cfg(debug_assertions)]
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
@@ -18,8 +22,10 @@ use wonderland_kernel::AppContext;
 use wonderland_kernel::logging::warn;
 use wonderland_plugin_protocol::{
     HostCompatibility, InstallationState, PluginBackend, PluginError, PluginFailure,
-    PluginManifest, PluginPlatform, PluginRuntimeState, PluginUi, PluginUiContribution,
-    PluginUiContributionKind, ProtocolCompatibility, RuntimeState,
+    PluginInstallSource, PluginManifest, PluginPlatform, PluginRuntimeState, PluginService,
+    PluginServiceRequirement, PluginServiceResolution, PluginUi, PluginUiCommand,
+    PluginUiCommandEffect, PluginUiContribution, PluginUiContributionKind, ProtocolCompatibility,
+    RuntimeState,
 };
 
 use crate::{plugin_package, plugin_runtime::PluginProcess};
@@ -56,6 +62,10 @@ struct PluginCatalogEntry {
     ui_bridge_compatibility: Option<ProtocolCompatibility>,
     platform: PluginPlatform,
     capabilities: Vec<String>,
+    #[serde(default)]
+    provides: Vec<PluginService>,
+    #[serde(default)]
+    requires: Vec<PluginServiceRequirement>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +95,7 @@ struct PluginManagerInner {
     documents_dir: PathBuf,
     installed_root: PathBuf,
     app_handle: AppHandle,
+    next_service_request_id: AtomicU64,
     state: Mutex<PluginManagerState>,
 }
 
@@ -112,6 +123,8 @@ struct Preferences {
     granted_capabilities: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     active_versions: BTreeMap<String, String>,
+    #[serde(default)]
+    installation_sources: BTreeMap<String, PluginInstallSource>,
 }
 
 impl Default for Preferences {
@@ -121,6 +134,7 @@ impl Default for Preferences {
             enabled_plugins: BTreeMap::new(),
             granted_capabilities: BTreeMap::new(),
             active_versions: BTreeMap::new(),
+            installation_sources: BTreeMap::new(),
         }
     }
 }
@@ -149,6 +163,7 @@ impl PluginManager {
                 documents_dir,
                 installed_root,
                 app_handle,
+                next_service_request_id: AtomicU64::new(1),
                 state: Mutex::new(PluginManagerState {
                     preferences,
                     config_error,
@@ -183,6 +198,47 @@ impl PluginManager {
                     }
                 });
         }
+    }
+
+    fn ensure_cli_plugin_started(&self, plugin_id: &str) -> Result<(), PluginError> {
+        self.inner.start_one(plugin_id)
+    }
+
+    #[cfg(debug_assertions)]
+    fn inject_backend_exit_for_test(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Vec<PluginRuntimeState>, PluginError> {
+        let process = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?
+            .plugins
+            .get(plugin_id)
+            .and_then(|record| record.process.clone())
+            .ok_or_else(|| plugin_error("NOT_RUNNING", "Plugin backend is not running."))?;
+        process.terminate_for_test()?;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process.is_alive() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        let snapshots = self.snapshots();
+        if !snapshots.iter().any(|snapshot| {
+            snapshot.manifest.id == plugin_id
+                && snapshot.runtime == RuntimeState::Failed
+                && snapshot
+                    .last_error
+                    .as_ref()
+                    .is_some_and(|failure| failure.code == "PLUGIN_CRASHED")
+        }) {
+            return Err(plugin_error(
+                "PLUGIN_CRASH_NOT_DETECTED",
+                "The plugin exit was not reflected as PLUGIN_CRASHED.",
+            ));
+        }
+        Ok(snapshots)
     }
 
     fn refresh(&self) -> Result<(), PluginError> {
@@ -274,7 +330,20 @@ impl PluginManager {
                             None
                         },
                         granted_capabilities: granted.clone(),
+                        installation_source: state
+                            .preferences
+                            .installation_sources
+                            .get(&id)
+                            .cloned(),
                         service_dependency_issues: Vec::new(),
+                        plugin_data_directory: Some(
+                            self.inner
+                                .app_data_dir
+                                .join("plugin-data")
+                                .join(&id)
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
                     };
                     let process = old.get(&id).and_then(|record| {
                         (record.directory == plugin.directory
@@ -368,14 +437,73 @@ impl PluginManager {
         }
         let manifest = plugin_package::manifest_for_install_source(&source)
             .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
-        self.install(source, true)?;
+        self.install(source, true, true)?;
         self.set_enabled(&manifest.id, true)
+    }
+
+    fn install_cli_package(
+        &self,
+        source: PathBuf,
+        approved_capabilities: Vec<String>,
+        overwrite: bool,
+        approve_source_change: bool,
+    ) -> Result<Vec<PluginRuntimeState>, PluginError> {
+        if source.is_dir() && !cfg!(debug_assertions) {
+            return Err(plugin_error(
+                "INVALID_REQUEST",
+                "Release CLI installs require a validated .wplug archive.",
+            ));
+        }
+        let manifest = plugin_package::manifest_for_install_source(&source)
+            .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
+        let approved = approved_capabilities.iter().collect::<BTreeSet<_>>();
+        if approved.len() != approved_capabilities.len() {
+            return Err(plugin_error(
+                "INVALID_REQUEST",
+                "Capability grants must not contain duplicates.",
+            ));
+        }
+        let requested = manifest.capabilities.iter().collect::<BTreeSet<_>>();
+        if approved
+            .iter()
+            .any(|capability| !requested.contains(capability))
+        {
+            return Err(plugin_error(
+                "UNAUTHORIZED",
+                "A requested CLI grant is not declared by this plugin.",
+            ));
+        }
+        let origin = source.canonicalize().map_err(|error| {
+            plugin_error(
+                "INVALID_REQUEST",
+                &format!("Cannot resolve local package: {error}"),
+            )
+        })?;
+        let install_path = plugin_package::install_path(&self.inner.installed_root, &manifest);
+        if install_path.exists() && !overwrite {
+            return Err(plugin_error(
+                "ALREADY_INSTALLED",
+                "This plugin version is already installed. Pass --overwrite to replace it.",
+            ));
+        }
+        self.install_with_capabilities(
+            source,
+            overwrite,
+            Some(&approved_capabilities),
+            PluginInstallSource {
+                kind: "local".to_owned(),
+                origin: origin.to_string_lossy().into_owned(),
+                author: None,
+            },
+            approve_source_change,
+        )
     }
 
     fn install_catalog_package(
         &self,
         source: PathBuf,
         entry: &PluginCatalogEntry,
+        approved_source_change: bool,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
         let manifest = plugin_package::manifest_for_install_source(&source)
             .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
@@ -389,6 +517,8 @@ impl PluginManager {
             && manifest.name == entry.name
             && manifest.version == entry.version
             && manifest_capabilities == catalog_capabilities
+            && manifest.provides == entry.provides
+            && manifest.requires == entry.requires
             && manifest.host_compatibility.min_core_version
                 == entry.host_compatibility.min_core_version
             && manifest.host_compatibility.max_core_version_exclusive
@@ -423,15 +553,42 @@ impl PluginManager {
                 "This plugin version is incompatible with the current Core.",
             ));
         }
-        self.install_with_capabilities(source, true, Some(&entry.capabilities))
+        self.install_with_capabilities(
+            source,
+            true,
+            Some(&entry.capabilities),
+            PluginInstallSource {
+                kind: "catalog".to_owned(),
+                origin: entry.repository_url.clone(),
+                author: Some(entry.author.clone()),
+            },
+            approved_source_change,
+        )
     }
 
     fn install(
         &self,
         source: PathBuf,
         overwrite: bool,
+        approved_source_change: bool,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
-        self.install_with_capabilities(source, overwrite, None)
+        let origin = source.canonicalize().map_err(|error| {
+            plugin_error(
+                "INVALID_REQUEST",
+                &format!("Cannot resolve local package: {error}"),
+            )
+        })?;
+        self.install_with_capabilities(
+            source,
+            overwrite,
+            None,
+            PluginInstallSource {
+                kind: "local".to_owned(),
+                origin: origin.to_string_lossy().into_owned(),
+                author: None,
+            },
+            approved_source_change,
+        )
     }
 
     fn install_with_capabilities(
@@ -439,20 +596,41 @@ impl PluginManager {
         source: PathBuf,
         overwrite: bool,
         approved_capabilities: Option<&[String]>,
+        install_source: PluginInstallSource,
+        approved_source_change: bool,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
         let source_manifest = plugin_package::manifest_for_install_source(&source)
             .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
         let replacing_same_version = overwrite
             && plugin_package::install_path(&self.inner.installed_root, &source_manifest).exists();
-        let previous_version = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?
-            .preferences
-            .active_versions
-            .get(&source_manifest.id)
-            .cloned();
+        let (previous_version, previous_source, previous_grants) = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?;
+            let preferences = &state.preferences;
+            (
+                preferences
+                    .active_versions
+                    .get(&source_manifest.id)
+                    .cloned(),
+                preferences
+                    .installation_sources
+                    .get(&source_manifest.id)
+                    .cloned(),
+                preferences
+                    .granted_capabilities
+                    .get(&capability_grant_key(&source_manifest.id))
+                    .cloned(),
+            )
+        };
+        let source_changed = check_install_source(
+            previous_version.as_deref(),
+            previous_source.as_ref(),
+            &install_source,
+            approved_source_change,
+        )?;
         let replacing_active_version = replacing_same_version
             && previous_version.as_deref() == Some(source_manifest.version.as_str());
         if replacing_active_version && !plugin_package::manifest_is_compatible(&source_manifest) {
@@ -505,21 +683,22 @@ impl PluginManager {
                 .insert(plugin_id.clone(), version);
             state
                 .preferences
+                .installation_sources
+                .insert(plugin_id.clone(), install_source);
+            state
+                .preferences
                 .enabled_plugins
                 .entry(plugin_id.clone())
                 .or_insert(true);
-            if let Some(approved) = approved_capabilities {
-                state
-                    .preferences
-                    .granted_capabilities
-                    .insert(grant_key, approved.to_vec());
-            } else {
-                state
-                    .preferences
-                    .granted_capabilities
-                    .entry(grant_key)
-                    .or_insert_with(|| inspected.manifest.capabilities.clone());
-            }
+            state.preferences.granted_capabilities.insert(
+                grant_key,
+                select_install_grants(
+                    previous_grants.as_deref(),
+                    &inspected.manifest.capabilities,
+                    approved_capabilities,
+                    source_changed || previous_version.is_none(),
+                ),
+            );
             persist_preferences(&self.inner.app_data_dir, &state.preferences).map_err(|error| {
                 plugin_error(
                     "INTERNAL",
@@ -549,6 +728,16 @@ impl PluginManager {
                     .preferences
                     .active_versions
                     .insert(plugin_id.clone(), previous_version);
+                restore_map_entry(
+                    &mut state.preferences.installation_sources,
+                    &plugin_id,
+                    previous_source,
+                );
+                restore_map_entry(
+                    &mut state.preferences.granted_capabilities,
+                    &plugin_id,
+                    previous_grants,
+                );
                 persist_preferences(&self.inner.app_data_dir, &state.preferences).map_err(
                     |save_error| {
                         plugin_error(
@@ -610,6 +799,12 @@ impl PluginManager {
                 .plugins
                 .get(plugin_id)
                 .ok_or_else(|| not_installed(plugin_id))?;
+            if record.snapshot.runtime == RuntimeState::Stopping {
+                return Err(plugin_error(
+                    "PLUGIN_BUSY",
+                    "Plugin is stopping and cannot change state yet.",
+                ));
+            }
             if record.snapshot.installation == InstallationState::Incompatible {
                 return Err(plugin_error(
                     "INCOMPATIBLE_CORE",
@@ -681,6 +876,12 @@ impl PluginManager {
                 .plugins
                 .get(plugin_id)
                 .ok_or_else(|| not_installed(plugin_id))?;
+            if record.snapshot.runtime == RuntimeState::Stopping {
+                return Err(plugin_error(
+                    "PLUGIN_BUSY",
+                    "Plugin is stopping and cannot change capabilities yet.",
+                ));
+            }
             let grant_key = capability_grant_key(plugin_id);
             let requested = record
                 .snapshot
@@ -734,50 +935,108 @@ impl PluginManager {
         plugin_id: &str,
         remove_plugin_data: bool,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
-        {
+        let process = {
             let mut state = self
                 .inner
                 .state
                 .lock()
                 .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?;
-            let record = state
-                .plugins
-                .get_mut(plugin_id)
-                .ok_or_else(|| not_installed(plugin_id))?;
-            record.snapshot.runtime = RuntimeState::Stopping;
-            record.process = None;
-            state.plugins.remove(plugin_id);
-            update_service_dependency_issues(&mut state.plugins);
-            let install_directory = self.inner.installed_root.join(plugin_id);
-            if install_directory.exists() {
-                reject_symlink(&install_directory)?;
-                fs::remove_dir_all(&install_directory).map_err(|error| {
-                    plugin_error("INTERNAL", &format!("Cannot remove plugin files: {error}"))
-                })?;
+            if !state.plugins.contains_key(plugin_id) {
+                return Err(not_installed(plugin_id));
             }
-            state.preferences.enabled_plugins.remove(plugin_id);
-            let grant_prefix = format!("{plugin_id}@");
+            if matches!(
+                state.plugins[plugin_id].snapshot.runtime,
+                RuntimeState::Starting | RuntimeState::Stopping
+            ) {
+                return Err(plugin_error(
+                    "PLUGIN_BUSY",
+                    "Wait for the plugin to finish starting or stopping before removing it.",
+                ));
+            }
+            let previous_preferences = state.preferences.clone();
+            clear_plugin_preferences(&mut state.preferences, plugin_id);
+            state
+                .preferences
+                .enabled_plugins
+                .insert(plugin_id.to_owned(), false);
             state
                 .preferences
                 .granted_capabilities
-                .retain(|key, _| !key.starts_with(&grant_prefix));
-            state.preferences.active_versions.remove(plugin_id);
-            persist_preferences(&self.inner.app_data_dir, &state.preferences).map_err(|error| {
-                plugin_error(
+                .insert(capability_grant_key(plugin_id), Vec::new());
+            if let Err(error) = persist_preferences(&self.inner.app_data_dir, &state.preferences) {
+                state.preferences = previous_preferences;
+                return Err(plugin_error(
                     "INTERNAL",
-                    &format!("Plugin removed but preferences could not be saved: {error}"),
-                )
-            })?;
-            state.config_error = None;
+                    &format!("Cannot prepare plugin removal safely: {error}"),
+                ));
+            }
+            let record = state
+                .plugins
+                .get_mut(plugin_id)
+                .expect("record checked above");
+            record.snapshot.enabled = false;
+            record.snapshot.granted_capabilities.clear();
+            record.snapshot.runtime = RuntimeState::Stopping;
+            let process = record.process.take();
+            update_service_dependency_issues(&mut state.plugins);
+            process
+        };
+
+        if let Some(process) = process
+            && let Err(error) = process.stop()
+        {
+            if let Ok(mut state) = self.inner.state.lock()
+                && let Some(record) = state.plugins.get_mut(plugin_id)
+            {
+                record.snapshot.runtime = RuntimeState::Failed;
+                record.snapshot.last_error = Some(failure(&error.code, &error.message));
+            }
+            return Err(error);
         }
+
+        if let Ok(mut state) = self.inner.state.lock()
+            && let Some(record) = state.plugins.get_mut(plugin_id)
+        {
+            record.snapshot.runtime = RuntimeState::Stopped;
+            record.snapshot.last_error = None;
+        }
+
         if remove_plugin_data {
             let data_directory = self.inner.app_data_dir.join("plugin-data").join(plugin_id);
-            if data_directory.exists() {
-                reject_symlink(&data_directory)?;
-                fs::remove_dir_all(&data_directory).map_err(|error| {
-                    plugin_error("INTERNAL", &format!("Cannot remove plugin data: {error}"))
-                })?;
-            }
+            apply_plugin_data_removal(&data_directory, true)?;
+        }
+
+        let install_directory = self.inner.installed_root.join(plugin_id);
+        if install_directory.exists() {
+            reject_symlink(&install_directory)?;
+            fs::remove_dir_all(&install_directory).map_err(|error| {
+                plugin_error(
+                    "INTERNAL",
+                    &format!(
+                        "Cannot remove plugin files at {}: {error}",
+                        install_directory.display()
+                    ),
+                )
+            })?;
+        }
+
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?;
+        state.plugins.remove(plugin_id);
+        update_service_dependency_issues(&mut state.plugins);
+        let removal_preferences = state.preferences.clone();
+        clear_plugin_preferences(&mut state.preferences, plugin_id);
+        if let Err(error) = persist_preferences(&self.inner.app_data_dir, &state.preferences) {
+            // The already-persisted removal intent has no grants and cannot silently authorize a
+            // later package with the same ID. Keep it if final preference cleanup fails.
+            state.preferences = removal_preferences;
+            state.config_error = Some(format!("Plugin removal preferences need cleanup: {error}"));
+            warn!(plugin_id = %plugin_id, reason = %error, "插件已移除，但授权记录的最终清理未完成");
+        } else {
+            state.config_error = None;
         }
         Ok(self.snapshots())
     }
@@ -859,6 +1118,213 @@ impl PluginManager {
         Ok(result)
     }
 
+    pub(crate) fn resolve_service(
+        &self,
+        consumer_id: &str,
+        service_id: &str,
+    ) -> Result<PluginServiceResolution, PluginError> {
+        self.service_target(consumer_id, service_id)
+            .map(|(resolution, _, _)| resolution)
+    }
+
+    pub(crate) fn invoke_service(
+        &self,
+        consumer_id: &str,
+        service_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, PluginError> {
+        if !valid_service_id(service_id) || !valid_service_method(method) {
+            return Err(plugin_error(
+                "INVALID_INPUT",
+                "Service ID or method is invalid.",
+            ));
+        }
+        let (resolution, process, contract) = self.service_target(consumer_id, service_id)?;
+        if !resolution.methods.iter().any(|allowed| allowed == method) {
+            return Err(plugin_error(
+                "UNAUTHORIZED",
+                "The requested method is not declared by the consumer plugin.",
+            ));
+        }
+        let method_contract = contract
+            .get("methods")
+            .and_then(Value::as_object)
+            .and_then(|methods| methods.get(method))
+            .ok_or_else(|| {
+                plugin_error(
+                    "SERVICE_METHOD_NOT_FOUND",
+                    "The provider no longer declares this service method.",
+                )
+            })?;
+        let params_schema = method_contract
+            .get("params")
+            .ok_or_else(|| plugin_error("INVALID_RESPONSE", "Provider contract is invalid."))?;
+        if let Err(error) = crate::plugin_schema::validate(&params, params_schema, &contract) {
+            return Err(plugin_error("INVALID_INPUT", &error));
+        }
+        let timeout_ms = method_contract
+            .get("timeoutMs")
+            .and_then(Value::as_u64)
+            .filter(|timeout| (1..=30_000).contains(timeout))
+            .ok_or_else(|| {
+                plugin_error(
+                    "INVALID_RESPONSE",
+                    "Provider service timeout is outside the supported range.",
+                )
+            })?;
+        let request_id = format!(
+            "service-{}",
+            self.inner
+                .next_service_request_id
+                .fetch_add(1, Ordering::Relaxed)
+        );
+        let result = process
+            .call(&request_id, method, params, timeout_ms)
+            .map_err(service_provider_error)?;
+        let result_schema = method_contract
+            .get("result")
+            .ok_or_else(|| plugin_error("INVALID_RESPONSE", "Provider contract is invalid."))?;
+        if let Err(error) = crate::plugin_schema::validate(&result, result_schema, &contract) {
+            return Err(plugin_error(
+                "INVALID_RESPONSE",
+                &format!("Provider result failed contract validation: {error}"),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn service_target(
+        &self,
+        consumer_id: &str,
+        service_id: &str,
+    ) -> Result<(PluginServiceResolution, Arc<PluginProcess>, Value), PluginError> {
+        if !valid_service_id(service_id) {
+            return Err(plugin_error("INVALID_INPUT", "Service ID is invalid."));
+        }
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?;
+        let consumer = state
+            .plugins
+            .get(consumer_id)
+            .ok_or_else(|| not_installed(consumer_id))?;
+        if consumer.snapshot.installation != InstallationState::Installed {
+            return Err(plugin_error(
+                "INCOMPATIBLE_CORE",
+                "Consumer plugin is not compatible with this Core.",
+            ));
+        }
+        if !consumer.snapshot.enabled {
+            return Err(plugin_error("DISABLED", "Consumer plugin is disabled."));
+        }
+        if consumer.snapshot.runtime != RuntimeState::Running
+            || !consumer
+                .process
+                .as_ref()
+                .is_some_and(|process| process.is_alive())
+        {
+            return Err(plugin_error(
+                "NOT_RUNNING",
+                "Consumer plugin is not running.",
+            ));
+        }
+        if !consumer
+            .snapshot
+            .granted_capabilities
+            .iter()
+            .any(|capability| capability == "services.call")
+        {
+            return Err(plugin_error(
+                "UNAUTHORIZED",
+                "Consumer plugin has not been granted services.call.",
+            ));
+        }
+        let requirement = consumer
+            .snapshot
+            .manifest
+            .requires
+            .iter()
+            .find(|requirement| requirement.id == service_id)
+            .ok_or_else(|| {
+                plugin_error(
+                    "SERVICE_NOT_DECLARED",
+                    "Consumer manifest does not declare this service requirement.",
+                )
+            })?;
+
+        let candidates = state
+            .plugins
+            .iter()
+            .filter(|(plugin_id, _)| plugin_id.as_str() != consumer_id)
+            .flat_map(|(plugin_id, record)| {
+                record
+                    .snapshot
+                    .manifest
+                    .provides
+                    .iter()
+                    .filter(move |service| service.id == service_id)
+                    .map(move |service| {
+                        (
+                            plugin_id.as_str(),
+                            service,
+                            record.snapshot.installation == InstallationState::Installed,
+                            record.snapshot.enabled,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let provider_id = choose_service_provider(consumer_id, requirement, &candidates)?;
+        let provider = state.plugins.get(provider_id).ok_or_else(|| {
+            plugin_error("SERVICE_UNAVAILABLE", "Service provider is unavailable.")
+        })?;
+        if provider.snapshot.installation != InstallationState::Installed
+            || !provider.snapshot.enabled
+            || provider.snapshot.runtime != RuntimeState::Running
+            || !provider.snapshot.service_dependency_issues.is_empty()
+        {
+            return Err(plugin_error(
+                "SERVICE_UNAVAILABLE",
+                "The selected service provider is not available.",
+            ));
+        }
+        let process = provider
+            .process
+            .as_ref()
+            .filter(|process| process.is_alive())
+            .cloned()
+            .ok_or_else(|| {
+                plugin_error(
+                    "SERVICE_UNAVAILABLE",
+                    "The selected service provider is not running.",
+                )
+            })?;
+        Ok((
+            PluginServiceResolution {
+                service_id: service_id.to_owned(),
+                provider_id: provider_id.to_owned(),
+                version: provider
+                    .snapshot
+                    .manifest
+                    .provides
+                    .iter()
+                    .find(|service| service.id == service_id)
+                    .map(|service| service.version.clone())
+                    .ok_or_else(|| {
+                        plugin_error(
+                            "SERVICE_UNAVAILABLE",
+                            "Service provider changed during resolution.",
+                        )
+                    })?,
+                methods: requirement.methods.clone(),
+            },
+            process,
+            provider.contract.clone(),
+        ))
+    }
+
     fn cancel(&self, plugin_id: &str, request_id: &str) -> Result<(), PluginError> {
         let state = self
             .inner
@@ -877,12 +1343,6 @@ impl PluginManager {
     }
 
     fn plugin_ui_url(&self, plugin_id: &str) -> Result<String, PluginError> {
-        if !plugin_ui_isolation_test_enabled() {
-            return Err(plugin_error(
-                "PLUGIN_UI_NOT_VERIFIED",
-                "Dynamic plugin UI remains disabled until the WebView isolation prototype is verified.",
-            ));
-        }
         let state = self
             .inner
             .state
@@ -1042,6 +1502,12 @@ impl PluginManagerInner {
                 .plugins
                 .get_mut(plugin_id)
                 .ok_or_else(|| not_installed(plugin_id))?;
+            if record.snapshot.runtime == RuntimeState::Stopping {
+                return Err(plugin_error(
+                    "PLUGIN_BUSY",
+                    "Plugin is stopping and cannot be started yet.",
+                ));
+            }
             if !record.snapshot.enabled
                 || record.snapshot.installation != InstallationState::Installed
             {
@@ -1128,6 +1594,581 @@ impl PluginManagerInner {
     }
 }
 
+/// Implements the plugin-management commands exposed by the Core CLI.
+/// Mutating commands require an explicit `--yes`; install grants are supplied one at a time.
+pub fn run_cli_command(
+    app: &AppHandle,
+    manager: &PluginManager,
+    args: &[OsString],
+    desktop_running: bool,
+) -> Result<Value, PluginError> {
+    let words = args
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if words.as_slice() == ["core", "status"] {
+        let plugins = manager.snapshots();
+        let profile_id = hex::encode(Sha256::digest(
+            manager
+                .inner
+                .app_data_dir
+                .to_string_lossy()
+                .to_lowercase()
+                .as_bytes(),
+        ));
+        return Ok(core_status_payload(
+            &app.package_info().version.to_string(),
+            desktop_running,
+            &plugins,
+            &profile_id[..16],
+        ));
+    }
+    if words.first().is_some_and(|word| word == "logs") {
+        return run_cli_logs(manager, &words[1..]);
+    }
+    if words.first().is_some_and(|word| word == "ui")
+        && words.get(1).is_some_and(|word| word == "command")
+    {
+        return run_cli_ui_command(manager, &words[2..]);
+    }
+    if words.first().is_some_and(|word| word == "plugins")
+        && words.get(1).is_some_and(|word| word == "permissions")
+    {
+        return run_cli_permissions(manager, &words[2..]);
+    }
+    if words.len() < 2 || words[0] != "plugins" {
+        return Err(plugin_error(
+            "INVALID_REQUEST",
+            "Expected a Core, logs, or plugins command. Run `wla --help` for usage.",
+        ));
+    }
+
+    match words[1].as_str() {
+        "list" if words.len() == 2 => Ok(json!({"plugins": manager.snapshots()})),
+        "ui-check" if (3..=4).contains(&words.len()) => {
+            let plugin_id = &words[2];
+            let snapshot = manager
+                .snapshots()
+                .into_iter()
+                .find(|snapshot| snapshot.manifest.id == *plugin_id)
+                .ok_or_else(|| not_installed(plugin_id))?;
+            let ui = snapshot.manifest.ui.clone().ok_or_else(|| {
+                plugin_error(
+                    "NO_PLUGIN_UI",
+                    "This plugin does not provide a user interface.",
+                )
+            })?;
+            manager.ensure_cli_plugin_started(plugin_id)?;
+            let snapshot = manager
+                .snapshots()
+                .into_iter()
+                .find(|snapshot| snapshot.manifest.id == *plugin_id)
+                .ok_or_else(|| not_installed(plugin_id))?;
+            let ui_url = manager.plugin_ui_url(plugin_id)?;
+            let asset = words.get(3).map(String::as_str).unwrap_or(&ui.entry);
+            let response_path = format!("/{plugin_id}/{asset}");
+            let response = plugin_asset_response(app, &response_path, "GET");
+            let status = response.status().as_u16();
+            let content_type = response
+                .headers()
+                .get(tauri::http::header::CONTENT_TYPE)
+                .and_then(|header| header.to_str().ok())
+                .unwrap_or_default();
+            let csp = response
+                .headers()
+                .get("Content-Security-Policy")
+                .and_then(|header| header.to_str().ok())
+                .unwrap_or_default();
+            let no_sniff = response
+                .headers()
+                .get(tauri::http::header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|header| header.to_str().ok())
+                == Some("nosniff");
+            let body = String::from_utf8_lossy(response.body());
+            let is_html = content_type.starts_with("text/html")
+                && body.to_ascii_lowercase().contains("<html");
+            let csp_is_restricted = csp.contains("default-src 'none'")
+                && csp.contains("connect-src 'none'")
+                && csp.contains("object-src 'none'");
+            let ok = status == 200 && is_html && no_sniff && csp_is_restricted;
+            let report = json!({
+                "ok": ok,
+                "pluginId": plugin_id,
+                "runtime": snapshot.runtime,
+                "uiUrl": ui_url,
+                "asset": asset,
+                "status": status,
+                "contentType": content_type,
+                "contentSecurityPolicy": csp,
+                "noSniff": no_sniff,
+                "htmlDocument": is_html,
+                "bytes": response.body().len(),
+                "bridgeCompatibility": ui.bridge_compatibility,
+                "contributions": ui.contributions,
+            });
+            if ok {
+                Ok(report)
+            } else {
+                Err(PluginError {
+                    code: "UI_RESOURCE_CHECK_FAILED".to_owned(),
+                    message: format!("Plugin UI asset check failed for '{plugin_id}/{asset}'."),
+                    details: Some(report),
+                })
+            }
+        }
+        "install" if words.len() >= 3 => {
+            let mut confirmed = false;
+            let mut overwrite = false;
+            let mut approve_source_change = false;
+            let mut grants = Vec::new();
+            let mut index = 3;
+            while index < args.len() {
+                let flag = args[index].to_string_lossy();
+                match flag.as_ref() {
+                    "--yes" => confirmed = true,
+                    "--overwrite" => overwrite = true,
+                    "--approve-source-change" => approve_source_change = true,
+                    "--grant" => {
+                        index += 1;
+                        let grant = args.get(index).ok_or_else(|| {
+                            plugin_error("INVALID_REQUEST", "--grant requires a capability ID.")
+                        })?;
+                        grants.push(grant.to_string_lossy().into_owned());
+                    }
+                    value if value.starts_with("--grant=") => {
+                        grants.push(value[8..].to_owned());
+                    }
+                    _ => {
+                        return Err(plugin_error(
+                            "INVALID_REQUEST",
+                            &format!("Unknown install option '{flag}'."),
+                        ));
+                    }
+                }
+                index += 1;
+            }
+            if !confirmed {
+                return Err(plugin_error(
+                    "CONFIRMATION_REQUIRED",
+                    "Plugin installation runs local code. Review its source and pass --yes to confirm.",
+                ));
+            }
+            let states = manager.install_cli_package(
+                PathBuf::from(&args[2]),
+                grants,
+                overwrite,
+                approve_source_change,
+            )?;
+            Ok(json!({ "plugins": states }))
+        }
+        "enable" | "disable" if words.len() >= 3 => {
+            require_cli_confirmation(&args[3..])?;
+            ensure_only_cli_flag(&args[3..], "--yes")?;
+            let states = manager.set_enabled(&words[2], words[1] == "enable")?;
+            Ok(json!({ "plugins": states }))
+        }
+        #[cfg(debug_assertions)]
+        "test-backend-exit" if words.len() == 4 => {
+            require_cli_confirmation(&args[3..])?;
+            ensure_only_cli_flag(&args[3..], "--yes")?;
+            for snapshot in manager.snapshots().into_iter().filter(|snapshot| {
+                snapshot.enabled && snapshot.installation == InstallationState::Installed
+            }) {
+                manager.ensure_cli_plugin_started(&snapshot.manifest.id)?;
+            }
+            manager.ensure_cli_plugin_started(&words[2])?;
+            let states = manager.inject_backend_exit_for_test(&words[2])?;
+            Ok(json!({ "plugins": states }))
+        }
+        "remove" if words.len() >= 3 => {
+            require_cli_confirmation(&args[3..])?;
+            let remove_data = args[3..].iter().any(|argument| argument == "--remove-data");
+            for argument in &args[3..] {
+                if argument != "--yes" && argument != "--remove-data" {
+                    return Err(plugin_error(
+                        "INVALID_REQUEST",
+                        &format!("Unknown remove option '{}'.", argument.to_string_lossy()),
+                    ));
+                }
+            }
+            let states = manager.remove(&words[2], remove_data)?;
+            Ok(json!({ "ok": true, "plugins": states }))
+        }
+        _ => Err(plugin_error(
+            "INVALID_REQUEST",
+            "Unknown or malformed plugins command. Run `wla --help` for usage.",
+        )),
+    }
+}
+
+fn core_status_payload(
+    version: &str,
+    desktop_running: bool,
+    plugins: &[PluginRuntimeState],
+    profile_id: &str,
+) -> Value {
+    json!({
+        "version": version,
+        "desktopRunning": desktop_running,
+        "pluginCount": plugins.len(),
+        "enabledPluginCount": plugins.iter().filter(|plugin| plugin.enabled).count(),
+        "runningPluginCount": plugins.iter().filter(|plugin| plugin.runtime == RuntimeState::Running).count(),
+        "profileId": profile_id,
+    })
+}
+
+#[cfg(test)]
+mod core_status_tests {
+    use super::*;
+
+    #[test]
+    fn status_reflects_whether_it_was_requested_from_the_desktop_runtime() {
+        let plugins = [];
+        let standalone = core_status_payload("0.1.0", false, &plugins, "profile");
+        let desktop = core_status_payload("0.1.0", true, &plugins, "profile");
+
+        assert_eq!(standalone["desktopRunning"], false);
+        assert_eq!(desktop["desktopRunning"], true);
+        assert_eq!(desktop["version"], "0.1.0");
+        assert_eq!(desktop["pluginCount"], 0);
+    }
+}
+
+fn run_cli_ui_command(manager: &PluginManager, args: &[String]) -> Result<Value, PluginError> {
+    if args.len() != 2 || args[0] != "list" {
+        return Err(plugin_error(
+            "INVALID_REQUEST",
+            "Expected `ui command list <plugin>/<contribution>`. UI command execution requires an open desktop Core.",
+        ));
+    }
+    let (plugin_id, contribution_id) = parse_contribution_selector(&args[1])?;
+    let plugin = manager
+        .snapshots()
+        .into_iter()
+        .find(|plugin| plugin.manifest.id == plugin_id)
+        .ok_or_else(|| not_installed(&plugin_id))?;
+    let contribution = plugin
+        .manifest
+        .ui
+        .as_ref()
+        .and_then(|ui| {
+            ui.contributions
+                .iter()
+                .find(|item| item.id == contribution_id)
+        })
+        .ok_or_else(|| {
+            plugin_error(
+                "CONTRIBUTION_NOT_FOUND",
+                "Plugin contribution is not registered.",
+            )
+        })?;
+    Ok(json!({
+        "pluginId": plugin_id,
+        "contributionId": contribution_id,
+        "commands": contribution.commands,
+    }))
+}
+
+pub fn validate_cli_ui_command(
+    manager: &PluginManager,
+    args: &[String],
+) -> Result<(String, PluginUiCommand, Value), PluginError> {
+    if args.len() < 5 || args[0] != "ui" || args[1] != "command" || args[2] != "run" {
+        return Err(plugin_error(
+            "INVALID_REQUEST",
+            "Expected `ui command run <plugin>/<contribution> <command-id> --input-json <json> [--yes]`.",
+        ));
+    }
+    let (plugin_id, contribution_id) = parse_contribution_selector(&args[3])?;
+    let command_id = &args[4];
+    let mut input_json = None;
+    let mut confirmed = false;
+    let mut index = 5;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--yes" => {
+                if confirmed {
+                    return Err(plugin_error(
+                        "INVALID_REQUEST",
+                        "--yes may be specified once.",
+                    ));
+                }
+                confirmed = true;
+            }
+            "--input-json" => {
+                if input_json.is_some() {
+                    return Err(plugin_error(
+                        "INVALID_REQUEST",
+                        "--input-json may be specified once.",
+                    ));
+                }
+                index += 1;
+                input_json = Some(args.get(index).ok_or_else(|| {
+                    plugin_error("INVALID_REQUEST", "--input-json requires a JSON value.")
+                })?);
+            }
+            option => {
+                return Err(plugin_error(
+                    "INVALID_REQUEST",
+                    &format!("Unknown UI command option '{option}'."),
+                ));
+            }
+        }
+        index += 1;
+    }
+    let input_json =
+        input_json.ok_or_else(|| plugin_error("INVALID_REQUEST", "--input-json is required."))?;
+    let input: Value = serde_json::from_str(input_json)
+        .map_err(|_| plugin_error("INVALID_REQUEST", "--input-json must contain valid JSON."))?;
+    let plugin = manager
+        .snapshots()
+        .into_iter()
+        .find(|plugin| plugin.manifest.id == plugin_id)
+        .ok_or_else(|| not_installed(&plugin_id))?;
+    let command = plugin
+        .manifest
+        .ui
+        .as_ref()
+        .and_then(|ui| {
+            ui.contributions
+                .iter()
+                .find(|item| item.id == contribution_id)
+        })
+        .and_then(|contribution| {
+            contribution
+                .commands
+                .iter()
+                .find(|command| command.id == *command_id)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            plugin_error(
+                "UI_COMMAND_NOT_FOUND",
+                "The command is not declared by this contribution.",
+            )
+        })?;
+    if matches!(command.effect, PluginUiCommandEffect::Mutating) && !confirmed {
+        return Err(plugin_error(
+            "CONFIRMATION_REQUIRED",
+            "This plugin UI command changes user content. Pass --yes to confirm.",
+        ));
+    }
+    crate::plugin_schema::validate(&input, &command.input_schema, &command.input_schema).map_err(
+        |error| PluginError {
+            code: "SCHEMA_VALIDATION_FAILED".to_owned(),
+            message: "The input does not match the plugin command schema.".to_owned(),
+            details: Some(json!({ "reason": error })),
+        },
+    )?;
+    Ok((format!("{plugin_id}/{contribution_id}"), command, input))
+}
+
+fn parse_contribution_selector(selector: &str) -> Result<(String, String), PluginError> {
+    let (plugin_id, contribution_id) = selector
+        .split_once('/')
+        .ok_or_else(|| plugin_error("INVALID_REQUEST", "Use <plugin-id>/<contribution-id>."))?;
+    if plugin_id.is_empty() || contribution_id.is_empty() || contribution_id.contains('/') {
+        return Err(plugin_error(
+            "INVALID_REQUEST",
+            "Use <plugin-id>/<contribution-id>.",
+        ));
+    }
+    Ok((plugin_id.to_owned(), contribution_id.to_owned()))
+}
+
+fn run_cli_permissions(manager: &PluginManager, args: &[String]) -> Result<Value, PluginError> {
+    let Some(action) = args.first().map(String::as_str) else {
+        return Err(plugin_error(
+            "INVALID_REQUEST",
+            "Expected `plugins permissions list|set <plugin-id>`. ",
+        ));
+    };
+    let Some(plugin_id) = args.get(1) else {
+        return Err(plugin_error(
+            "INVALID_REQUEST",
+            "A plugin ID is required for permission management.",
+        ));
+    };
+    let snapshot = || {
+        manager
+            .snapshots()
+            .into_iter()
+            .find(|plugin| plugin.manifest.id == *plugin_id)
+            .ok_or_else(|| not_installed(plugin_id))
+    };
+    match action {
+        "list" if args.len() == 2 => {
+            let plugin = snapshot()?;
+            Ok(json!({
+                "pluginId": plugin_id,
+                "requested": plugin.manifest.capabilities,
+                "granted": plugin.granted_capabilities,
+            }))
+        }
+        "set" => {
+            let mut confirmed = false;
+            let mut grants = Vec::new();
+            let mut index = 2;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--yes" => confirmed = true,
+                    "--grant" => {
+                        index += 1;
+                        let grant = args.get(index).ok_or_else(|| {
+                            plugin_error("INVALID_REQUEST", "--grant requires a capability ID.")
+                        })?;
+                        grants.push(grant.clone());
+                    }
+                    option if option.starts_with("--grant=") => {
+                        grants.push(option[8..].to_owned());
+                    }
+                    option => {
+                        return Err(plugin_error(
+                            "INVALID_REQUEST",
+                            &format!("Unknown permission option '{option}'."),
+                        ));
+                    }
+                }
+                index += 1;
+            }
+            if !confirmed {
+                return Err(plugin_error(
+                    "CONFIRMATION_REQUIRED",
+                    "Changing plugin permissions requires --yes.",
+                ));
+            }
+            let states = manager.set_capabilities(plugin_id, grants)?;
+            Ok(json!({ "plugins": states }))
+        }
+        _ => Err(plugin_error(
+            "INVALID_REQUEST",
+            "Expected `plugins permissions list <plugin-id>` or `set <plugin-id> --grant <capability>... --yes`.",
+        )),
+    }
+}
+
+fn run_cli_logs(manager: &PluginManager, args: &[String]) -> Result<Value, PluginError> {
+    let log_dir = manager.inner.app_data_dir.join("logs");
+    match args.first().map(String::as_str) {
+        Some("dir") if args.len() == 1 => Ok(json!({
+            "directory": log_dir,
+            "exists": log_dir.is_dir(),
+        })),
+        Some("list") if args.len() == 1 => {
+            let mut files = Vec::new();
+            if let Ok(entries) = fs::read_dir(&log_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file()
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("wonderland-assistant.log."))
+                        && let Ok(metadata) = entry.metadata()
+                    {
+                        files.push(json!({
+                            "name": path.file_name().and_then(|name| name.to_str()).unwrap_or_default(),
+                            "sizeBytes": metadata.len(),
+                            "modified": metadata.modified().ok().and_then(|time| {
+                                time.duration_since(std::time::UNIX_EPOCH).ok().map(|value| value.as_secs())
+                            }),
+                        }));
+                    }
+                }
+            }
+            files.sort_by(|left, right| right["name"].as_str().cmp(&left["name"].as_str()));
+            Ok(json!({ "directory": log_dir, "files": files }))
+        }
+        Some("tail") => {
+            let mut line_count = 100_usize;
+            let mut index = 1;
+            while index < args.len() {
+                if args[index] == "--lines" {
+                    index += 1;
+                    let value = args.get(index).ok_or_else(|| {
+                        plugin_error("INVALID_REQUEST", "--lines requires a count.")
+                    })?;
+                    line_count = value.parse::<usize>().map_err(|_| {
+                        plugin_error(
+                            "INVALID_REQUEST",
+                            "--lines must be an integer from 1 to 500.",
+                        )
+                    })?;
+                    if !(1..=500).contains(&line_count) {
+                        return Err(plugin_error(
+                            "INVALID_REQUEST",
+                            "--lines must be an integer from 1 to 500.",
+                        ));
+                    }
+                } else {
+                    return Err(plugin_error(
+                        "INVALID_REQUEST",
+                        &format!("Unknown logs tail option '{}'.", args[index]),
+                    ));
+                }
+                index += 1;
+            }
+            let mut candidates = fs::read_dir(&log_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("wonderland-assistant.log."))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort();
+            let Some(path) = candidates.pop() else {
+                return Ok(json!({ "path": null, "lines": [] }));
+            };
+            let content = fs::read_to_string(&path).map_err(|error| {
+                plugin_error("LOG_READ_FAILED", &format!("Cannot read log file: {error}"))
+            })?;
+            let lines = content
+                .lines()
+                .rev()
+                .take(line_count)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>();
+            Ok(json!({ "path": path, "lines": lines }))
+        }
+        _ => Err(plugin_error(
+            "INVALID_REQUEST",
+            "Expected `logs dir`, `logs list`, or `logs tail [--lines <1-500>]`.",
+        )),
+    }
+}
+
+fn require_cli_confirmation(args: &[OsString]) -> Result<(), PluginError> {
+    if args.iter().any(|argument| argument == "--yes") {
+        Ok(())
+    } else {
+        Err(plugin_error(
+            "CONFIRMATION_REQUIRED",
+            "This command changes plugin state. Pass --yes to confirm.",
+        ))
+    }
+}
+
+fn ensure_only_cli_flag(args: &[OsString], allowed: &str) -> Result<(), PluginError> {
+    if let Some(unknown) = args
+        .iter()
+        .find(|argument| argument.to_string_lossy() != allowed)
+    {
+        return Err(plugin_error(
+            "INVALID_REQUEST",
+            &format!("Unknown command option '{}'.", unknown.to_string_lossy()),
+        ));
+    }
+    Ok(())
+}
+
 /// Lists packages discovered from installed-plugins/<id>/<version>.
 #[tauri::command]
 pub fn plugins_list(
@@ -1198,17 +2239,31 @@ pub async fn plugins_catalog_list(
 
 /// Downloads one reviewed catalog version, verifies its digest and manifest, then installs it
 /// through the same package validation and atomic replacement path as a local .wplug file.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogInstallRequest {
+    plugin_id: String,
+    version: String,
+    expected_sha256: String,
+    approved_capabilities: Vec<String>,
+    approved_source_change: bool,
+}
+
 #[tauri::command]
 pub async fn plugins_catalog_install(
     window: WebviewWindow,
     context: State<'_, AppContext>,
     manager: State<'_, PluginManager>,
-    plugin_id: String,
-    version: String,
-    expected_sha256: String,
-    approved_capabilities: Vec<String>,
+    request: CatalogInstallRequest,
 ) -> Result<Vec<PluginRuntimeState>, PluginError> {
     ensure_main(&window).map_err(|error| plugin_error("INVALID_REQUEST", &error.message))?;
+    let CatalogInstallRequest {
+        plugin_id,
+        version,
+        expected_sha256,
+        approved_capabilities,
+        approved_source_change,
+    } = request;
     if !valid_plugin_id(&plugin_id) {
         return Err(plugin_error("INVALID_REQUEST", "Plugin ID is invalid."));
     }
@@ -1306,7 +2361,8 @@ pub async fn plugins_catalog_install(
 
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let result = manager.install_catalog_package(source.clone(), &entry);
+        let result =
+            manager.install_catalog_package(source.clone(), &entry, approved_source_change);
         let _ = fs::remove_file(source);
         result
     })
@@ -1372,6 +2428,47 @@ fn validate_catalog_entry(entry: &PluginCatalogEntry) -> Result<(), PluginError>
                 )
     });
     let capabilities: BTreeSet<_> = entry.capabilities.iter().collect();
+    let provided_ids: BTreeSet<_> = entry
+        .provides
+        .iter()
+        .map(|service| service.id.as_str())
+        .collect();
+    let required_ids: BTreeSet<_> = entry
+        .requires
+        .iter()
+        .map(|service| service.id.as_str())
+        .collect();
+    let services_valid = entry.provides.len() <= 32
+        && entry.requires.len() <= 32
+        && provided_ids.len() == entry.provides.len()
+        && required_ids.len() == entry.requires.len()
+        && entry.provides.iter().all(|service| {
+            valid_service_id(&service.id)
+                && Version::parse(&service.version).is_ok()
+                && !service.methods.is_empty()
+                && service.methods.len() <= 128
+                && service
+                    .methods
+                    .iter()
+                    .all(|method| valid_service_method(method))
+                && service.methods.iter().collect::<BTreeSet<_>>().len() == service.methods.len()
+        })
+        && entry.requires.iter().all(|requirement| {
+            let min = Version::parse(&requirement.min_version);
+            let max = Version::parse(&requirement.max_version_exclusive);
+            valid_service_id(&requirement.id)
+                && min.is_ok()
+                && max.is_ok()
+                && min.ok().zip(max.ok()).is_some_and(|(min, max)| min < max)
+                && !requirement.methods.is_empty()
+                && requirement.methods.len() <= 128
+                && requirement
+                    .methods
+                    .iter()
+                    .all(|method| valid_service_method(method))
+                && requirement.methods.iter().collect::<BTreeSet<_>>().len()
+                    == requirement.methods.len()
+        });
     let valid_release_notes = entry.release_notes_url.as_ref().is_none_or(|url| {
         let prefix = format!("{}/releases/tag/", entry.repository_url);
         url.strip_prefix(&prefix).is_some_and(|tag| {
@@ -1427,6 +2524,7 @@ fn validate_catalog_entry(entry: &PluginCatalogEntry) -> Result<(), PluginError>
         || entry.size_bytes == 0
         || entry.size_bytes > PLUGIN_PACKAGE_MAX_BYTES
         || capabilities.len() != entry.capabilities.len()
+        || !services_valid
         || entry
             .capabilities
             .iter()
@@ -1536,26 +2634,60 @@ pub async fn plugins_install(
             .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
         let same_version_path =
             plugin_package::install_path(&manager.inner.installed_root, &manifest);
-        let overwrite = if same_version_path.exists() {
-            app.dialog()
-                .message(format!(
-                    "插件「{}」v{} 已安装。要用所选版本覆盖吗？",
-                    manifest.name, manifest.version
-                ))
-                .title("确认覆盖插件")
-                .kind(MessageDialogKind::Warning)
-                .buttons(MessageDialogButtons::OkCancelCustom(
-                    "覆盖".to_owned(),
-                    "取消".to_owned(),
-                ))
-                .blocking_show()
+        let existing = manager
+            .snapshots()
+            .into_iter()
+            .find(|state| state.manifest.id == manifest.id);
+        let previous_source = existing
+            .as_ref()
+            .and_then(|state| state.installation_source.as_ref())
+            .map(|source| {
+                let kind = if source.kind == "catalog" {
+                    "在线目录"
+                } else {
+                    "本地安装"
+                };
+                format!("{kind}：{}", source.origin)
+            })
+            .unwrap_or_else(|| {
+                if existing.is_some() {
+                    "来源未记录（旧版本安装）".to_owned()
+                } else {
+                    "尚未安装".to_owned()
+                }
+            });
+        let capabilities = if manifest.capabilities.is_empty() {
+            "无".to_owned()
         } else {
-            false
+            manifest.capabilities.join("、")
         };
-        if same_version_path.exists() && !overwrite {
+        let confirmed = app
+            .dialog()
+            .message(format!(
+                "安装「{}」v{}？\n插件 ID：{}\n本地包：{}\n现有来源：{}\n请求的宿主能力：{}\n\n同 ID 替换会保留已有插件数据；新插件后端以当前用户身份运行，可能读取这些数据和本机其他可访问文件。{}",
+                manifest.name,
+                manifest.version,
+                manifest.id,
+                source.display(),
+                previous_source,
+                capabilities,
+                if same_version_path.exists() {
+                    "这将覆盖已安装的相同版本。"
+                } else {
+                    ""
+                }
+            ))
+            .title("确认安装本地插件")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "安装".to_owned(),
+                "取消".to_owned(),
+            ))
+            .blocking_show();
+        if !confirmed {
             return Ok(manager.snapshots());
         }
-        manager.install(source, overwrite)
+        manager.install(source, same_version_path.exists(), true)
     })
     .await
     .map_err(|error| plugin_error("INTERNAL", &format!("Plugin installation failed: {error}")))?
@@ -1806,6 +2938,7 @@ fn invalid_snapshot(id: &str, message: &str) -> PluginRuntimeState {
                     icon: None,
                     default_order: 0,
                     location: None,
+                    commands: Vec::new(),
                 }],
             }),
             backend: PluginBackend {
@@ -1822,8 +2955,128 @@ fn invalid_snapshot(id: &str, message: &str) -> PluginRuntimeState {
         runtime: RuntimeState::Stopped,
         last_error: Some(failure("INVALID_PACKAGE", message)),
         granted_capabilities: Vec::new(),
+        installation_source: None,
         service_dependency_issues: Vec::new(),
+        plugin_data_directory: None,
     }
+}
+
+fn choose_service_provider<'a>(
+    consumer_id: &str,
+    requirement: &PluginServiceRequirement,
+    candidates: &'a [(&'a str, &'a PluginService, bool, bool)],
+) -> Result<&'a str, PluginError> {
+    let candidates = candidates
+        .iter()
+        .filter(|(plugin_id, _, _, _)| *plugin_id != consumer_id)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err(plugin_error(
+            "SERVICE_NOT_FOUND",
+            "No installed plugin provides this service.",
+        ));
+    }
+
+    let min = Version::parse(&requirement.min_version)
+        .map_err(|_| plugin_error("INTERNAL", "Service requirement version is invalid."))?;
+    let max = Version::parse(&requirement.max_version_exclusive)
+        .map_err(|_| plugin_error("INTERNAL", "Service requirement version is invalid."))?;
+    let version_matches = candidates
+        .into_iter()
+        .filter(|(_, service, _, _)| {
+            Version::parse(&service.version).is_ok_and(|version| version >= min && version < max)
+        })
+        .collect::<Vec<_>>();
+    if version_matches.is_empty() {
+        return Err(plugin_error(
+            "SERVICE_VERSION_MISMATCH",
+            "Installed service providers do not match the requested version range.",
+        ));
+    }
+
+    let method_matches = version_matches
+        .into_iter()
+        .filter(|(_, service, _, _)| {
+            requirement
+                .methods
+                .iter()
+                .all(|method| service.methods.contains(method))
+        })
+        .collect::<Vec<_>>();
+    if method_matches.is_empty() {
+        return Err(plugin_error(
+            "SERVICE_METHOD_NOT_FOUND",
+            "No version-compatible provider declares every required service method.",
+        ));
+    }
+
+    let active = method_matches
+        .into_iter()
+        .filter(|(_, _, installed, enabled)| *installed && *enabled)
+        .collect::<Vec<_>>();
+    match active.as_slice() {
+        [] => Err(plugin_error(
+            "SERVICE_UNAVAILABLE",
+            "Matching service providers are installed but disabled or incompatible.",
+        )),
+        [(plugin_id, _, _, _)] => Ok(plugin_id),
+        _ => Err(plugin_error(
+            "AMBIGUOUS_PROVIDER",
+            "Multiple enabled plugins provide a compatible service; disable all but one provider.",
+        )),
+    }
+}
+
+fn service_provider_error(error: PluginError) -> PluginError {
+    match error.code.as_str() {
+        "TIMEOUT" => plugin_error(
+            "SERVICE_TIMEOUT",
+            "The selected service provider did not answer before the call timed out.",
+        ),
+        "NOT_INSTALLED"
+        | "DISABLED"
+        | "NOT_RUNNING"
+        | "INCOMPATIBLE_CORE"
+        | "PLUGIN_START_FAILED"
+        | "PLUGIN_STOPPED"
+        | "PLUGIN_CRASHED"
+        | "SERVICE_DEPENDENCY_MISSING" => plugin_error(
+            "SERVICE_UNAVAILABLE",
+            "The selected service provider stopped or became unavailable during the call.",
+        ),
+        "METHOD_NOT_FOUND" => plugin_error(
+            "SERVICE_METHOD_NOT_FOUND",
+            "The provider no longer declares this service method.",
+        ),
+        _ => error,
+    }
+}
+
+fn valid_service_id(value: &str) -> bool {
+    value.len() <= 128
+        && value.split('.').count() >= 2
+        && value.split('.').all(|part| {
+            !part.is_empty()
+                && part.as_bytes()[0].is_ascii_lowercase()
+                && part.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'
+                        || byte == b'-'
+                })
+        })
+}
+
+fn valid_service_method(value: &str) -> bool {
+    value.len() <= 128
+        && !value.is_empty()
+        && value.split('.').all(|part| {
+            !part.is_empty()
+                && part.as_bytes()[0].is_ascii_lowercase()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
 }
 
 fn update_service_dependency_issues(plugins: &mut BTreeMap<String, PluginRecord>) {
@@ -1841,6 +3094,7 @@ fn update_service_dependency_issues(plugins: &mut BTreeMap<String, PluginRecord>
                         plugin_id.clone(),
                         service.id.clone(),
                         service.version.clone(),
+                        service.methods.clone(),
                         record.snapshot.enabled,
                     )
                 })
@@ -1858,9 +3112,13 @@ fn update_service_dependency_issues(plugins: &mut BTreeMap<String, PluginRecord>
         {
             let matching = providers
                 .iter()
-                .filter(|(provider_id, service_id, version, enabled)| {
+                .filter(|(provider_id, service_id, version, methods, enabled)| {
                     provider_id != plugin_id
                         && service_id == &requirement.id
+                        && requirement
+                            .methods
+                            .iter()
+                            .all(|method| methods.contains(method))
                         && *enabled
                         && Version::parse(version).is_ok_and(|version| {
                             Version::parse(&requirement.min_version).is_ok_and(|min| version >= min)
@@ -1908,11 +3166,6 @@ fn valid_plugin_id(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
         })
-}
-
-fn plugin_ui_isolation_test_enabled() -> bool {
-    cfg!(debug_assertions)
-        && std::env::var("WONDERLAND_PLUGIN_UI_ISOLATION_TEST").as_deref() == Ok("1")
 }
 
 fn content_type(path: &Path) -> String {
@@ -1975,10 +3228,10 @@ pub fn plugin_asset_response(
 fn reject_symlink(path: &Path) -> Result<(), PluginError> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| plugin_error("INTERNAL", &error.to_string()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if is_reparse_metadata(&metadata) || !metadata.is_dir() {
         return Err(plugin_error(
             "INVALID_REQUEST",
-            "Refusing to remove a non-directory plugin path.",
+            "Refusing to use a non-directory plugin path or a path that is a symbolic link, junction, or reparse point.",
         ));
     }
     Ok(())
@@ -2011,6 +3264,155 @@ fn capability_grant_key(plugin_id: &str) -> String {
     plugin_id.to_owned()
 }
 
+fn install_source_changed(
+    previous: Option<&PluginInstallSource>,
+    next: &PluginInstallSource,
+) -> bool {
+    previous.is_none_or(|previous| {
+        previous.kind != next.kind || !previous.origin.eq_ignore_ascii_case(&next.origin)
+    })
+}
+
+fn check_install_source(
+    previous_version: Option<&str>,
+    previous_source: Option<&PluginInstallSource>,
+    next: &PluginInstallSource,
+    approved_source_change: bool,
+) -> Result<bool, PluginError> {
+    let changed = previous_version.is_some() && install_source_changed(previous_source, next);
+    if changed && !approved_source_change {
+        return Err(plugin_error(
+            "SOURCE_CHANGE_APPROVAL_REQUIRED",
+            "The installed plugin has a different or unrecorded source. Review and confirm the new source before replacing it.",
+        ));
+    }
+    Ok(changed)
+}
+
+fn select_install_grants(
+    previous: Option<&[String]>,
+    requested: &[String],
+    approved: Option<&[String]>,
+    reset: bool,
+) -> Vec<String> {
+    if let Some(approved) = approved {
+        return approved.to_vec();
+    }
+    if reset {
+        return requested.to_vec();
+    }
+    let requested = requested.iter().collect::<BTreeSet<_>>();
+    previous
+        .unwrap_or_default()
+        .iter()
+        .filter(|capability| requested.contains(capability))
+        .cloned()
+        .collect()
+}
+
+fn clear_plugin_preferences(preferences: &mut Preferences, plugin_id: &str) {
+    preferences.enabled_plugins.remove(plugin_id);
+    preferences.granted_capabilities.remove(plugin_id);
+    let legacy_prefix = format!("{plugin_id}@");
+    preferences
+        .granted_capabilities
+        .retain(|key, _| !key.starts_with(&legacy_prefix));
+    preferences.active_versions.remove(plugin_id);
+    preferences.installation_sources.remove(plugin_id);
+}
+
+fn apply_plugin_data_removal(path: &Path, remove_data: bool) -> Result<(), PluginError> {
+    if !remove_data {
+        return Ok(());
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(plugin_error(
+                "INTERNAL",
+                &format!("Cannot inspect plugin data at {}: {error}", path.display()),
+            ));
+        }
+    };
+    if is_reparse_metadata(&metadata) {
+        return Err(plugin_error(
+            "UNSAFE_PATH",
+            &format!(
+                "Refusing to remove plugin data through a symbolic link, junction, or reparse point: {}",
+                path.display()
+            ),
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(plugin_error(
+            "UNSAFE_PATH",
+            &format!("Plugin data path is not a directory: {}", path.display()),
+        ));
+    }
+    reject_reparse_points_below(path)?;
+    fs::remove_dir_all(path).map_err(|error| {
+        plugin_error(
+            "INTERNAL",
+            &format!("Cannot remove plugin data at {}: {error}", path.display()),
+        )
+    })
+}
+
+fn reject_reparse_points_below(root: &Path) -> Result<(), PluginError> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|error| {
+            plugin_error(
+                "INTERNAL",
+                &format!(
+                    "Cannot inspect plugin data at {}: {error}",
+                    directory.display()
+                ),
+            )
+        })? {
+            let entry = entry.map_err(|error| plugin_error("INTERNAL", &error.to_string()))?;
+            let child = entry.path();
+            let metadata = fs::symlink_metadata(&child)
+                .map_err(|error| plugin_error("INTERNAL", &error.to_string()))?;
+            if is_reparse_metadata(&metadata) {
+                return Err(plugin_error(
+                    "UNSAFE_PATH",
+                    &format!(
+                        "Refusing to remove plugin data containing a symbolic link, junction, or reparse point: {}",
+                        child.display()
+                    ),
+                ));
+            }
+            if metadata.is_dir() {
+                pending.push(child);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_metadata(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn restore_map_entry<T>(map: &mut BTreeMap<String, T>, key: &str, previous: Option<T>) {
+    if let Some(value) = previous {
+        map.insert(key.to_owned(), value);
+    } else {
+        map.remove(key);
+    }
+}
+
 fn migrate_capability_grants(
     grants: BTreeMap<String, Vec<String>>,
 ) -> BTreeMap<String, Vec<String>> {
@@ -2037,4 +3439,231 @@ fn migrate_capability_grants(
         .into_iter()
         .map(|(plugin_id, capabilities)| (plugin_id, capabilities.into_iter().collect()))
         .collect()
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn uninstall_clears_current_and_legacy_grants_without_touching_other_plugins() {
+        let mut preferences = Preferences::default();
+        preferences
+            .granted_capabilities
+            .insert("editor".into(), vec!["files.pick".into()]);
+        preferences
+            .granted_capabilities
+            .insert("editor@1.0.0".into(), vec!["files.export".into()]);
+        preferences
+            .granted_capabilities
+            .insert("editor_plus".into(), vec!["files.pick".into()]);
+        preferences
+            .installation_sources
+            .insert("editor".into(), local_source("C:/plugins/editor.wplug"));
+        preferences
+            .active_versions
+            .insert("editor".into(), "1.0.0".into());
+
+        clear_plugin_preferences(&mut preferences, "editor");
+
+        assert!(!preferences.granted_capabilities.contains_key("editor"));
+        assert!(
+            !preferences
+                .granted_capabilities
+                .contains_key("editor@1.0.0")
+        );
+        assert!(preferences.granted_capabilities.contains_key("editor_plus"));
+        assert!(!preferences.installation_sources.contains_key("editor"));
+        assert!(!preferences.active_versions.contains_key("editor"));
+    }
+
+    #[test]
+    fn source_switch_requires_new_review_and_does_not_reuse_grants() {
+        let old = local_source("C:/plugins/editor.wplug");
+        let new = PluginInstallSource {
+            kind: "catalog".into(),
+            origin: "https://github.com/example/editor".into(),
+            author: Some("Example".into()),
+        };
+        assert!(install_source_changed(None, &new));
+        assert!(install_source_changed(Some(&old), &new));
+        assert!(!install_source_changed(Some(&new), &new));
+        assert!(!check_install_source(None, None, &new, false).unwrap());
+        assert_eq!(
+            check_install_source(Some("1.0.0"), Some(&old), &new, false)
+                .unwrap_err()
+                .code,
+            "SOURCE_CHANGE_APPROVAL_REQUIRED"
+        );
+        assert!(check_install_source(Some("1.0.0"), None, &new, true).unwrap());
+
+        let previous = vec!["files.pick".into()];
+        let requested = vec!["files.pick".into(), "network.public".into()];
+        assert_eq!(
+            select_install_grants(Some(&previous), &requested, None, false),
+            previous
+        );
+        assert_eq!(
+            select_install_grants(Some(&previous), &requested, None, true),
+            requested
+        );
+    }
+
+    #[test]
+    fn existing_preferences_without_source_remain_readable() {
+        let preferences: Preferences = serde_json::from_str(
+            r#"{"schemaVersion":3,"enabledPlugins":{"editor":true},"grantedCapabilities":{"editor":["files.pick"]},"activeVersions":{"editor":"1.0.0"}}"#,
+        )
+        .unwrap();
+        assert!(preferences.installation_sources.is_empty());
+        assert_eq!(preferences.granted_capabilities["editor"], ["files.pick"]);
+    }
+
+    #[test]
+    fn plugin_data_remains_by_default_and_is_deleted_only_when_requested() {
+        let data_directory = std::env::temp_dir().join(format!(
+            "wonderland-plugin-data-removal-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&data_directory).unwrap();
+        let data_file = data_directory.join("user-state.json");
+        fs::write(&data_file, b"user data").unwrap();
+
+        apply_plugin_data_removal(&data_directory, false).unwrap();
+        assert_eq!(fs::read(&data_file).unwrap(), b"user data");
+
+        apply_plugin_data_removal(&data_directory, true).unwrap();
+        assert!(!data_directory.exists());
+    }
+
+    fn local_source(origin: &str) -> PluginInstallSource {
+        PluginInstallSource {
+            kind: "local".into(),
+            origin: origin.into(),
+            author: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod service_resolution_tests {
+    use super::*;
+
+    fn requirement(min_version: &str, max_version_exclusive: &str) -> PluginServiceRequirement {
+        PluginServiceRequirement {
+            id: "wonderland.comments.archive".into(),
+            min_version: min_version.into(),
+            max_version_exclusive: max_version_exclusive.into(),
+            optional: true,
+            methods: vec!["service_archives".into(), "archive_page".into()],
+        }
+    }
+
+    fn service(version: &str, methods: &[&str]) -> PluginService {
+        PluginService {
+            id: "wonderland.comments.archive".into(),
+            version: version.into(),
+            methods: methods.iter().map(|method| (*method).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn resolves_one_compatible_enabled_provider_and_excludes_self() {
+        let own_service = service("1.0.0", &["service_archives", "archive_page"]);
+        let provider = service("1.2.0", &["service_archives", "archive_page"]);
+        let providers = [
+            ("knowledge_library", &own_service, true, true),
+            ("comment_collector", &provider, true, true),
+        ];
+
+        let selected = choose_service_provider(
+            "knowledge_library",
+            &requirement("1.0.0", "2.0.0"),
+            &providers,
+        )
+        .unwrap();
+
+        assert_eq!(selected, "comment_collector");
+    }
+
+    #[test]
+    fn service_resolution_reports_missing_version_and_method_errors() {
+        let no_providers = [];
+        assert_eq!(
+            choose_service_provider("consumer", &requirement("1.0.0", "2.0.0"), &no_providers,)
+                .unwrap_err()
+                .code,
+            "SERVICE_NOT_FOUND"
+        );
+
+        // An upgrade to the next major version no longer satisfies the consumer's pinned range.
+        let wrong_version = service("2.0.0", &["service_archives", "archive_page"]);
+        assert_eq!(
+            choose_service_provider(
+                "consumer",
+                &requirement("1.0.0", "2.0.0"),
+                &[("provider", &wrong_version, true, true)],
+            )
+            .unwrap_err()
+            .code,
+            "SERVICE_VERSION_MISMATCH"
+        );
+
+        let missing_method = service("1.0.0", &["service_archives"]);
+        assert_eq!(
+            choose_service_provider(
+                "consumer",
+                &requirement("1.0.0", "2.0.0"),
+                &[("provider", &missing_method, true, true)],
+            )
+            .unwrap_err()
+            .code,
+            "SERVICE_METHOD_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn service_resolution_rejects_ambiguous_or_disabled_providers() {
+        let first = service("1.0.0", &["service_archives", "archive_page"]);
+        let second = service("1.1.0", &["service_archives", "archive_page"]);
+        assert_eq!(
+            choose_service_provider(
+                "consumer",
+                &requirement("1.0.0", "2.0.0"),
+                &[
+                    ("provider_a", &first, true, true),
+                    ("provider_b", &second, true, true),
+                ],
+            )
+            .unwrap_err()
+            .code,
+            "AMBIGUOUS_PROVIDER"
+        );
+
+        assert_eq!(
+            choose_service_provider(
+                "consumer",
+                &requirement("1.0.0", "2.0.0"),
+                &[("provider", &first, true, false)],
+            )
+            .unwrap_err()
+            .code,
+            "SERVICE_UNAVAILABLE"
+        );
+    }
+
+    #[test]
+    fn provider_call_failures_use_stable_service_codes() {
+        assert_eq!(
+            service_provider_error(plugin_error("TIMEOUT", "late")).code,
+            "SERVICE_TIMEOUT"
+        );
+        for original in ["PLUGIN_CRASHED", "NOT_RUNNING", "DISABLED"] {
+            assert_eq!(
+                service_provider_error(plugin_error(original, "stopped")).code,
+                "SERVICE_UNAVAILABLE"
+            );
+        }
+    }
 }

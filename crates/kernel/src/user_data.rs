@@ -31,6 +31,10 @@ pub struct UserDataState {
     pub pending_path: Option<String>,
     /// 最近一次成功迁移的目标目录，供设置页确认结果。
     pub last_migration_path: Option<String>,
+    /// 迁移成功后未能清理的旧目录；新目录已激活，旧路径可能只剩部分文件。
+    pub last_migration_source: Option<String>,
+    /// 迁移已完成但旧目录清理未完全成功时的提示。
+    pub last_migration_warning: Option<String>,
     /// 上次启动迁移失败的原因；失败时仍从原目录启动，不丢数据。
     pub last_migration_error: Option<String>,
 }

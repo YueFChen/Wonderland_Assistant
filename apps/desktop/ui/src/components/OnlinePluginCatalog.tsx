@@ -39,20 +39,34 @@ export function OnlinePluginCatalog({ onInstalled }: {
 
   const install = async (item: PluginCatalogSnapshot['plugins'][number]) => {
     const { entry } = item
-    const requested = entry.capabilities.length > 0
-      ? entry.capabilities.map((capability) => `• ${capability}`).join('\n')
-      : t('settings.plugins.catalog.noCapabilities')
-    const confirmation = t('settings.plugins.catalog.confirm', {
-      name: entry.name,
-      version: entry.version,
-      capabilities: requested,
-    })
-    if (!window.confirm(confirmation)) return
-
     setBusy(entry.id)
     setFailure('')
     try {
-      const states = await pluginApi.installCatalog(entry.id, entry.version, entry.sha256, entry.capabilities)
+      const installed = (await pluginApi.states()).find((state) => state.manifest.id === entry.id)
+      const previousSource = installed?.installationSource
+        ? `${installed.installationSource.kind === 'catalog' ? 'GitHub' : '本地'}：${installed.installationSource.origin}`
+        : installed ? t('settings.plugins.source.unknown') : t('settings.plugins.source.none')
+      const requested = entry.capabilities.length > 0
+        ? entry.capabilities.map((capability) => `• ${capability}`).join('\n')
+        : t('settings.plugins.catalog.noCapabilities')
+      const serviceLines = [
+        ...entry.provides.map((service) => `• ${service.id}@${service.version}：${service.methods.join('、')}`),
+        ...entry.requires.map((service) => `• ${service.id}（${service.minVersion} ≤ version < ${service.maxVersionExclusive}，${service.optional ? '可选' : '必需'}）：${service.methods.join('、')}`),
+      ]
+      const requestedServices = serviceLines.length > 0
+        ? serviceLines.join('\n')
+        : t('settings.plugins.catalog.noServices')
+      const confirmation = t('settings.plugins.catalog.confirm', {
+        name: entry.name,
+        version: entry.version,
+        author: entry.author,
+        repository: entry.repositoryUrl,
+        previousSource,
+        capabilities: requested,
+        services: requestedServices,
+      })
+      if (!window.confirm(confirmation)) return
+      const states = await pluginApi.installCatalog(entry.id, entry.version, entry.sha256, entry.capabilities, true)
       onInstalled(states)
       setCatalog((current) => current && ({
         ...current,

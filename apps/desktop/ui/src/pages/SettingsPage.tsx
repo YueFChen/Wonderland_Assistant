@@ -14,6 +14,7 @@ import { setStartupMemoryEnabled, startupMemoryEnabled } from '../startupMemory'
 import { t, type MessageKey } from '../i18n'
 import { AccountManagementSection } from './AccountSection'
 import { CoreUpdateCard } from '../components/CoreUpdateCard'
+import { NetworkProxyCard } from '../components/NetworkProxyCard'
 
 /** 主题档位。自定义档的控件保持深色，与后端 `ThemeMode` 的语义一致。 */
 const MODES: { value: ThemeMode; labelKey: MessageKey; hintKey: MessageKey; icon: LucideIcon }[] = [
@@ -80,6 +81,10 @@ export function SettingsPage() {
             <StartupMemoryCard />
             <CoreUpdateCard />
           </div>
+        </SettingsGroup>
+
+        <SettingsGroup title={t('settings.section.network')} hint={t('settings.section.networkHint')}>
+          <NetworkProxyCard />
         </SettingsGroup>
 
         <SettingsGroup title={t('settings.section.appearance')}>
@@ -293,6 +298,12 @@ function UserDataCard({ state, setState, loadFailure }: {
           )}
           {state.last_migration_path && !state.pending_path && !state.last_migration_error && (
             <p role="status" className="text-xs text-ink-muted">{t('settings.userData.lastSuccess', { path: state.last_migration_path })}</p>
+          )}
+          {state.last_migration_warning && (
+            <p role="status" className="rounded-lg border border-brand-400/40 bg-glass px-3 py-2 text-xs text-ink-muted">
+              {t('settings.userData.cleanupWarning', { path: state.last_migration_source ?? state.active_path })}
+              <span className="mt-1 block">{state.last_migration_warning}</span>
+            </p>
           )}
         </div>
       )}

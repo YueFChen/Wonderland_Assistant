@@ -23,6 +23,8 @@ use wonderland_plugin_protocol::{
     PluginRuntimeState,
 };
 
+use crate::plugin_manager::PluginManager;
+
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
@@ -282,6 +284,60 @@ impl PluginProcess {
 
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Stops the backend synchronously before Core removes its package or private data.
+    pub(crate) fn stop(&self) -> Result<(), PluginError> {
+        self.alive.store(false, Ordering::Release);
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| internal_error("Plugin process handle is unavailable."))?;
+        if child
+            .try_wait()
+            .map_err(|error| internal_error(&format!("Cannot inspect plugin process: {error}")))?
+            .is_none()
+            && let Err(error) = child.kill()
+            && child
+                .try_wait()
+                .map_err(|wait_error| {
+                    internal_error(&format!("Cannot inspect plugin process: {wait_error}"))
+                })?
+                .is_none()
+        {
+            return Err(internal_error(&format!(
+                "Cannot stop plugin process before removing its data: {error}"
+            )));
+        }
+        child.wait().map_err(|error| {
+            internal_error(&format!("Cannot collect plugin process exit: {error}"))
+        })?;
+        self.fail_pending(plugin_error(
+            "PLUGIN_STOPPED",
+            "Plugin was stopped before its files were removed.",
+        ));
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn terminate_for_test(&self) -> Result<(), PluginError> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| internal_error("Plugin process handle is unavailable."))?;
+        if child
+            .try_wait()
+            .map_err(|error| internal_error(&format!("Cannot inspect plugin process: {error}")))?
+            .is_none()
+        {
+            child
+                .kill()
+                .map_err(|error| internal_error(&format!("Cannot stop plugin process: {error}")))?;
+        }
+        child.wait().map_err(|error| {
+            internal_error(&format!("Cannot collect plugin process exit: {error}"))
+        })?;
+        Ok(())
     }
 
     fn write_frame(&self, frame: &Value) -> Result<(), PluginError> {
@@ -577,7 +633,7 @@ impl PluginProcess {
             "core.files.export" | "core.files.export_dir" => "files.export",
             "core.files.reveal_own" => "files.reveal_own",
             "core.browser.open_official" => "browser.open_official",
-            "core.knowledge.local_model" => "knowledge.local_model",
+            "core.services.resolve" | "core.services.invoke" => "services.call",
             _ => {
                 return Err(plugin_error(
                     "METHOD_NOT_FOUND",
@@ -611,9 +667,42 @@ impl PluginProcess {
             "core.files.read" => self.read_picked_file(params),
             "core.files.export" => self.export_file(params),
             "core.files.export_dir" => self.export_dir(),
-            "core.files.reveal_own" => self.reveal_own(app, params),
+            "core.files.reveal_own" => self.reveal_own(params),
             "core.browser.open_official" => open_official(params),
-            "core.knowledge.local_model" => knowledge_local_model(app),
+            "core.services.resolve" => {
+                let service_id = params
+                    .get("serviceId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| plugin_error("INVALID_INPUT", "Service ID is missing."))?;
+                let manager = app.try_state::<PluginManager>().ok_or_else(|| {
+                    plugin_error(
+                        "SERVICE_UNAVAILABLE",
+                        "Plugin service broker is unavailable.",
+                    )
+                })?;
+                let resolution = manager.resolve_service(&self.plugin_id, service_id)?;
+                serde_json::to_value(resolution).map_err(|_| {
+                    plugin_error("INTERNAL", "Service resolution could not be serialized.")
+                })
+            }
+            "core.services.invoke" => {
+                let service_id = params
+                    .get("serviceId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| plugin_error("INVALID_INPUT", "Service ID is missing."))?;
+                let service_method = params
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| plugin_error("INVALID_INPUT", "Service method is missing."))?;
+                let service_params = params.get("params").cloned().unwrap_or_else(|| json!({}));
+                let manager = app.try_state::<PluginManager>().ok_or_else(|| {
+                    plugin_error(
+                        "SERVICE_UNAVAILABLE",
+                        "Plugin service broker is unavailable.",
+                    )
+                })?;
+                manager.invoke_service(&self.plugin_id, service_id, service_method, service_params)
+            }
             _ => unreachable!(),
         }
     }
@@ -1046,28 +1135,10 @@ impl PluginProcess {
         Ok(json!({ "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
     }
 
-    fn reveal_own(&self, app: &AppHandle, params: &Value) -> Result<Value, PluginError> {
+    fn reveal_own(&self, params: &Value) -> Result<Value, PluginError> {
         let directory = match params.get("scope").and_then(Value::as_str) {
             Some("data") => &self.data_dir,
             Some("exports") => &self.export_dir,
-            Some("knowledge_cache") if self.plugin_id == "knowledge_library" => {
-                let context = app.state::<wonderland_kernel::AppContext>();
-                let path = context.app_data_dir.join("plugins/knowledge/zh-cn/v1");
-                fs::create_dir_all(&path).map_err(|error| {
-                    plugin_error(
-                        "INTERNAL",
-                        &format!("Cannot create knowledge cache directory: {error}"),
-                    )
-                })?;
-                return crate::reveal::open_dir(&path)
-                    .map(|_| json!({ "ok": true }))
-                    .map_err(|error| {
-                        plugin_error(
-                            "INTERNAL",
-                            &format!("Cannot open knowledge cache directory: {error}"),
-                        )
-                    });
-            }
             _ => return Err(plugin_error("INVALID_INPUT", "Reveal scope is invalid.")),
         };
         fs::create_dir_all(directory).map_err(|error| {
@@ -1102,19 +1173,6 @@ fn account_snapshot(app: &AppHandle) -> Result<Value, PluginError> {
         .ok_or_else(|| plugin_error("NOT_RUNNING", "Core account service is unavailable."))?;
     serde_json::to_value(account.snapshot())
         .map_err(|_| plugin_error("INTERNAL", "Cannot serialize the Core account snapshot."))
-}
-
-fn knowledge_local_model(app: &AppHandle) -> Result<Value, PluginError> {
-    let context = app.state::<wonderland_kernel::AppContext>();
-    let cache_dir = context.app_data_dir.join("plugins/knowledge/zh-cn/v1");
-    let models_dir = cache_dir.join("models");
-    fs::create_dir_all(&models_dir).map_err(|error| {
-        plugin_error(
-            "INTERNAL",
-            &format!("Cannot create the approved knowledge model directory: {error}"),
-        )
-    })?;
-    Ok(json!({ "cacheDir": cache_dir, "modelsDir": models_dir }))
 }
 
 /// Browser access is intentionally a set of named destinations. Plugins cannot ask the host to
@@ -1210,6 +1268,7 @@ fn account_authed_get(app: &AppHandle, params: &Value) -> Result<Value, PluginEr
                     wonderland_kernel::KernelError::SessionExpired => {
                         "PLUGIN_MY_WONDERLAND_SESSION_EXPIRED"
                     }
+                    wonderland_kernel::KernelError::ResourceLimit => "RESOURCE_LIMIT",
                     wonderland_kernel::KernelError::InvalidInput => "UNAUTHORIZED",
                     wonderland_kernel::KernelError::Timeout => "TIMEOUT",
                     wonderland_kernel::KernelError::Http(_) => "PLUGIN_MY_WONDERLAND_HTTP_ERROR",
@@ -1337,6 +1396,7 @@ fn network_public(params: &Value) -> Result<Value, PluginError> {
         plugin_error(
             match error {
                 wonderland_kernel::KernelError::Timeout => "TIMEOUT",
+                wonderland_kernel::KernelError::ResourceLimit => "RESOURCE_LIMIT",
                 wonderland_kernel::KernelError::InvalidInput => "UNAUTHORIZED",
                 wonderland_kernel::KernelError::Http(_) => "PLUGIN_NETWORK_HTTP_ERROR",
                 _ => "PLUGIN_NETWORK_REQUEST_FAILED",

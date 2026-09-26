@@ -1,5 +1,4 @@
-import { useEffect, useState } from 'react'
-import { ArrowRight, Clock3, Gamepad2, LayoutGrid, Play, Puzzle, Settings2 } from 'lucide-react'
+import { ArrowRight, Clock3, LayoutGrid, Puzzle, Settings2 } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 
 import brandAvatar from '../assets/brand-avatar.png'
@@ -8,54 +7,19 @@ import { buildContributionRegistry, openContribution } from '../plugins/contribu
 import { pluginIcon } from '../plugins/icons'
 import { usePlugins } from '../plugins/api'
 import { useWorkspaceLayout } from '../plugins/workspaceLayout'
-import { gameLauncherApi, type GameLauncherSnapshot } from '../home/gameLauncher'
 import './HomePage.css'
 
-/** Home is the branded entry point for the game and UGC development workspace. */
+/** Home is the branded entry point for the Wonderland plugin workspace. */
 export function HomePage() {
   const navigate = useNavigate()
   const { states } = usePlugins()
   const { layout } = useWorkspaceLayout()
-  const [launcher, setLauncher] = useState<GameLauncherSnapshot | null>(null)
-  const [gameBusy, setGameBusy] = useState(false)
-  const [launchError, setLaunchError] = useState(false)
-
-  useEffect(() => {
-    let live = true
-    void gameLauncherApi.snapshot()
-      .then((snapshot) => { if (live) setLauncher(snapshot) })
-      .catch(() => { if (live) setLauncher({ path: null, available: false, supported: true, kind: null, source: null }) })
-    return () => { live = false }
-  }, [])
-
   const registry = buildContributionRegistry(states)
   const recent = [...layout.openContributionIds]
     .reverse()
     .map((id) => registry.find((item) => item.id === id && item.kind === 'activity'))
     .filter((item): item is NonNullable<typeof item> => item !== undefined)
     .slice(0, 3)
-
-  const canLaunch = launcher?.supported === true && launcher.available
-  const gameButtonText = launcher === null
-    ? t('home.launcherLoading')
-    : canLaunch ? t('home.launchGame') : t('home.chooseLauncher')
-
-  const handleGameAction = async (action: 'launch' | 'select' = canLaunch ? 'launch' : 'select') => {
-    if (!launcher?.supported || gameBusy) return
-    setGameBusy(true)
-    setLaunchError(false)
-    try {
-      if (action === 'launch' && canLaunch) {
-        await gameLauncherApi.launch()
-      } else {
-        setLauncher(await gameLauncherApi.select())
-      }
-    } catch {
-      setLaunchError(true)
-    } finally {
-      setGameBusy(false)
-    }
-  }
 
   return (
     <section className="flex h-full min-h-0 w-full">
@@ -84,57 +48,6 @@ export function HomePage() {
 
       <div className="flex min-h-0 min-w-0 flex-1 overflow-y-auto px-7 py-8 md:px-10 xl:px-14 xl:py-12 2xl:px-20">
         <div className="mx-auto my-auto w-full max-w-3xl space-y-8 xl:max-w-5xl 2xl:max-w-6xl">
-          <section aria-labelledby="home-game-heading" className="glass-card relative overflow-hidden rounded-3xl border border-brand-500/20 bg-brand-600/[0.06] p-6 md:p-7">
-            <div className="pointer-events-none absolute -right-12 -top-20 h-56 w-56 rounded-full bg-brand-500/10 blur-3xl" />
-            <div className="relative flex flex-wrap items-start justify-between gap-5">
-              <div className="flex min-w-0 items-start gap-4">
-                <span className="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-brand-600/15 text-brand-400">
-                  <Gamepad2 className="h-5 w-5" strokeWidth={1.7} aria-hidden />
-                </span>
-                <div className="min-w-0 pt-0.5">
-                  <p className="text-[10px] font-bold uppercase tracking-[0.19em] text-brand-400">{t('home.gameEyebrow')}</p>
-                  <h2 id="home-game-heading" className="mt-1 text-xl font-semibold text-ink">{t('home.gameTitle')}</h2>
-                </div>
-              </div>
-              {launcher?.supported && launcher.available && launcher.path && (
-                <span className="max-w-52 truncate rounded-full border border-glass-line bg-glass/70 px-3 py-1.5 text-[11px] text-ink-faint" title={launcher.path}>
-                  {launcher.path.split(/[\\/]/).pop()}
-                </span>
-              )}
-            </div>
-            <div className="relative mt-6 flex flex-wrap items-center gap-3 border-t border-dashed border-glass-line pt-5">
-              <button
-                type="button"
-                onClick={() => void handleGameAction()}
-                disabled={gameBusy || launcher === null || !launcher.supported}
-                className="inline-flex min-w-40 items-center justify-center gap-2 rounded-xl bg-brand-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-brand-950/15 transition hover:-translate-y-0.5 hover:bg-brand-500 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-brand-400 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:translate-y-0"
-              >
-                {canLaunch ? <Play className="h-4 w-4 fill-current" aria-hidden /> : <Gamepad2 className="h-4 w-4" aria-hidden />}
-                {gameBusy ? t('home.gameWorking') : gameButtonText}
-                {!gameBusy && canLaunch && <ArrowRight className="h-4 w-4" aria-hidden />}
-              </button>
-              {launcher?.supported && launcher.available && (
-                <button type="button" onClick={() => void handleGameAction('select')} disabled={gameBusy} className="rounded-lg px-3 py-2 text-xs font-medium text-ink-muted transition hover:bg-glass-hover hover:text-ink disabled:opacity-50">
-                  {t('home.changeLauncher')}
-                </button>
-              )}
-              <span className="text-xs text-ink-faint">
-                {launcher === null
-                  ? t('home.launcherLoading')
-                  : !launcher.supported
-                    ? t('home.launcherUnsupported')
-                    : launcher.available
-                      ? launcher.source === 'registry'
-                        ? t('home.launcherDetected')
-                        : launcher.kind === 'game'
-                          ? t('home.gameReady')
-                          : t('home.launcherReady')
-                      : t('home.launcherUnavailable')}
-              </span>
-            </div>
-            {launchError && <p role="alert" className="relative mt-4 text-xs text-[var(--app-danger)]">{t('home.launchFailed')}</p>}
-          </section>
-
           <section aria-labelledby="home-recent-heading" className="border-t border-dashed border-glass-line pt-7">
             <div className="mb-3 flex items-center justify-between gap-3">
               <h2 id="home-recent-heading" className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.16em] text-ink-faint">

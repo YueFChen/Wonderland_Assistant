@@ -3,6 +3,13 @@ import { X } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { listen } from '@tauri-apps/api/event'
 import { UI_BRIDGE_PROTOCOL as BRIDGE_PROTOCOL, UI_BRIDGE_VERSION } from '@wonderland/plugin-ui-sdk'
+import { validatePluginUiBridgeMessage } from '../plugins/pluginUiBridgeValidation'
+import {
+  completePluginUiCommand,
+  queuedPluginUiCommands,
+  takeQueuedPluginUiCommand,
+  type CliPluginUiCommand,
+} from '../plugins/cliUiCommandBus'
 
 import { t } from '../i18n'
 import { pluginApi, usePlugins, type PluginEventPayload } from '../plugins/api'
@@ -28,6 +35,10 @@ type PluginUiMessage = {
   topic?: string
   viewId?: string
   payload?: unknown
+  commandId?: string
+  input?: unknown
+  result?: unknown
+  error?: { code?: string; message?: string }
 }
 
 /** Core owns activity tabs and mounts each enabled contribution in its own sandboxed frame. */
@@ -80,7 +91,10 @@ export function PluginPage() {
     }
 
     if (!activeContribution && pluginId && contributionId) {
-      navigate('/workspace', { replace: true })
+      navigate('/workspace', {
+        replace: true,
+        state: { pluginPageRecovery: { pluginId, contributionId } },
+      })
     }
   }, [activeContribution?.kind, activeContribution?.status, activeId, activityIds, contributionId, layout.activeContributionId, layout.activeSidebarContributionId, layout.openContributionIds, navigate, pluginId, states, update])
 
@@ -287,11 +301,16 @@ export function PluginSurface({
   const nonce = useRef(crypto.randomUUID())
   const activeCalls = useRef<number[]>([])
   const pendingCalls = useRef(new Set<string>())
+  const pendingCliCommands = useRef(new Map<string, CliPluginUiCommand>())
+  const sentCliCommands = useRef(new Set<string>())
   const subscribedTopics = useRef(new Set<string>())
+  const handshakeTimer = useRef<number | null>(null)
   const [url, setUrl] = useState('')
   const [loaderFailure, setLoaderFailure] = useState('')
   const [ready, setReady] = useState(false)
   const [bridgeError, setBridgeError] = useState('')
+  const [loadGeneration, setLoadGeneration] = useState(0)
+  const [frameGeneration, setFrameGeneration] = useState(0)
   const followsTheme = contribution.integrations.includes('theme.followHost')
   const providesSidebar = contribution.integrations.includes('workspace.sidebar')
 
@@ -313,6 +332,54 @@ export function PluginSurface({
     }, '*')
   }, [contribution.contributionId, state.manifest.id])
 
+  const deliverCliCommand = useCallback((command: CliPluginUiCommand) => {
+    if (!active || !ready || sentCliCommands.current.has(command.requestId)) return
+    sentCliCommands.current.add(command.requestId)
+    sendToPlugin({
+      type: 'command',
+      requestId: command.requestId,
+      commandId: command.commandId,
+      input: command.input,
+    })
+  }, [active, ready, sendToPlugin])
+
+  useEffect(() => {
+    const receiveCommand = (event: Event) => {
+      const command = (event as CustomEvent<CliPluginUiCommand>).detail
+      if (!command || command.contributionId !== `${state.manifest.id}/${contribution.contributionId}` || !active) return
+      const queuedCommand = takeQueuedPluginUiCommand(command.requestId)
+      if (!queuedCommand) return
+      pendingCliCommands.current.set(command.requestId, queuedCommand)
+      deliverCliCommand(queuedCommand)
+    }
+    window.addEventListener('wonderland:cli-ui-command', receiveCommand)
+    if (active) {
+      for (const command of queuedPluginUiCommands(`${state.manifest.id}/${contribution.contributionId}`)) {
+        const queuedCommand = takeQueuedPluginUiCommand(command.requestId)
+        if (!queuedCommand) continue
+        pendingCliCommands.current.set(command.requestId, queuedCommand)
+        deliverCliCommand(queuedCommand)
+      }
+    }
+    return () => window.removeEventListener('wonderland:cli-ui-command', receiveCommand)
+  }, [active, contribution.contributionId, deliverCliCommand, state.manifest.id])
+
+  useEffect(() => {
+    if (!active || !ready) return
+    for (const command of pendingCliCommands.current.values()) deliverCliCommand(command)
+  }, [active, deliverCliCommand, ready])
+
+  useEffect(() => () => {
+    for (const requestId of pendingCliCommands.current.keys()) {
+      completePluginUiCommand(requestId, null, {
+        code: 'CONTRIBUTION_CLOSED',
+        message: 'The plugin UI closed before completing the command.',
+      })
+    }
+    pendingCliCommands.current.clear()
+    sentCliCommands.current.clear()
+  }, [])
+
   useEffect(() => {
     let live = true
     setUrl('')
@@ -322,26 +389,71 @@ export function PluginSurface({
       .then((next) => { if (live) setUrl(next) })
       .catch((cause) => { if (live) setLoaderFailure(errorText(cause)) })
     return () => { live = false }
-  }, [state.manifest.id])
+  }, [loadGeneration, state.manifest.id])
+
+  useEffect(() => () => {
+    if (handshakeTimer.current !== null) window.clearTimeout(handshakeTimer.current)
+  }, [])
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<unknown>) => {
       const frameWindow = frame.current?.contentWindow
       if (!frameWindow || event.source !== frameWindow || event.origin !== 'null') return
-      const message = event.data as Partial<PluginUiMessage> | null
-      if (
-        !message
-        || message.protocol !== BRIDGE_PROTOCOL
-        || message.bridgeVersion !== UI_BRIDGE_VERSION
-        || message.pluginId !== state.manifest.id
-        || message.contributionId !== contribution.contributionId
-        || message.nonce !== nonce.current
-      ) return
+      const validation = validatePluginUiBridgeMessage(event.data, {
+        protocol: BRIDGE_PROTOCOL,
+        bridgeVersion: UI_BRIDGE_VERSION,
+        pluginId: state.manifest.id,
+        contributionId: contribution.contributionId,
+        nonce: nonce.current,
+      })
+      if (validation === 'ignore') return
+      const message = event.data as Partial<PluginUiMessage>
+
+      if (validation === 'bridge-version-mismatch') {
+        if (handshakeTimer.current !== null) {
+          window.clearTimeout(handshakeTimer.current)
+          handshakeTimer.current = null
+        }
+        setReady(false)
+        setBridgeError(t('pluginPage.bridgeMismatch'))
+        return
+      }
 
       if (message.type === 'ready') {
+        if (handshakeTimer.current !== null) {
+          window.clearTimeout(handshakeTimer.current)
+          handshakeTimer.current = null
+        }
         setReady(true)
         setBridgeError('')
         sendToPlugin({ type: 'surface_lifecycle', state: active ? 'active' : 'inactive' })
+        return
+      }
+      if (
+        (message.type === 'command_result' || message.type === 'command_error')
+        && typeof message.requestId === 'string'
+        && pendingCliCommands.current.has(message.requestId)
+      ) {
+        pendingCliCommands.current.delete(message.requestId)
+        sentCliCommands.current.delete(message.requestId)
+        if (message.type === 'command_error') {
+          completePluginUiCommand(message.requestId, null, message.error)
+        } else {
+          let resultBytes = 0
+          try {
+            resultBytes = new TextEncoder().encode(JSON.stringify(message.result ?? null)).byteLength
+          } catch {
+            resultBytes = Number.POSITIVE_INFINITY
+          }
+          if (resultBytes > 64 * 1024) {
+            completePluginUiCommand(message.requestId, null, {
+              code: 'RESOURCE_LIMIT',
+              message: 'Plugin UI command results cannot exceed 64 KiB.',
+            })
+          } else {
+            completePluginUiCommand(message.requestId, message.result)
+          }
+        }
         return
       }
       if (message.type === 'open_sidebar' && typeof message.viewId === 'string' && providesSidebar) {
@@ -458,6 +570,11 @@ export function PluginSurface({
     setReady(false)
     setBridgeError('')
     subscribedTopics.current.clear()
+    if (handshakeTimer.current !== null) window.clearTimeout(handshakeTimer.current)
+    handshakeTimer.current = window.setTimeout(() => {
+      handshakeTimer.current = null
+      setBridgeError(t('pluginPage.bridgeTimeout'))
+    }, 10_000)
     frame.current?.contentWindow?.postMessage({
       protocol: BRIDGE_PROTOCOL,
       bridgeVersion: UI_BRIDGE_VERSION,
@@ -469,21 +586,58 @@ export function PluginSurface({
     }, '*')
   }
 
-  if (loaderFailure) return <p role="alert" className="rounded-xl bg-glass px-5 py-4 text-sm text-[var(--app-danger)]">{t('pluginPage.uiPending')} {loaderFailure}</p>
+  const retry = () => {
+    if (handshakeTimer.current !== null) {
+      window.clearTimeout(handshakeTimer.current)
+      handshakeTimer.current = null
+    }
+    setReady(false)
+    setBridgeError('')
+    if (loaderFailure) {
+      setUrl('')
+      setLoaderFailure('')
+      setLoadGeneration((value) => value + 1)
+    } else {
+      setFrameGeneration((value) => value + 1)
+    }
+  }
+
+  if (loaderFailure) {
+    return (
+      <section role="alert" className="mx-auto mt-8 w-full max-w-xl rounded-xl bg-glass px-5 py-4">
+        <p className="text-sm text-[var(--app-danger)]">{t('pluginPage.frameFailed')} {loaderFailure}</p>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button type="button" onClick={retry} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-500">{t('pluginPage.retry')}</button>
+          <Link to="/workspace/settings" className="rounded-lg border border-glass-line px-4 py-2 text-sm text-ink hover:bg-glass-hover">{t('workspace.goToSettings')}</Link>
+        </div>
+      </section>
+    )
+  }
   if (!url) return <p role="status" className="rounded-xl bg-glass px-5 py-4 text-sm text-ink-muted">{t('pluginPage.uiPending')}</p>
 
   return (
     <div className="plugin-surface-frame" hidden={!active} aria-hidden={!active} data-active={active}>
       {!ready && <p role="status" className="border-b border-glass-line px-4 py-2 text-xs text-ink-faint">{t('pluginPage.bridgeStarting')}</p>}
-      {bridgeError && <p role="alert" className="px-4 py-2 text-xs text-[var(--app-danger)]">{bridgeError}</p>}
+      {bridgeError && (
+        <div role="alert" className="flex flex-wrap items-center gap-2 border-b border-glass-line px-4 py-2 text-xs text-[var(--app-danger)]">
+          <span className="flex-1">{bridgeError}</span>
+          <button type="button" onClick={retry} className="rounded-md border border-glass-line px-2.5 py-1 text-ink hover:bg-glass-hover">{t('pluginPage.retry')}</button>
+          <Link to="/workspace/settings" className="rounded-md border border-glass-line px-2.5 py-1 text-ink hover:bg-glass-hover">{t('workspace.goToSettings')}</Link>
+        </div>
+      )}
       <iframe
         ref={frame}
+        key={frameGeneration}
         title={contribution.title}
         src={surfaceUrl(url, surface, contribution.contributionId)}
         sandbox="allow-scripts"
         referrerPolicy="no-referrer"
         onLoad={initializeFrame}
-        onError={() => setBridgeError(t('pluginPage.frameFailed'))}
+        onError={() => {
+          if (handshakeTimer.current !== null) window.clearTimeout(handshakeTimer.current)
+          handshakeTimer.current = null
+          setBridgeError(t('pluginPage.frameFailed'))
+        }}
         className="min-h-[24rem] w-full flex-1 border-0 bg-transparent"
       />
     </div>

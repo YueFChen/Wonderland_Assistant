@@ -16,12 +16,14 @@ dist/
 
 # Generated Tauri files
 apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/binaries/
 
 # Local runtime files
 *.log
 logs/
 tmp/
-docs/
+docs/*
+!docs/CORE-CLI-COMMAND-INVENTORY.md
 # Local Cargo cache
 .cargo-home/
 .DS_Store

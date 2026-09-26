@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use wonderland_plugin_protocol::PluginServiceResolution;
 
 mod failure;
 pub use failure::PluginFailure;
@@ -26,6 +27,7 @@ const PROTOCOL: &str = "wonderland-plugin";
 const VERSION: &str = "1.0.0";
 const MAX_FRAME_BYTES: u64 = 32 * 1024 * 1024;
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(60);
+const PLUGIN_SERVICE_TIMEOUT: Duration = Duration::from_secs(35);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +67,15 @@ impl HostClient {
 
     /// Make a capability-gated Core service request.
     pub fn call_core(&self, method: &str, params: Value) -> Result<Value, PluginError> {
+        self.call_core_with_timeout(method, params, SERVICE_TIMEOUT)
+    }
+
+    fn call_core_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, PluginError> {
         let id = format!("p-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (sender, receiver) = mpsc::sync_channel(1);
         self.pending
@@ -79,7 +90,7 @@ impl HostClient {
                 format!("Cannot send Core service request: {error}"),
             ));
         }
-        match receiver.recv_timeout(SERVICE_TIMEOUT) {
+        match receiver.recv_timeout(timeout) {
             Ok(result) => result,
             Err(_) => {
                 self.pending.lock().ok().and_then(|mut p| p.remove(&id));
@@ -89,6 +100,38 @@ impl HostClient {
                 ))
             }
         }
+    }
+
+    /// Resolve a service declared in this plugin's `manifest.json` requirements.
+    pub fn resolve_service(
+        &self,
+        service_id: &str,
+    ) -> Result<PluginServiceResolution, PluginError> {
+        let value = self.call_core("core.services.resolve", json!({ "serviceId": service_id }))?;
+        serde_json::from_value(value).map_err(|_| {
+            PluginError::new(
+                "INVALID_RESPONSE",
+                "Core returned an invalid service resolution.",
+            )
+        })
+    }
+
+    /// Invoke one method from a service declared in this plugin's `manifest.json` requirements.
+    pub fn invoke_service(
+        &self,
+        service_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, PluginError> {
+        self.call_core_with_timeout(
+            "core.services.invoke",
+            json!({
+                "serviceId": service_id,
+                "method": method,
+                "params": params,
+            }),
+            PLUGIN_SERVICE_TIMEOUT,
+        )
     }
 
     pub fn emit(

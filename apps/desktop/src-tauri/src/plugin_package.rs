@@ -9,7 +9,9 @@ use semver::Version;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use wonderland_plugin_protocol::{PluginManifest, PluginUiContributionKind, UI_BRIDGE_VERSION};
+use wonderland_plugin_protocol::{
+    PluginManifest, PluginUiCommandEffect, PluginUiContributionKind, UI_BRIDGE_VERSION,
+};
 use zip::ZipArchive;
 
 use crate::plugin_schema;
@@ -666,6 +668,18 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
         if min_ui_bridge >= max_ui_bridge {
             return Err("Plugin UI bridge compatibility range is invalid.".to_owned());
         }
+        let command_bridge_version = Version::parse(UI_BRIDGE_VERSION)
+            .expect("the Core UI bridge version is a valid semantic version");
+        if ui
+            .contributions
+            .iter()
+            .any(|contribution| !contribution.commands.is_empty())
+            && min_ui_bridge < command_bridge_version
+        {
+            return Err(format!(
+                "Plugins that declare UI commands must require bridge version {UI_BRIDGE_VERSION} or newer."
+            ));
+        }
         if ui.integrations.len() > 8 {
             return Err("Plugin requests too many UI integrations.".to_owned());
         }
@@ -741,6 +755,57 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
                     "Plugin contribution '{}' has an invalid icon key.",
                     contribution.id
                 ));
+            }
+            if contribution.commands.len() > 64 {
+                return Err(format!(
+                    "Contribution '{}' declares too many UI commands.",
+                    contribution.id
+                ));
+            }
+            let mut command_ids = BTreeSet::new();
+            for command in &contribution.commands {
+                if !valid_method(&command.id) || !command_ids.insert(&command.id) {
+                    return Err(format!(
+                        "UI command ID '{}' is invalid or duplicated in contribution '{}'.",
+                        command.id, contribution.id
+                    ));
+                }
+                if command.title.trim().is_empty() || command.title.chars().count() > 120 {
+                    return Err(format!("UI command '{}' has an invalid title.", command.id));
+                }
+                if command.input_schema.get("type").and_then(Value::as_str) != Some("object") {
+                    return Err(format!(
+                        "UI command '{}' input schema must describe an object.",
+                        command.id
+                    ));
+                }
+                if serde_json::to_vec(&command.input_schema)
+                    .is_ok_and(|schema| schema.len() > 64 * 1024)
+                {
+                    return Err(format!(
+                        "UI command '{}' input schema exceeds 64 KiB.",
+                        command.id
+                    ));
+                }
+                plugin_schema::ensure_supported_in(&command.input_schema, &command.input_schema)
+                    .map_err(|error| {
+                        format!(
+                            "UI command '{}' has an unsupported input schema: {error}",
+                            command.id
+                        )
+                    })?;
+                if matches!(command.effect, PluginUiCommandEffect::Mutating)
+                    && command
+                        .input_schema
+                        .get("readOnly")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                {
+                    return Err(format!(
+                        "Mutating UI command '{}' cannot declare a read-only input schema.",
+                        command.id
+                    ));
+                }
             }
         }
         if activity_count != 1 {
@@ -831,6 +896,21 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
                 requirement.id
             ));
         }
+        if requirement.methods.is_empty() || requirement.methods.len() > 128 {
+            return Err(format!(
+                "Required service '{}' must declare between one and 128 methods.",
+                requirement.id
+            ));
+        }
+        let mut methods = BTreeSet::new();
+        for method in &requirement.methods {
+            if !valid_method(method) || !methods.insert(method) {
+                return Err(format!(
+                    "Required service '{}' has an invalid or duplicate method.",
+                    requirement.id
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -861,9 +941,19 @@ fn validate_provided_service_methods(
         .ok_or_else(|| "Plugin contract must define a methods object.".to_owned())?;
     for service in &manifest.provides {
         for method in &service.methods {
-            if !methods.contains_key(method) {
+            let Some(contract_method) = methods.get(method) else {
                 return Err(format!(
                     "Provided service '{}' references missing contract method '{}'.",
+                    service.id, method
+                ));
+            };
+            if contract_method
+                .get("timeoutMs")
+                .and_then(Value::as_u64)
+                .is_none_or(|timeout| timeout > 30_000)
+            {
+                return Err(format!(
+                    "Provided service '{}' method '{}' exceeds the 30-second service-call limit.",
                     service.id, method
                 ));
             }
@@ -1046,7 +1136,7 @@ fn allowed_capabilities() -> BTreeSet<&'static str> {
         "files.export",
         "files.reveal_own",
         "browser.open_official",
-        "knowledge.local_model",
+        "services.call",
     ]
     .into_iter()
     .collect()
@@ -1145,6 +1235,7 @@ fn validate_hex_hash(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wonderland_plugin_protocol::{PluginUiCommand, PluginUiCommandEffect};
 
     #[test]
     fn path_validation_rejects_windows_and_traversal_paths() {
@@ -1168,6 +1259,76 @@ mod tests {
         assert!(valid_plugin_id("plugin_2"));
         assert!(!valid_plugin_id("Upper"));
         assert!(!valid_plugin_id("../plugin"));
+    }
+
+    #[test]
+    fn comment_archive_provider_and_consumer_contracts_validate() {
+        let cases = [
+            (
+                include_str!("../../../../plugins/comment_collector/package/manifest.json"),
+                include_str!("../../../../plugins/comment_collector/package/contract.json"),
+            ),
+            (
+                include_str!("../../../../plugins/knowledge_library/package/manifest.json"),
+                include_str!("../../../../plugins/knowledge_library/package/contract.json"),
+            ),
+        ];
+
+        for (manifest_json, contract_json) in cases {
+            let manifest: PluginManifest = serde_json::from_str(manifest_json).unwrap();
+            let contract: Value = serde_json::from_str(contract_json).unwrap();
+            validate_manifest(&manifest).unwrap();
+            validate_contract(&contract).unwrap();
+            validate_provided_service_methods(&manifest, &contract).unwrap();
+        }
+    }
+
+    #[test]
+    fn plugin_ui_commands_require_a_supported_schema_and_current_bridge() {
+        let mut manifest: PluginManifest = serde_json::from_str(include_str!(
+            "../../../../plugins/comment_collector/package/manifest.json"
+        ))
+        .unwrap();
+        {
+            let ui = manifest.ui.as_mut().unwrap();
+            ui.bridge_compatibility.min_version = UI_BRIDGE_VERSION.to_owned();
+            ui.contributions[0].commands.push(PluginUiCommand {
+                id: "archive.export".to_owned(),
+                title: "Export archive".to_owned(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"format": {"type": "string", "enum": ["json", "csv"]}},
+                    "required": ["format"],
+                    "additionalProperties": false
+                }),
+                effect: PluginUiCommandEffect::Mutating,
+            });
+        }
+        validate_manifest(&manifest).unwrap();
+
+        manifest
+            .ui
+            .as_mut()
+            .unwrap()
+            .bridge_compatibility
+            .min_version = "1.0.0".to_owned();
+        assert!(
+            validate_manifest(&manifest)
+                .unwrap_err()
+                .contains("must require bridge version")
+        );
+
+        let ui = manifest.ui.as_mut().unwrap();
+        ui.bridge_compatibility.min_version = UI_BRIDGE_VERSION.to_owned();
+        ui.contributions[0].commands[0].input_schema = serde_json::json!({
+            "type": "object",
+            "format": "not-supported"
+        });
+        assert!(
+            validate_manifest(&manifest)
+                .unwrap_err()
+                .contains("unsupported input schema")
+        );
     }
 
     #[test]

@@ -11,6 +11,8 @@ pub enum KernelError {
     Timeout,
     Connection,
     Http(u16),
+    /// A response or local payload exceeded a Core-enforced size limit.
+    ResourceLimit,
     /// 官方接口返回的业务错误码，以及官方附带的可读文案（可能为空）。
     Business {
         code: i64,
@@ -56,6 +58,7 @@ impl KernelError {
             Self::Timeout => "timeout",
             Self::Connection => "connection",
             Self::Http(_) => "http",
+            Self::ResourceLimit => "resource_limit",
             Self::Business { .. } => "business",
             Self::InvalidResponse => "invalid_response",
             Self::InvalidInput => "invalid_input",
@@ -101,6 +104,7 @@ impl fmt::Display for KernelError {
             Self::Timeout => write!(f, "请求超时，请重试"),
             Self::Connection => write!(f, "网络连接失败，请重试"),
             Self::Http(code) => write!(f, "服务返回 HTTP {code}"),
+            Self::ResourceLimit => write!(f, "响应超过 Core 支持的大小限制"),
             Self::Business { code, message } => {
                 if message.is_empty() {
                     write!(f, "官方接口返回业务码 {code}")

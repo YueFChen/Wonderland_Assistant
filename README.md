@@ -4,18 +4,29 @@ Wonderland Assistant Core 是 Windows 桌面应用，为《原神 千星奇域�
 
 ## 功能
 
-- **游戏入口**：从 Windows 注册表查找原神安装位置，也可以手动选择官方启动器或游戏本体。
 - **工作区**：从活动卡片启动插件功能，调整顺序、固定常用入口，并恢复上次打开的工作页。
-- **插件管理**：启用、停用或移除插件，并查看及调整插件申请的宿主能力。
+- **插件管理**：启用、停用或移除插件，并查看及调整插件申请的宿主能力。插件后端以当前 Windows 用户权限运行；Core 的能力授权只约束通过 Core 提供的接口，不是操作系统沙箱。
 - **插件安装**：从在线目录搜索安装，或从本地选择 `.wplug` 插件包。在线安装前会展示能力请求；安装时校验目录记录的 SHA-256 和插件包内容。
+- **用户数据与网络**：可在设置中迁移 Core 数据目录；插件私有数据按插件 ID 管理。Core 发出的请求可使用设置中的代理，插件后端自行联网不受 Core 代理强制约束。
 - **应用更新**：在“设置 → 应用更新”中检查 GitHub Releases。更新包在安装前进行签名验证。
-- **个性化与诊断**：调整主题、背景、启动页、日志级别和用户数据目录。
+- **个性化与诊断**：调整主题、背景、启动页、日志级别和用户数据目录；查看 Core 状态与日志。
+- **命令行入口**：安装包附带版本匹配的 `wla` CLI，可管理插件，也可控制正在运行的桌面窗口和工作区。
 
 ## 安装与使用
 
 从 [GitHub Releases](https://github.com/YueFChen/Wonderland_Assistant/releases) 下载 Windows 安装包并运行。安装完成后可从开始菜单或桌面快捷方式启动。
 
 在工作区中打开“插件管理 → 安装插件”可浏览在线目录，或选择本地插件包。在线目录由维护者审核；插件包由各插件作者发布在自己的 GitHub Releases。目录仓库按插件分别维护登记文件，通过 PR 审核后汇总发布。登记与 Core 发布流程见 [RELEASING.md](RELEASING.md)。
+
+安装包会把匹配当前 Core 版本的 CLI sidecar 放在应用安装目录的 `resources\binaries` 子目录中（Windows x64 文件名为 `wla-x86_64-pc-windows-msvc.exe`）。可在 PowerShell 中通过完整路径调用：
+
+```powershell
+& '<Wonderland Assistant 安装目录>\resources\binaries\wla-x86_64-pc-windows-msvc.exe' core status
+& '<Wonderland Assistant 安装目录>\resources\binaries\wla-x86_64-pc-windows-msvc.exe' plugins list
+& '<Wonderland Assistant 安装目录>\resources\binaries\wla-x86_64-pc-windows-msvc.exe' app open --target settings
+```
+
+默认情况下，成功结果以 JSON 写到 stdout，错误 JSON 写到 stderr；命令退出码为成功 `0`、用法或确认错误 `2`、Core 正忙 `3`、其他运行错误 `1`。面向已打开窗口的命令通过本地 IPC 转发，并等待 UI 确认。命令清单、插件 UI 命令声明与脚本示例见 [`docs/CORE-CLI-COMMAND-INVENTORY.md`](docs/CORE-CLI-COMMAND-INVENTORY.md)。
 
 ## 创建和开发插件
 

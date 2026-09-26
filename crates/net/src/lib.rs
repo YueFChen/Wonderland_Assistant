@@ -1,14 +1,24 @@
 //! 受控 HTTP 网络出口；统一处理超时、错误分类和主机白名单。
 
 use std::fmt;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use wonderland_kernel::KernelError;
 use wonderland_kernel::logging::{debug, warn};
 
+pub mod proxy;
+pub use proxy::{
+    ProxyConfiguration, ProxyCredentials, ProxyEnvironmentVariable, ProxyError, ProxyMode,
+    ProxySettings,
+};
+
 /// 出站请求超时。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Keep Core-mediated plugin responses below the plugin protocol's 32 MiB frame limit after
+/// base64 encoding, while bounding memory use before serialization.
+const MAX_HTTP_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
 const PLUGIN_CATALOG_URL: &str =
     "https://yuefchen.github.io/Wonderland_Plugin_Catalog/catalog/v1/index.json";
 const PLUGIN_CATALOG_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -27,26 +37,20 @@ const ALLOWED_HOSTS: &[&str] = &[
     "act-webstatic.mihoyo.com",
 ];
 
-/// 拒绝白名单之外的主机。
-fn ensure_allowed(url: &str) -> Result<(), KernelError> {
-    let host = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .ok_or(KernelError::InvalidInput)?
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .rsplit('@')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if ALLOWED_HOSTS.contains(&host.as_str()) {
-        Ok(())
+/// Parse and validate once so the host checked here is the same host reqwest will contact.
+fn ensure_allowed(raw: &str) -> Result<reqwest::Url, KernelError> {
+    let url = reqwest::Url::parse(raw).map_err(|_| KernelError::InvalidInput)?;
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.fragment().is_none()
+        && ALLOWED_HOSTS.contains(&host.as_str())
+    {
+        Ok(url)
     } else {
-        warn!(host = %host, "出站主机不在白名单");
+        warn!(host = %host, "出站主机或 URL 不符合白名单策略");
         Err(KernelError::InvalidInput)
     }
 }
@@ -54,18 +58,46 @@ fn ensure_allowed(url: &str) -> Result<(), KernelError> {
 /// 出站 HTTP 客户端。
 #[derive(Clone)]
 pub struct HttpClient {
-    inner: reqwest::Client,
+    cached: Arc<RwLock<Option<(u64, reqwest::Client)>>>,
 }
 
 impl HttpClient {
     pub fn new() -> Result<Self, KernelError> {
-        let inner = reqwest::Client::builder()
+        let client = Self {
+            cached: Arc::new(RwLock::new(None)),
+        };
+        client.inner()?;
+        Ok(client)
+    }
+
+    fn inner(&self) -> Result<reqwest::Client, KernelError> {
+        let snapshot = proxy::current_proxy()
+            .map_err(|_| KernelError::Transport("代理设置暂不可用".to_owned()))?;
+        if let Some((revision, client)) = self
+            .cached
+            .read()
+            .map_err(|_| KernelError::Transport("HTTP 客户端暂不可用".to_owned()))?
+            .as_ref()
+            && *revision == snapshot.revision
+        {
+            return Ok(client.clone());
+        }
+
+        let builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(REQUEST_TIMEOUT)
-            .user_agent(USER_AGENT)
+            .user_agent(USER_AGENT);
+        let client = snapshot
+            .configuration
+            .apply_to(builder)
             .build()
-            .map_err(|error| KernelError::Transport(format!("HTTP 客户端初始化失败：{error}")))?;
-        Ok(Self { inner })
+            .map_err(|_| KernelError::Transport("HTTP 客户端初始化失败".to_owned()))?;
+        *self
+            .cached
+            .write()
+            .map_err(|_| KernelError::Transport("HTTP 客户端暂不可用".to_owned()))? =
+            Some((snapshot.revision, client.clone()));
+        Ok(client)
     }
 
     /// 有限重试只针对只读 GET 的临时失败；不记录 URL、Cookie 或响应体。
@@ -75,19 +107,16 @@ impl HttpClient {
         headers: &[(&str, &str)],
         query: &[(String, String)],
     ) -> Result<Vec<u8>, KernelError> {
-        ensure_allowed(url)?;
+        let url = ensure_allowed(url)?;
+        let inner = self.inner()?;
         for attempt in 0..3 {
-            let mut request = self.inner.get(url).query(query);
+            let mut request = inner.get(url.clone()).query(query);
             for (name, value) in headers {
                 request = request.header(*name, *value);
             }
             let result = async {
                 let response = request.send().await.map_err(classify)?;
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(KernelError::Http(status.as_u16()));
-                }
-                Ok(response.bytes().await.map_err(classify)?.to_vec())
+                read_limited_response(response, MAX_HTTP_RESPONSE_BYTES).await
             }
             .await;
             let retry = matches!(
@@ -121,21 +150,20 @@ impl HttpClient {
         url: &str,
         headers: &[(&str, &str)],
     ) -> Result<T, KernelError> {
-        ensure_allowed(url)?;
-        let mut request = self.inner.get(url);
+        let url = ensure_allowed(url)?;
+        let mut request = self.inner()?.get(url);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
 
         let response = request.send().await.map_err(classify)?;
         let status = response.status();
-        let body = response.text().await.map_err(classify)?;
-
         if !status.is_success() {
             return Err(KernelError::Transport(format!("HTTP 状态码 {status}")));
         }
+        let body = read_limited_body(response, MAX_HTTP_RESPONSE_BYTES).await?;
 
-        serde_json::from_str(&body)
+        serde_json::from_slice(&body)
             .map_err(|error| KernelError::Transport(format!("响应解析失败：{error}")))
     }
 
@@ -148,9 +176,9 @@ impl HttpClient {
         headers: &[(&str, &str)],
         body: &str,
     ) -> Result<Vec<u8>, KernelError> {
-        ensure_allowed(url)?;
+        let url = ensure_allowed(url)?;
         let mut request = self
-            .inner
+            .inner()?
             .post(url)
             .header("content-type", "application/json");
         for (name, value) in headers {
@@ -166,7 +194,7 @@ impl HttpClient {
         if !status.is_success() {
             return Err(KernelError::Http(status.as_u16()));
         }
-        Ok(response.bytes().await.map_err(classify)?.to_vec())
+        read_limited_response(response, MAX_HTTP_RESPONSE_BYTES).await
     }
 }
 
@@ -180,24 +208,36 @@ pub struct PluginCatalogClient {
 
 impl PluginCatalogClient {
     pub fn new() -> Result<Self, KernelError> {
-        let index = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent("WonderlandAssistant/PluginCatalog")
+        let proxy = proxy::current_proxy()
+            .map_err(|_| KernelError::Transport("代理设置暂不可用".to_owned()))?;
+        let index = proxy
+            .configuration
+            .apply_to(
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(REQUEST_TIMEOUT)
+                    .user_agent("WonderlandAssistant/PluginCatalog"),
+            )
             .build()
-            .map_err(|error| KernelError::Transport(format!("HTTP 客户端初始化失败：{error}")))?;
-        let package = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 5 || !is_allowed_release_redirect(attempt.url()) {
-                    attempt.stop()
-                } else {
-                    attempt.follow()
-                }
-            }))
-            .timeout(Duration::from_secs(120))
-            .user_agent("WonderlandAssistant/PluginCatalog")
+            .map_err(|_| KernelError::Transport("HTTP 客户端初始化失败".to_owned()))?;
+        let package = proxy
+            .configuration
+            .apply_to(
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                        if attempt.previous().len() >= 5
+                            || !is_allowed_release_redirect(attempt.url())
+                        {
+                            attempt.stop()
+                        } else {
+                            attempt.follow()
+                        }
+                    }))
+                    .timeout(Duration::from_secs(120))
+                    .user_agent("WonderlandAssistant/PluginCatalog"),
+            )
             .build()
-            .map_err(|error| KernelError::Transport(format!("HTTP 客户端初始化失败：{error}")))?;
+            .map_err(|_| KernelError::Transport("HTTP 客户端初始化失败".to_owned()))?;
         Ok(Self { index, package })
     }
 
@@ -279,25 +319,32 @@ fn is_allowed_release_redirect(url: &reqwest::Url) -> bool {
 }
 
 async fn read_limited_response(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     max_bytes: usize,
 ) -> Result<Vec<u8>, KernelError> {
     let status = response.status();
     if !status.is_success() {
         return Err(KernelError::Http(status.as_u16()));
     }
+    read_limited_body(response, max_bytes).await
+}
+
+async fn read_limited_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, KernelError> {
     if response
         .content_length()
         .is_some_and(|length| length > max_bytes as u64)
     {
-        return Err(KernelError::InvalidInput);
+        return Err(KernelError::ResourceLimit);
     }
     let mut body = Vec::new();
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
                 if body.len().saturating_add(chunk.len()) > max_bytes {
-                    return Err(KernelError::InvalidInput);
+                    return Err(KernelError::ResourceLimit);
                 }
                 body.extend_from_slice(&chunk);
             }
@@ -479,11 +526,17 @@ pub struct ModelClient {
 impl ModelClient {
     pub fn new(endpoint: ModelEndpoint) -> Result<Self, ModelError> {
         let base = validate_endpoint(&endpoint.base_url, endpoint.allow_loopback)?;
-        let inner = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(endpoint.timeout)
+        let proxy = proxy::current_proxy()
+            .map_err(|_| ModelError::Config("代理设置暂不可用".to_owned()))?;
+        let inner = proxy
+            .configuration
+            .apply_to(
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(endpoint.timeout),
+            )
             .build()
-            .map_err(|error| ModelError::Config(format!("HTTP 客户端初始化失败：{error}")))?;
+            .map_err(|_| ModelError::Config("HTTP 客户端初始化失败".to_owned()))?;
         let origin = base.origin().ascii_serialization();
         Ok(Self {
             inner,
@@ -612,6 +665,60 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbound_allowlist_checks_the_canonical_url_authority() {
+        let allowed = ensure_allowed("https://API-TAKUMI.MIHOYO.COM:443/path").unwrap();
+        assert_eq!(allowed.host_str(), Some("api-takumi.mihoyo.com"));
+
+        for raw in [
+            r"https://evil.com\@api-takumi.mihoyo.com/path",
+            "http://api-takumi.mihoyo.com/path",
+            "https://user@api-takumi.mihoyo.com/path",
+            "https://api-takumi.mihoyo.com:8443/path",
+            "https://api-takumi.mihoyo.com/path#fragment",
+        ] {
+            assert!(
+                matches!(ensure_allowed(raw), Err(KernelError::InvalidInput)),
+                "URL should be rejected: {raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn response_body_limit_is_enforced_without_content_length() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_limited_body(response, 5).await,
+            Err(KernelError::ResourceLimit)
+        ));
+        server.join().unwrap();
+    }
+
     fn ok(base_url: &str, allow_loopback: bool) -> String {
         validate_endpoint(base_url, allow_loopback)
             .expect("应当校验通过")

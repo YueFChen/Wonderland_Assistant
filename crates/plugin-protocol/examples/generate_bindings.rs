@@ -14,16 +14,20 @@ fn main() {
         PluginManifest,
         PluginService,
         PluginServiceRequirement,
+        PluginServiceResolution,
         HostCompatibility,
         ProtocolCompatibility,
         PluginPlatform,
         PluginUi,
         PluginUiContribution,
         PluginUiContributionKind,
+        PluginUiCommand,
+        PluginUiCommandEffect,
         PluginBackend,
         InstallationState,
         RuntimeState,
         PluginFailure,
+        PluginInstallSource,
         PluginRuntimeState,
         PluginError,
         HostHello,
@@ -35,6 +39,12 @@ fn main() {
         PluginCancel,
         PluginMessage,
     );
+    output = output
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../packages/plugin-protocol/src/index.ts");
     if std::env::args().any(|arg| arg == "--check") {

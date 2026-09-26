@@ -10,11 +10,29 @@ use wonderland_kernel::{AccountService, AppContext, SettingsService, UserDataSer
 use wonderland_logging::Logging;
 use wonderland_user_data::FsUserDataService;
 
+use crate::network::NetworkProxyService;
+
 /// 加载持久化服务并组装应用上下文。
-pub fn bootstrap(app: &AppHandle) -> Result<(AppContext, Option<Logging>), Box<dyn Error>> {
-    let default_data_dir = app.path().app_data_dir()?;
+pub fn bootstrap(
+    app: &AppHandle,
+) -> Result<(AppContext, Option<Logging>, NetworkProxyService), Box<dyn Error>> {
+    bootstrap_with_data_dir(app, None)
+}
+
+/// Loads Core services from an alternate data root for CLI diagnostics and isolated test runs.
+pub fn bootstrap_with_data_dir(
+    app: &AppHandle,
+    data_dir: Option<PathBuf>,
+) -> Result<(AppContext, Option<Logging>, NetworkProxyService), Box<dyn Error>> {
+    let default_data_dir = match data_dir {
+        Some(data_dir) => data_dir,
+        None => app.path().app_data_dir()?,
+    };
     let (user_data, app_data_dir) = FsUserDataService::bootstrap(default_data_dir)?;
     let documents_dir = app_data_dir.clone();
+
+    // Configure all Core-managed network clients before services construct their clients.
+    let network_proxy = NetworkProxyService::load(&app_data_dir)?;
 
     let settings = FsSettingsService::load(app_data_dir.clone());
     let logging = init_logging(settings.logging(), &app_data_dir);
@@ -39,6 +57,7 @@ pub fn bootstrap(app: &AppHandle) -> Result<(AppContext, Option<Logging>), Box<d
             user_data: Some(user_data),
         },
         logging,
+        network_proxy,
     ))
 }
 
