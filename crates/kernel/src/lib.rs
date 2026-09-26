@@ -4,11 +4,9 @@ pub mod account;
 pub mod context;
 pub mod error;
 pub mod logging;
-pub mod plugin;
 pub mod settings;
 pub mod theme;
 pub mod user_data;
-pub use plugin::{Plugin, PluginManifest, PluginState};
 
 pub use account::{
     Account, AccountService, AccountSnapshot, AccountStatus, GameRole, LoginCancelReason,

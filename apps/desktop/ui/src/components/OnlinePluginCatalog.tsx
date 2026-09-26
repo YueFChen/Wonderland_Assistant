@@ -130,7 +130,7 @@ export function OnlinePluginCatalog({ onInstalled }: {
             const { entry } = item
             const installed = item.installedVersion === entry.version
             return (
-              <li key={`${entry.id}@${entry.version}`} className="flex min-w-0 flex-col justify-between rounded-xl border border-glass-line bg-glass-subtle p-3">
+              <li key={`${entry.id}@${entry.version}`} className="flex min-h-44 min-w-0 flex-col justify-between rounded-xl border border-glass-line bg-glass-subtle p-3">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <h3 className="min-w-0 break-words text-xs font-semibold text-ink">{entry.name}</h3>

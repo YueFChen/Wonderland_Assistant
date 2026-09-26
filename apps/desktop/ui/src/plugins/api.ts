@@ -55,7 +55,7 @@ export const pluginApi = {
       request: { pluginId, version, expectedSha256, approvedCapabilities, approvedSourceChange },
     }),
   install: () => invoke<PluginRuntimeState[]>('plugins_install'),
-  remove: (pluginId: string, removePluginData = false) =>
+  uninstall: (pluginId: string, removePluginData = false) =>
     invoke<PluginRuntimeState[]>('plugins_remove', { pluginId, removePluginData }),
   setEnabled: (pluginId: string, enabled: boolean) =>
     invoke<PluginRuntimeState[]>('plugins_set_enabled', { pluginId, enabled }),

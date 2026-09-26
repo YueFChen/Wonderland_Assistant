@@ -35,6 +35,7 @@ impl FsAccountService {
     pub fn load(app_data_dir: PathBuf) -> Result<Self, KernelError> {
         let store = CredentialStore::new(&app_data_dir);
         let accounts = store.load_accounts();
+        store.recover_pending_removals(&accounts);
         let current = store
             .current()
             .filter(|key| accounts.iter().any(|account| &account.account_key == key))
@@ -140,7 +141,8 @@ impl AccountService for FsAccountService {
     }
 
     fn submit_login(&self, cookies: Vec<StoredCookie>) -> Result<LoginOutcome, KernelError> {
-        if !self.lock().status.is_logging_in() {
+        let mut state = self.lock();
+        if !state.status.is_logging_in() {
             return Err(KernelError::NoLoginInProgress);
         }
 
@@ -152,9 +154,8 @@ impl AccountService for FsAccountService {
             .save_credentials(&credentials.account_key, &cookies)?;
 
         let now = unix_now();
-        let mut state = self.lock();
-        match state
-            .accounts
+        let mut accounts = state.accounts.clone();
+        match accounts
             .iter_mut()
             .find(|account| account.account_key == credentials.account_key)
         {
@@ -162,7 +163,7 @@ impl AccountService for FsAccountService {
                 account.mid = credentials.mid.clone().or_else(|| account.mid.clone());
                 account.updated_at = now;
             }
-            None => state.accounts.push(Account {
+            None => accounts.push(Account {
                 account_key: credentials.account_key.clone(),
                 mid: credentials.mid.clone(),
                 game_roles: Vec::new(),
@@ -173,11 +174,11 @@ impl AccountService for FsAccountService {
                 updated_at: now,
             }),
         }
-        state.current = Some(credentials.account_key.clone());
+        let current = Some(credentials.account_key.as_str());
+        self.store.save_account_state(&accounts, current)?;
+        state.accounts = accounts;
+        state.current = current.map(str::to_owned);
         state.status = AccountStatus::LoggedIn;
-
-        self.store.save_accounts(&state.accounts)?;
-        self.store.set_current(state.current.as_deref())?;
 
         Ok(LoginOutcome::Completed {
             account_key: credentials.account_key,
@@ -212,8 +213,8 @@ impl AccountService for FsAccountService {
             };
 
             let mut state = self.lock();
-            let account = state
-                .accounts
+            let mut accounts = state.accounts.clone();
+            let account = accounts
                 .iter_mut()
                 .find(|account| account.account_key == account_key)
                 .ok_or_else(|| KernelError::AccountNotFound(account_key.to_owned()))?;
@@ -228,7 +229,9 @@ impl AccountService for FsAccountService {
             }
             account.updated_at = unix_now();
             let updated = account.clone();
-            self.store.save_accounts(&state.accounts)?;
+            self.store
+                .save_account_state(&accounts, state.current.as_deref())?;
+            state.accounts = accounts;
             Ok(updated)
         })
     }
@@ -254,22 +257,22 @@ impl AccountService for FsAccountService {
             .position(|account| account.account_key == account_key)
             .ok_or_else(|| KernelError::AccountNotFound(account_key.to_owned()))?;
 
-        self.store.delete_credentials(account_key)?;
-        state.accounts.remove(index);
-        if state.current.as_deref() == Some(account_key) {
-            state.current = state
-                .accounts
-                .first()
-                .map(|account| account.account_key.clone());
-        }
+        let mut accounts = state.accounts.clone();
+        accounts.remove(index);
+        let current = if state.current.as_deref() == Some(account_key) {
+            accounts.first().map(|account| account.account_key.clone())
+        } else {
+            state.current.clone()
+        };
+        self.store
+            .remove_account_state(account_key, &accounts, current.as_deref())?;
+        state.accounts = accounts;
+        state.current = current;
         state.status = if state.current.is_some() {
             AccountStatus::LoggedIn
         } else {
             AccountStatus::LoggedOut
         };
-
-        self.store.save_accounts(&state.accounts)?;
-        self.store.set_current(state.current.as_deref())?;
         Ok(())
     }
 
@@ -282,9 +285,11 @@ impl AccountService for FsAccountService {
         {
             return Err(KernelError::AccountNotFound(account_key.to_owned()));
         }
+        self.store
+            .save_account_state(&state.accounts, Some(account_key))?;
         state.current = Some(account_key.to_owned());
         state.status = AccountStatus::LoggedIn;
-        self.store.set_current(state.current.as_deref())
+        Ok(())
     }
 }
 

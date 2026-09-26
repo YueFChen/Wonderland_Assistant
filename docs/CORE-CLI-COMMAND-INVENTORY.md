@@ -19,7 +19,7 @@
 | `... plugins ui-check <插件 ID> [资源路径]` | 启动目标插件并检查 UI 资源、MIME、CSP、`nosniff` | 诊断命令 |
 | `... plugins install <本地包路径> --yes [--grant <能力>]... [--overwrite] [--approve-source-change]` | 安装本地插件；Debug 可安装目录，Release 要求 `.wplug` 包；能力需逐项列明 | 管理变更转发到当前 Core |
 | `... plugins enable|disable <插件 ID> --yes` | 启用或停用插件 | 管理变更转发到当前 Core |
-| `... plugins remove <插件 ID> --yes [--remove-data]` | 移除插件，可显式删除其数据 | 管理变更转发到当前 Core |
+| `... plugins uninstall <插件 ID> --yes [--remove-data]` | 卸载插件；默认保留数据，指定 `--remove-data` 才删除 | 管理变更转发到当前 Core；`remove` 仍作为兼容别名 |
 | `... plugins permissions list <插件 ID>` | 查看插件声明能力及当前授权 | 读同一 Core 状态 |
 | `... plugins permissions set <插件 ID> --grant <能力>... --yes` | 替换授权集合；未列出的授权撤销 | 管理变更转发到当前 Core |
 | `... plugins test-backend-exit <插件 ID> --yes` | Debug 构建专用后端故障注入 | Debug 专用，不出现在 Release 帮助中 |

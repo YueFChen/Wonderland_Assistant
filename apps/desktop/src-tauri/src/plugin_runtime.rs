@@ -34,6 +34,8 @@ const MAX_PICKED_FILE_CHUNK_BYTES: u64 = 1024 * 1024;
 const MAX_PICKED_FILE_INLINE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_EXPORTED_FILE_BYTES: usize = 20 * 1024 * 1024;
 const FILE_HANDLE_TTL: Duration = Duration::from_secs(5 * 60);
+const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub(crate) struct PluginProcess {
     child: Mutex<Child>,
@@ -293,25 +295,13 @@ impl PluginProcess {
             .child
             .lock()
             .map_err(|_| internal_error("Plugin process handle is unavailable."))?;
-        if child
-            .try_wait()
-            .map_err(|error| internal_error(&format!("Cannot inspect plugin process: {error}")))?
-            .is_none()
-            && let Err(error) = child.kill()
-            && child
-                .try_wait()
-                .map_err(|wait_error| {
-                    internal_error(&format!("Cannot inspect plugin process: {wait_error}"))
-                })?
-                .is_none()
-        {
-            return Err(internal_error(&format!(
-                "Cannot stop plugin process before removing its data: {error}"
-            )));
+        if let Err(error) = stop_child(&mut child) {
+            self.fail_pending(plugin_error(
+                "PLUGIN_STOPPED",
+                "Plugin shutdown was requested by Core.",
+            ));
+            return Err(error);
         }
-        child.wait().map_err(|error| {
-            internal_error(&format!("Cannot collect plugin process exit: {error}"))
-        })?;
         self.fail_pending(plugin_error(
             "PLUGIN_STOPPED",
             "Plugin was stopped before its files were removed.",
@@ -321,23 +311,7 @@ impl PluginProcess {
 
     #[cfg(debug_assertions)]
     pub(crate) fn terminate_for_test(&self) -> Result<(), PluginError> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| internal_error("Plugin process handle is unavailable."))?;
-        if child
-            .try_wait()
-            .map_err(|error| internal_error(&format!("Cannot inspect plugin process: {error}")))?
-            .is_none()
-        {
-            child
-                .kill()
-                .map_err(|error| internal_error(&format!("Cannot stop plugin process: {error}")))?;
-        }
-        child.wait().map_err(|error| {
-            internal_error(&format!("Cannot collect plugin process exit: {error}"))
-        })?;
-        Ok(())
+        self.stop()
     }
 
     fn write_frame(&self, frame: &Value) -> Result<(), PluginError> {
@@ -387,17 +361,97 @@ impl PluginProcess {
     }
 }
 
+fn stop_child(child: &mut Child) -> Result<(), PluginError> {
+    if child
+        .try_wait()
+        .map_err(|error| internal_error(&format!("Cannot inspect plugin process: {error}")))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    if let Err(kill_error) = child.kill()
+        && child
+            .try_wait()
+            .map_err(|error| internal_error(&format!("Cannot inspect plugin process: {error}")))?
+            .is_none()
+    {
+        return Err(internal_error(&format!(
+            "Cannot stop plugin process: {kill_error}"
+        )));
+    }
+
+    let deadline = Instant::now() + PROCESS_STOP_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| internal_error(&format!("Cannot inspect plugin process: {error}")))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(internal_error(&format!(
+                "Plugin process did not exit within {} seconds.",
+                PROCESS_STOP_TIMEOUT.as_secs()
+            )));
+        }
+        thread::sleep(PROCESS_STOP_POLL_INTERVAL);
+    }
+}
+
 impl Drop for PluginProcess {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
         if let Ok(child) = self.child.get_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            // Drop can run while a caller holds the plugin state lock. Never block there
+            // waiting for process exit; `Child` closes its handle after this best-effort kill.
+            if child.try_wait().is_ok_and(|status| status.is_none()) {
+                let _ = child.kill();
+            }
         }
         self.fail_pending(plugin_error(
             "PLUGIN_CRASHED",
             "Plugin process was stopped by Core.",
         ));
+    }
+}
+
+#[cfg(test)]
+mod process_stop_tests {
+    use super::*;
+
+    #[test]
+    fn stopping_a_running_child_is_bounded_and_collects_its_exit() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 30"]);
+            command
+        };
+
+        let mut child = command.spawn().expect("long-running test process starts");
+        let started = Instant::now();
+        stop_child(&mut child).expect("Core can stop the child process");
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            child
+                .try_wait()
+                .expect("child status is readable")
+                .is_some()
+        );
     }
 }
 

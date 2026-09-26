@@ -111,6 +111,7 @@ struct PluginRecord {
     contract: Value,
     contract_sha256: String,
     process: Option<Arc<PluginProcess>>,
+    revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,7 +346,11 @@ impl PluginManager {
                                 .into_owned(),
                         ),
                     };
-                    let process = old.get(&id).and_then(|record| {
+                    let previous_record = old.get(&id);
+                    let revision = previous_record
+                        .map(|record| record.revision.wrapping_add(1))
+                        .unwrap_or_default();
+                    let process = previous_record.and_then(|record| {
                         (record.directory == plugin.directory
                             && record
                                 .process
@@ -365,6 +370,7 @@ impl PluginManager {
                             contract: plugin.contract,
                             contract_sha256: plugin.contract_sha256,
                             process,
+                            revision,
                         },
                     );
                 }
@@ -379,6 +385,7 @@ impl PluginManager {
                             contract: Value::Null,
                             contract_sha256: String::new(),
                             process: None,
+                            revision: 0,
                         },
                     );
                 }
@@ -399,6 +406,7 @@ impl PluginManager {
         let Ok(mut state) = self.inner.state.lock() else {
             return Vec::new();
         };
+        let mut retired_processes = Vec::new();
         for record in state.plugins.values_mut() {
             if record.snapshot.runtime == RuntimeState::Running
                 && !record
@@ -411,14 +419,19 @@ impl PluginManager {
                     "PLUGIN_CRASHED",
                     "Plugin process exited unexpectedly.",
                 ));
-                record.process = None;
+                if let Some(process) = record.process.take() {
+                    retired_processes.push(process);
+                }
             }
         }
-        state
+        let snapshots = state
             .plugins
             .values()
             .map(|record| record.snapshot.clone())
-            .collect()
+            .collect();
+        drop(state);
+        drop(retired_processes);
+        snapshots
     }
 
     /// Installs a local package directory passed by a development launch script.
@@ -609,6 +622,16 @@ impl PluginManager {
                 .state
                 .lock()
                 .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?;
+            if state
+                .plugins
+                .get(&source_manifest.id)
+                .is_some_and(|record| record.snapshot.runtime == RuntimeState::Starting)
+            {
+                return Err(plugin_error(
+                    "PLUGIN_BUSY",
+                    "Wait for the plugin to finish starting before replacing its package.",
+                ));
+            }
             let preferences = &state.preferences;
             (
                 preferences
@@ -766,20 +789,53 @@ impl PluginManager {
     }
 
     fn stop_for_reinstall(&self, plugin_id: &str) -> Result<bool, PluginError> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?;
-        let record = state
-            .plugins
-            .get_mut(plugin_id)
-            .ok_or_else(|| not_installed(plugin_id))?;
-        let was_running = record.process.is_some();
-        if was_running {
-            record.snapshot.runtime = RuntimeState::Stopping;
-            record.process = None;
-            record.snapshot.runtime = RuntimeState::Stopped;
+        let process = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?;
+            let record = state
+                .plugins
+                .get_mut(plugin_id)
+                .ok_or_else(|| not_installed(plugin_id))?;
+            if matches!(
+                record.snapshot.runtime,
+                RuntimeState::Starting | RuntimeState::Stopping
+            ) {
+                return Err(plugin_error(
+                    "PLUGIN_BUSY",
+                    "Wait for the plugin to finish starting or stopping before replacing it.",
+                ));
+            }
+            let was_running = record
+                .process
+                .as_ref()
+                .is_some_and(|process| process.is_alive());
+            if record.process.is_some() {
+                record.snapshot.runtime = RuntimeState::Stopping;
+            }
+            (record.process.take(), was_running)
+        };
+        let (process, was_running) = process;
+        if let Some(process) = process {
+            if let Err(error) = process.stop() {
+                if let Ok(mut state) = self.inner.state.lock()
+                    && let Some(record) = state.plugins.get_mut(plugin_id)
+                {
+                    record.process = Some(process);
+                    record.snapshot.runtime = RuntimeState::Failed;
+                    record.snapshot.last_error = Some(failure(&error.code, &error.message));
+                }
+                return Err(error);
+            }
+            if let Ok(mut state) = self.inner.state.lock()
+                && let Some(record) = state.plugins.get_mut(plugin_id)
+            {
+                record.snapshot.runtime = RuntimeState::Stopped;
+                record.snapshot.last_error = None;
+            }
+            drop(process);
         }
         Ok(was_running)
     }
@@ -789,7 +845,7 @@ impl PluginManager {
         plugin_id: &str,
         enabled: bool,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
-        {
+        let process = {
             let mut state = self
                 .inner
                 .state
@@ -799,10 +855,13 @@ impl PluginManager {
                 .plugins
                 .get(plugin_id)
                 .ok_or_else(|| not_installed(plugin_id))?;
-            if record.snapshot.runtime == RuntimeState::Stopping {
+            if matches!(
+                record.snapshot.runtime,
+                RuntimeState::Starting | RuntimeState::Stopping
+            ) {
                 return Err(plugin_error(
                     "PLUGIN_BUSY",
-                    "Plugin is stopping and cannot change state yet.",
+                    "Wait for the plugin to finish starting or stopping before changing its state.",
                 ));
             }
             if record.snapshot.installation == InstallationState::Incompatible {
@@ -817,26 +876,54 @@ impl PluginManager {
                     "Invalid plugin packages cannot be enabled.",
                 ));
             }
-            state
-                .preferences
+            let mut next_preferences = state.preferences.clone();
+            next_preferences
                 .enabled_plugins
                 .insert(plugin_id.to_owned(), enabled);
-            persist_preferences(&self.inner.app_data_dir, &state.preferences).map_err(|error| {
+            persist_preferences(&self.inner.app_data_dir, &next_preferences).map_err(|error| {
                 plugin_error("INTERNAL", &format!("Cannot save plugin state: {error}"))
             })?;
+            state.preferences = next_preferences;
             state.config_error = None;
             let record = state
                 .plugins
                 .get_mut(plugin_id)
                 .expect("record checked above");
             record.snapshot.enabled = enabled;
-            if !enabled {
+            let process = if !enabled {
                 record.snapshot.runtime = RuntimeState::Stopping;
-                record.process = None;
+                record.process.take()
+            } else {
+                None
+            };
+            update_service_dependency_issues(&mut state.plugins);
+            process
+        };
+        if let Some(process) = process {
+            if let Err(error) = process.stop() {
+                if let Ok(mut state) = self.inner.state.lock()
+                    && let Some(record) = state.plugins.get_mut(plugin_id)
+                {
+                    record.process = Some(process);
+                    record.snapshot.runtime = RuntimeState::Failed;
+                    record.snapshot.last_error = Some(failure(&error.code, &error.message));
+                }
+                return Err(error);
+            }
+            if let Ok(mut state) = self.inner.state.lock()
+                && let Some(record) = state.plugins.get_mut(plugin_id)
+            {
                 record.snapshot.runtime = RuntimeState::Stopped;
                 record.snapshot.last_error = None;
             }
-            update_service_dependency_issues(&mut state.plugins);
+            drop(process);
+        } else if !enabled {
+            if let Ok(mut state) = self.inner.state.lock()
+                && let Some(record) = state.plugins.get_mut(plugin_id)
+            {
+                record.snapshot.runtime = RuntimeState::Stopped;
+                record.snapshot.last_error = None;
+            }
         }
         if enabled {
             let can_start = self
@@ -866,7 +953,7 @@ impl PluginManager {
                 "Duplicate capability grant.",
             ));
         }
-        {
+        let process = {
             let mut state = self
                 .inner
                 .state
@@ -876,10 +963,13 @@ impl PluginManager {
                 .plugins
                 .get(plugin_id)
                 .ok_or_else(|| not_installed(plugin_id))?;
-            if record.snapshot.runtime == RuntimeState::Stopping {
+            if matches!(
+                record.snapshot.runtime,
+                RuntimeState::Starting | RuntimeState::Stopping
+            ) {
                 return Err(plugin_error(
                     "PLUGIN_BUSY",
-                    "Plugin is stopping and cannot change capabilities yet.",
+                    "Wait for the plugin to finish starting or stopping before changing capabilities.",
                 ));
             }
             let grant_key = capability_grant_key(plugin_id);
@@ -898,26 +988,47 @@ impl PluginManager {
                     "A capability was not requested by this plugin.",
                 ));
             }
-            state
-                .preferences
+            let mut next_preferences = state.preferences.clone();
+            next_preferences
                 .granted_capabilities
                 .insert(grant_key, capabilities.clone());
-            persist_preferences(&self.inner.app_data_dir, &state.preferences).map_err(|error| {
+            persist_preferences(&self.inner.app_data_dir, &next_preferences).map_err(|error| {
                 plugin_error(
                     "INTERNAL",
                     &format!("Cannot save capability grants: {error}"),
                 )
             })?;
+            state.preferences = next_preferences;
             state.config_error = None;
             let record = state
                 .plugins
                 .get_mut(plugin_id)
                 .expect("record checked above");
             record.snapshot.granted_capabilities = capabilities;
-            if record.process.take().is_some() {
+            let process = record.process.take();
+            if process.is_some() {
                 record.snapshot.runtime = RuntimeState::Stopping;
-                record.snapshot.runtime = RuntimeState::Stopped;
             }
+            process
+        };
+        if let Some(process) = process {
+            if let Err(error) = process.stop() {
+                if let Ok(mut state) = self.inner.state.lock()
+                    && let Some(record) = state.plugins.get_mut(plugin_id)
+                {
+                    record.process = Some(process);
+                    record.snapshot.runtime = RuntimeState::Failed;
+                    record.snapshot.last_error = Some(failure(&error.code, &error.message));
+                }
+                return Err(error);
+            }
+            if let Ok(mut state) = self.inner.state.lock()
+                && let Some(record) = state.plugins.get_mut(plugin_id)
+            {
+                record.snapshot.runtime = RuntimeState::Stopped;
+                record.snapshot.last_error = None;
+            }
+            drop(process);
         }
         let enabled = self.snapshots().iter().any(|snapshot| {
             snapshot.manifest.id == plugin_id
@@ -930,7 +1041,7 @@ impl PluginManager {
         Ok(self.snapshots())
     }
 
-    fn remove(
+    fn uninstall(
         &self,
         plugin_id: &str,
         remove_plugin_data: bool,
@@ -954,7 +1065,6 @@ impl PluginManager {
                 ));
             }
             let previous_preferences = state.preferences.clone();
-            clear_plugin_preferences(&mut state.preferences, plugin_id);
             state
                 .preferences
                 .enabled_plugins
@@ -982,43 +1092,61 @@ impl PluginManager {
             process
         };
 
-        if let Some(process) = process
-            && let Err(error) = process.stop()
-        {
+        if let Some(process) = process {
+            if let Err(error) = process.stop() {
+                if let Ok(mut state) = self.inner.state.lock()
+                    && let Some(record) = state.plugins.get_mut(plugin_id)
+                {
+                    record.process = Some(process);
+                    record.snapshot.runtime = RuntimeState::Failed;
+                    record.snapshot.last_error = Some(failure(&error.code, &error.message));
+                }
+                return Err(plugin_error(
+                    &error.code,
+                    &format!(
+                        "Uninstall was cancelled because the plugin process could not be stopped. Its package and local data were left untouched. {}",
+                        error.message
+                    ),
+                ));
+            }
+            drop(process);
+        }
+
+        // Remove the package first. If it fails, keep the plugin's private data untouched.
+        let install_directory = self.inner.installed_root.join(plugin_id);
+        let package_removal = (|| {
+            if install_directory.exists() {
+                reject_symlink(&install_directory)?;
+                fs::remove_dir_all(&install_directory).map_err(|error| {
+                    plugin_error(
+                        "INTERNAL",
+                        &format!(
+                            "Cannot remove plugin files at {}: {error}",
+                            install_directory.display()
+                        ),
+                    )
+                })
+            } else {
+                Ok(())
+            }
+        })();
+        if let Err(error) = package_removal {
             if let Ok(mut state) = self.inner.state.lock()
                 && let Some(record) = state.plugins.get_mut(plugin_id)
             {
-                record.snapshot.runtime = RuntimeState::Failed;
+                record.snapshot.runtime = RuntimeState::Stopped;
                 record.snapshot.last_error = Some(failure(&error.code, &error.message));
             }
             return Err(error);
         }
 
-        if let Ok(mut state) = self.inner.state.lock()
-            && let Some(record) = state.plugins.get_mut(plugin_id)
-        {
-            record.snapshot.runtime = RuntimeState::Stopped;
-            record.snapshot.last_error = None;
-        }
-
-        if remove_plugin_data {
+        // Once the package is gone, finalize its removal even if an optional data cleanup fails.
+        let data_removal = if remove_plugin_data {
             let data_directory = self.inner.app_data_dir.join("plugin-data").join(plugin_id);
-            apply_plugin_data_removal(&data_directory, true)?;
-        }
-
-        let install_directory = self.inner.installed_root.join(plugin_id);
-        if install_directory.exists() {
-            reject_symlink(&install_directory)?;
-            fs::remove_dir_all(&install_directory).map_err(|error| {
-                plugin_error(
-                    "INTERNAL",
-                    &format!(
-                        "Cannot remove plugin files at {}: {error}",
-                        install_directory.display()
-                    ),
-                )
-            })?;
-        }
+            apply_plugin_data_removal(&data_directory, true)
+        } else {
+            Ok(())
+        };
 
         let mut state = self
             .inner
@@ -1034,10 +1162,14 @@ impl PluginManager {
             // later package with the same ID. Keep it if final preference cleanup fails.
             state.preferences = removal_preferences;
             state.config_error = Some(format!("Plugin removal preferences need cleanup: {error}"));
-            warn!(plugin_id = %plugin_id, reason = %error, "插件已移除，但授权记录的最终清理未完成");
+            warn!(plugin_id = %plugin_id, reason = %error, "插件已卸载，但授权记录的最终清理未完成");
         } else {
             state.config_error = None;
         }
+        // `snapshots()` takes the same mutex; release this guard first to avoid
+        // deadlocking after the package has already been removed.
+        drop(state);
+        data_removal?;
         Ok(self.snapshots())
     }
 
@@ -1493,7 +1625,7 @@ impl PluginManager {
 
 impl PluginManagerInner {
     fn start_one(&self, plugin_id: &str) -> Result<(), PluginError> {
-        let (snapshot, directory, contract, contract_sha256) = {
+        let (snapshot, directory, contract, contract_sha256, previous_process, start_revision) = {
             let mut state = self
                 .state
                 .lock()
@@ -1507,6 +1639,9 @@ impl PluginManagerInner {
                     "PLUGIN_BUSY",
                     "Plugin is stopping and cannot be started yet.",
                 ));
+            }
+            if record.snapshot.runtime == RuntimeState::Starting {
+                return Err(plugin_error("PLUGIN_BUSY", "Plugin is already starting."));
             }
             if !record.snapshot.enabled
                 || record.snapshot.installation != InstallationState::Installed
@@ -1531,13 +1666,31 @@ impl PluginManagerInner {
             }
             record.snapshot.runtime = RuntimeState::Starting;
             record.snapshot.last_error = None;
+            record.revision = record.revision.wrapping_add(1);
+            let start_revision = record.revision;
+            let previous_process = record.process.take();
             (
                 record.snapshot.clone(),
                 record.directory.clone(),
                 record.contract.clone(),
                 record.contract_sha256.clone(),
+                previous_process,
+                start_revision,
             )
         };
+        if let Some(process) = previous_process {
+            if let Err(error) = process.stop() {
+                if let Ok(mut state) = self.state.lock()
+                    && let Some(record) = state.plugins.get_mut(plugin_id)
+                {
+                    record.process = Some(process);
+                    record.snapshot.runtime = RuntimeState::Failed;
+                    record.snapshot.last_error = Some(failure(&error.code, &error.message));
+                }
+                return Err(error);
+            }
+            drop(process);
+        }
         let process = (|| {
             let executable = directory.join(&snapshot.manifest.backend.entry);
             let canonical_directory = directory.canonicalize().map_err(|error| {
@@ -1574,10 +1727,28 @@ impl PluginManagerInner {
             .state
             .lock()
             .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?;
-        let record = state
-            .plugins
-            .get_mut(plugin_id)
-            .ok_or_else(|| not_installed(plugin_id))?;
+        let Some(record) = state.plugins.get_mut(plugin_id) else {
+            drop(state);
+            if let Ok(process) = process {
+                let _ = process.stop();
+            }
+            return Err(not_installed(plugin_id));
+        };
+        if record.revision != start_revision
+            || record.snapshot.runtime != RuntimeState::Starting
+            || !record.snapshot.enabled
+            || record.directory != directory
+            || record.contract_sha256 != contract_sha256
+        {
+            drop(state);
+            if let Ok(process) = process {
+                let _ = process.stop();
+            }
+            return Err(plugin_error(
+                "PLUGIN_BUSY",
+                "Plugin state changed while the backend was starting; the stale process was stopped.",
+            ));
+        }
         match process {
             Ok(process) => {
                 record.snapshot.runtime = RuntimeState::Running;
@@ -1780,18 +1951,18 @@ pub fn run_cli_command(
             let states = manager.inject_backend_exit_for_test(&words[2])?;
             Ok(json!({ "plugins": states }))
         }
-        "remove" if words.len() >= 3 => {
+        "uninstall" | "remove" if words.len() >= 3 => {
             require_cli_confirmation(&args[3..])?;
             let remove_data = args[3..].iter().any(|argument| argument == "--remove-data");
             for argument in &args[3..] {
                 if argument != "--yes" && argument != "--remove-data" {
                     return Err(plugin_error(
                         "INVALID_REQUEST",
-                        &format!("Unknown remove option '{}'.", argument.to_string_lossy()),
+                        &format!("Unknown uninstall option '{}'.", argument.to_string_lossy()),
                     ));
                 }
             }
-            let states = manager.remove(&words[2], remove_data)?;
+            let states = manager.uninstall(&words[2], remove_data)?;
             Ok(json!({ "ok": true, "plugins": states }))
         }
         _ => Err(plugin_error(
@@ -2732,9 +2903,9 @@ pub async fn plugins_remove(
 ) -> Result<Vec<PluginRuntimeState>, PluginError> {
     ensure_main(&window)?;
     let manager = manager.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || manager.remove(&plugin_id, remove_plugin_data))
+    tauri::async_runtime::spawn_blocking(move || manager.uninstall(&plugin_id, remove_plugin_data))
         .await
-        .map_err(|error| plugin_error("INTERNAL", &format!("Plugin removal failed: {error}")))?
+        .map_err(|error| plugin_error("INTERNAL", &format!("Plugin uninstall failed: {error}")))?
 }
 
 #[tauri::command]

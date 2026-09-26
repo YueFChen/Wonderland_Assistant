@@ -281,7 +281,7 @@ export function WorkspacePage() {
             <p className="text-sm text-ink-muted">{t('workspace.emptyEnabled')}</p>
           </div>
         ) : (
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+          <div className="grid gap-2.5 md:grid-cols-2 2xl:grid-cols-3">
             {previewActivities.map((item) => {
               const Icon = pluginIcon(item.icon)
               const pinnedItem = layout.pinnedIds.includes(item.id)
@@ -293,7 +293,7 @@ export function WorkspacePage() {
                   data-activity-id={item.id}
                   data-drop-target={dropTargetId === item.id ? 'true' : undefined}
                   style={isDragging && dragPreview ? { height: dragPreview.height } : undefined}
-                  className={`activity-card glass-card flex min-h-44 flex-col rounded-xl p-4 transition ${
+                  className={`activity-card glass-card flex min-h-44 flex-col rounded-xl p-3 transition ${
                     isDragging ? 'activity-card-dragging' : ''
                   }`}
                 >
@@ -351,7 +351,7 @@ export function WorkspacePage() {
         )}
       </section>
       {dragPreview && dragPreviewActivity && DragPreviewIcon && (
-        <div ref={dragPreviewRef} className="activity-drag-preview glass-card flex min-h-44 flex-col rounded-xl p-4" aria-hidden="true">
+        <div ref={dragPreviewRef} className="activity-drag-preview glass-card flex min-h-44 flex-col rounded-xl p-3" aria-hidden="true">
           <div className="flex items-start justify-between gap-3">
             <div className="flex min-w-0 items-start gap-3">
               <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-brand-600/15 text-brand-400">

@@ -249,7 +249,7 @@ fn cli_help_text() -> String {
            plugins install <path> --yes [--grant <capability>]... [--overwrite] [--approve-source-change]\n\
            plugins enable <plugin-id> --yes\n\
            plugins disable <plugin-id> --yes\n\
-           plugins remove <plugin-id> --yes [--remove-data]\n",
+           plugins uninstall <plugin-id> --yes [--remove-data]\n",
     );
     #[cfg(debug_assertions)]
     help.push_str("plugins test-backend-exit <plugin-id> --yes (debug builds only)\n");

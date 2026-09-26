@@ -45,15 +45,29 @@ type PluginUiMessage = {
 export function PluginPage() {
   const { pluginId = '', contributionId = '' } = useParams()
   const navigate = useNavigate()
-  const { states, error } = usePlugins()
+  const { states, error, setStates } = usePlugins()
   const { layout, update } = useWorkspaceLayout()
   const { resolved } = useTheme()
+  const [enablingPluginId, setEnablingPluginId] = useState<string | null>(null)
+  const [enableFailure, setEnableFailure] = useState('')
   const registry = useMemo(() => buildContributionRegistry(states), [states])
   const activityIds = useMemo(() => new Set(registry.filter((item) => item.kind === 'activity').map((item) => item.id)), [registry])
   const tabButtons = useRef(new Map<string, HTMLButtonElement>())
   const closingRouteTabId = useRef<string | null>(null)
   const activeId = `${pluginId}/${contributionId}`
   const activeContribution = findContribution(registry, activeId)
+
+  const enablePlugin = useCallback(async (targetPluginId: string) => {
+    setEnablingPluginId(targetPluginId)
+    setEnableFailure('')
+    try {
+      setStates(await pluginApi.setEnabled(targetPluginId, true))
+    } catch (cause) {
+      setEnableFailure(errorText(cause))
+    } finally {
+      setEnablingPluginId(null)
+    }
+  }, [setStates])
 
   useEffect(() => {
     if (closingRouteTabId.current && closingRouteTabId.current !== activeId) {
@@ -212,7 +226,12 @@ export function PluginPage() {
   if (activeContribution.kind !== 'activity') {
     return activeContribution.status === 'ready'
       ? null
-      : <ContributionUnavailable contribution={activeContribution} />
+      : <ContributionUnavailable
+        contribution={activeContribution}
+        onEnable={() => void enablePlugin(activeContribution.pluginId)}
+        enabling={enablingPluginId === activeContribution.pluginId}
+        enableFailure={enableFailure}
+      />
   }
 
   return (
@@ -244,7 +263,13 @@ export function PluginPage() {
       <div className="relative min-h-0 flex-1">
         {openTabs.map((item) => (
           item.status !== 'ready'
-            ? item.id === activeId && <ContributionUnavailable key={item.id} contribution={item} />
+            ? item.id === activeId && <ContributionUnavailable
+              key={item.id}
+              contribution={item}
+              onEnable={() => void enablePlugin(item.pluginId)}
+              enabling={enablingPluginId === item.pluginId}
+              enableFailure={enableFailure}
+            />
             : <PluginSurface
               key={item.id}
               contribution={item}
@@ -259,7 +284,12 @@ export function PluginPage() {
   )
 }
 
-function ContributionUnavailable({ contribution }: { contribution: WorkspaceContribution }) {
+function ContributionUnavailable({ contribution, onEnable, enabling, enableFailure }: {
+  contribution: WorkspaceContribution
+  onEnable: () => void
+  enabling: boolean
+  enableFailure: string
+}) {
   const message = contribution.status === 'invalid'
     ? contribution.state.lastError?.message ?? t('pluginPage.invalid')
     : contribution.status === 'incompatible'
@@ -278,7 +308,16 @@ function ContributionUnavailable({ contribution }: { contribution: WorkspaceCont
       <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-ink-faint">{contribution.state.manifest.name}</p>
       <h1 className="text-xl font-bold text-ink">{contribution.title}</h1>
       <p role={contribution.status === 'failed' || contribution.status === 'invalid' || contribution.status === 'incompatible' ? 'alert' : 'status'} className="mt-3 text-sm leading-6 text-ink-muted">{message}</p>
-      <Link to="/workspace/settings" className="mt-5 inline-flex rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-500">{t('workspace.goToSettings')}</Link>
+      {contribution.status === 'disabled' ? (
+        <>
+          <button type="button" disabled={enabling} onClick={onEnable} className="mt-5 inline-flex rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-500 disabled:cursor-default disabled:opacity-60">
+            {enabling ? t('pluginPage.enabling') : t('pluginPage.enable')}
+          </button>
+          {enableFailure && <p role="alert" className="mt-3 text-sm text-[var(--app-danger)]">{t('pluginPage.enableFailed', { error: enableFailure })}</p>}
+        </>
+      ) : (
+        <Link to="/workspace/settings" className="mt-5 inline-flex rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-500">{t('workspace.goToSettings')}</Link>
+      )}
     </section>
   )
 }

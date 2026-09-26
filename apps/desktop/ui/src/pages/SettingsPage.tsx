@@ -15,6 +15,7 @@ import { t, type MessageKey } from '../i18n'
 import { AccountManagementSection } from './AccountSection'
 import { CoreUpdateCard } from '../components/CoreUpdateCard'
 import { NetworkProxyCard } from '../components/NetworkProxyCard'
+import { ToggleSwitch } from '../components/ToggleSwitch'
 
 /** 主题档位。自定义档的控件保持深色，与后端 `ThemeMode` 的语义一致。 */
 const MODES: { value: ThemeMode; labelKey: MessageKey; hintKey: MessageKey; icon: LucideIcon }[] = [
@@ -143,20 +144,16 @@ function StartupMemoryCard() {
   }
 
   return (
-    <section className="glass-card flex h-full items-center rounded-card p-5">
-      <label htmlFor="resume-last-work-page" className="flex w-full cursor-pointer items-center justify-between gap-4">
-        <span className="min-w-0">
-          <span className="block text-sm font-semibold text-ink">{t('settings.startupMemory.title')}</span>
-          <span className="mt-1 block text-xs leading-relaxed text-ink-muted">{t('settings.startupMemory.description')}</span>
-        </span>
-        <input
-          id="resume-last-work-page"
-          type="checkbox"
-          checked={enabled}
-          onChange={(event) => changeEnabled(event.target.checked)}
-          className="h-4 w-4 shrink-0 accent-[var(--app-accent)]"
-        />
-      </label>
+    <section className="glass-card flex h-full items-center justify-between gap-4 rounded-card p-4">
+      <div className="min-w-0">
+        <h3 className="text-sm font-semibold text-ink">{t('settings.startupMemory.title')}</h3>
+        <p className="mt-1 text-xs leading-relaxed text-ink-muted">{t('settings.startupMemory.description')}</p>
+      </div>
+      <ToggleSwitch
+        checked={enabled}
+        label={t('settings.startupMemory.title')}
+        onChange={changeEnabled}
+      />
     </section>
   )
 }

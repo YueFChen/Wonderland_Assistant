@@ -60,15 +60,19 @@ impl FsUserDataService {
             .unwrap_or_else(|| default_path.clone());
 
         if !active.is_dir() {
-            control.last_migration_error = Some(format!(
-                "已配置的数据目录不存在：{}；本次已回退到默认目录",
-                active.display()
-            ));
+            let unavailable_path = active.clone();
             active = default_path.clone();
             control.active_path = None;
+            // A pending migration was requested from the unavailable directory. Do not
+            // accidentally migrate data from the fallback directory into its target.
+            control.pending_path = None;
             control.last_migration_path = None;
             control.last_migration_source = None;
             control.last_migration_warning = None;
+            control.last_migration_error = Some(format!(
+                "已配置的用户数据目录当前不可用：{}；应用已切回默认目录并继续启动。原目录数据仍保留在该路径，恢复后可在设置中重新迁移。",
+                unavailable_path.display()
+            ));
             control_dirty = true;
         }
 

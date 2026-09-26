@@ -79,7 +79,15 @@ export function NetworkProxyCard() {
     }
   }
 
-  const configuredVariables = settings?.environmentVariables.filter((item) => item.configured) ?? []
+  const configuredVariables = settings?.environmentVariables.filter((item) => item.configured && item.name !== 'NO_PROXY') ?? []
+  const detectedProxySources = [
+    ...(settings?.windowsSystemProxy.supported
+      && settings.windowsSystemProxy.enabled
+      && settings.windowsSystemProxy.serverConfigured
+      ? [t('settings.proxy.windowsSource')]
+      : []),
+    ...configuredVariables.map((item) => item.name),
+  ]
   const hasNewCredentials = Boolean(username || password)
   const canSaveCredentials = !hasNewCredentials || Boolean(username && password)
   const hasUnsavedChanges = Boolean(settings && (
@@ -203,29 +211,14 @@ export function NetworkProxyCard() {
           )}
 
           {mode === 'system' && (
-            <div className="rounded-lg border border-glass-line bg-glass-subtle p-3 text-xs text-ink-muted">
-              <p>{t('settings.proxy.environmentHint')}</p>
-              {settings.windowsSystemProxy.supported && (
-                <p className="mt-2 text-ink-faint">
-                  {settings.windowsSystemProxy.enabled
-                    ? t(settings.windowsSystemProxy.serverConfigured
-                      ? 'settings.proxy.windowsProxyEnabled'
-                      : 'settings.proxy.windowsProxyMissingServer')
-                    : t('settings.proxy.windowsProxyDisabled')}
-                </p>
-              )}
-              <p className="mt-2 text-ink-faint">
-                {configuredVariables.length
-                  ? t('settings.proxy.environmentFound', { names: configuredVariables.map((item) => item.name).join(', ') })
-                  : t('settings.proxy.environmentNone')}
+            detectedProxySources.length > 0 && (
+              <p className="rounded-lg border border-glass-line bg-glass-subtle px-3 py-2 text-xs text-ink-muted">
+                {t('settings.proxy.detected', { sources: detectedProxySources.join('、') })}
               </p>
-            </div>
+            )
           )}
 
-          <div className="rounded-lg border border-glass-line bg-glass-subtle p-3 text-xs leading-relaxed text-ink-muted">
-            <p>{t('settings.proxy.coreRoutes')}</p>
-            <p className="mt-1">{t('settings.proxy.pluginBoundary')}</p>
-          </div>
+          <p className="text-[11px] leading-relaxed text-ink-faint">{t('settings.proxy.scopeHint')}</p>
 
           {settings.warning && <p role="alert" className="text-xs text-[var(--app-danger)]">{settings.warning}</p>}
           {failure && <p role="alert" className="text-sm text-[var(--app-danger)]">{failure}</p>}

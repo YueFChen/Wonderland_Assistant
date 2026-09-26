@@ -7,8 +7,10 @@
 //!
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -349,12 +351,61 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), KernelError> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(storage)?;
     }
-    let temp = path.with_extension("tmp");
-    fs::write(&temp, bytes).map_err(storage)?;
-    if path.exists() {
-        fs::remove_file(path).map_err(storage)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .map_err(storage)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&temp);
+        return Err(storage(error));
     }
-    fs::rename(&temp, path).map_err(storage)
+    drop(file);
+    if let Err(error) = replace_file(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(storage(error));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
 }
 
 /// 设置分区读写失败：带底层原因（**不含任何凭据**），并落一条 warn。
