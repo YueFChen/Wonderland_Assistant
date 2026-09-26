@@ -1,0 +1,32 @@
+{
+  "manifestVersion": 2,
+  "id": "knowledge_library",
+  "name": "Knowledge Library Consumer",
+  "version": "0.1.0",
+  "hostCompatibility": {
+    "minCoreVersion": "0.1.0",
+    "maxCoreVersionExclusive": "1.0.0",
+    "protocol": { "minVersion": "1.0.0", "maxVersionExclusive": "2.0.0" }
+  },
+  "platform": { "os": "windows", "architecture": "x86_64", "abi": "msvc" },
+  "ui": {
+    "entry": "ui/index.html",
+    "bridgeCompatibility": { "minVersion": "1.0.0", "maxVersionExclusive": "2.0.0" },
+    "integrations": [],
+    "contributions": [
+      { "id": "main", "kind": "activity", "title": "Knowledge Library", "defaultOrder": 0 }
+    ]
+  },
+  "backend": { "entry": "backend/consumer.exe", "transport": "stdio-ndjson-v1" },
+  "contract": "contract.json",
+  "capabilities": ["services.call"],
+  "requires": [
+    {
+      "id": "wonderland.comments.archive",
+      "minVersion": "1.0.0",
+      "maxVersionExclusive": "2.0.0",
+      "optional": true,
+      "methods": ["service_archives", "archive_page"]
+    }
+  ]
+}

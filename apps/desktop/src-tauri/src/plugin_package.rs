@@ -1265,12 +1265,12 @@ mod tests {
     fn comment_archive_provider_and_consumer_contracts_validate() {
         let cases = [
             (
-                include_str!("../../../../plugins/comment_collector/package/manifest.json"),
-                include_str!("../../../../plugins/comment_collector/package/contract.json"),
+                include_str!("../tests/fixtures/comment_collector_manifest.json"),
+                include_str!("../tests/fixtures/comment_collector_contract.json"),
             ),
             (
-                include_str!("../../../../plugins/knowledge_library/package/manifest.json"),
-                include_str!("../../../../plugins/knowledge_library/package/contract.json"),
+                include_str!("../tests/fixtures/knowledge_library_manifest.json"),
+                include_str!("../tests/fixtures/knowledge_library_contract.json"),
             ),
         ];
 
@@ -1286,7 +1286,7 @@ mod tests {
     #[test]
     fn plugin_ui_commands_require_a_supported_schema_and_current_bridge() {
         let mut manifest: PluginManifest = serde_json::from_str(include_str!(
-            "../../../../plugins/comment_collector/package/manifest.json"
+            "../tests/fixtures/comment_collector_manifest.json"
         ))
         .unwrap();
         {

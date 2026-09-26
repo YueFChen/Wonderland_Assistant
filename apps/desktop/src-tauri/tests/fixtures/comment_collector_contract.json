@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "methods": {
+    "service_archives": {
+      "params": { "type": "object", "additionalProperties": false },
+      "result": { "type": "array", "items": { "type": "object" } },
+      "timeoutMs": 10000
+    },
+    "archive_page": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "level_id": { "type": "string" },
+          "offset": { "type": "integer" },
+          "limit": { "type": "integer" }
+        },
+        "required": ["level_id", "offset", "limit"],
+        "additionalProperties": false
+      },
+      "result": { "type": "object" },
+      "timeoutMs": 10000
+    }
+  },
+  "events": {}
+}
