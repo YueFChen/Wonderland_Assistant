@@ -73,8 +73,9 @@ jobs:
           $installRoot = Join-Path $env:TEMP "WonderlandAssistant-InstallCheck-$env:GITHUB_RUN_ID"
           $installerProcess = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installRoot") -Wait -PassThru -WindowStyle Hidden
           if ($installerProcess.ExitCode -ne 0) { throw "Silent installer returned $($installerProcess.ExitCode)." }
-          $targetTriple = ((rustc -vV | Select-String '^host: (.+)$').Matches.Groups[1].Value)
-          $cli = Join-Path $installRoot "resources/binaries/wla-$targetTriple.exe"
+          # Tauri's NSIS bundler strips the target triple from externalBin and installs
+          # sidecars into the install root (unlike app bundle resource directories).
+          $cli = Join-Path $installRoot 'wla.exe'
           if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) { throw "Installed wla sidecar missing at '$cli'." }
           $appVersion = (Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $reportedVersion = (& $cli --version).Trim()
