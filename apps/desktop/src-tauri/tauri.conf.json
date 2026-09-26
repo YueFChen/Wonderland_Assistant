@@ -28,7 +28,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
     "externalBin": ["binaries/wla"],
     "publisher": "Yuef Chen",
     "icon": [
