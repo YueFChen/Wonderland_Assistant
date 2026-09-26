@@ -917,13 +917,12 @@ impl PluginManager {
                 record.snapshot.last_error = None;
             }
             drop(process);
-        } else if !enabled {
-            if let Ok(mut state) = self.inner.state.lock()
-                && let Some(record) = state.plugins.get_mut(plugin_id)
-            {
-                record.snapshot.runtime = RuntimeState::Stopped;
-                record.snapshot.last_error = None;
-            }
+        } else if !enabled
+            && let Ok(mut state) = self.inner.state.lock()
+            && let Some(record) = state.plugins.get_mut(plugin_id)
+        {
+            record.snapshot.runtime = RuntimeState::Stopped;
+            record.snapshot.last_error = None;
         }
         if enabled {
             let can_start = self

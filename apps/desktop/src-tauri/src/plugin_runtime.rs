@@ -417,44 +417,6 @@ impl Drop for PluginProcess {
     }
 }
 
-#[cfg(test)]
-mod process_stop_tests {
-    use super::*;
-
-    #[test]
-    fn stopping_a_running_child_is_bounded_and_collects_its_exit() {
-        #[cfg(windows)]
-        let mut command = {
-            let mut command = Command::new("powershell.exe");
-            command.args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Start-Sleep -Seconds 30",
-            ]);
-            command
-        };
-        #[cfg(not(windows))]
-        let mut command = {
-            let mut command = Command::new("sh");
-            command.args(["-c", "exec sleep 30"]);
-            command
-        };
-
-        let mut child = command.spawn().expect("long-running test process starts");
-        let started = Instant::now();
-        stop_child(&mut child).expect("Core can stop the child process");
-
-        assert!(started.elapsed() < Duration::from_secs(3));
-        assert!(
-            child
-                .try_wait()
-                .expect("child status is readable")
-                .is_some()
-        );
-    }
-}
-
 fn read_stdout(
     stdout: std::process::ChildStdout,
     process: Weak<PluginProcess>,
@@ -1612,4 +1574,42 @@ pub(crate) fn plugin_error(code: &str, message: &str) -> PluginError {
 
 fn internal_error(message: &str) -> PluginError {
     plugin_error("INTERNAL", message)
+}
+
+#[cfg(test)]
+mod process_stop_tests {
+    use super::*;
+
+    #[test]
+    fn stopping_a_running_child_is_bounded_and_collects_its_exit() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 30"]);
+            command
+        };
+
+        let mut child = command.spawn().expect("long-running test process starts");
+        let started = Instant::now();
+        stop_child(&mut child).expect("Core can stop the child process");
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            child
+                .try_wait()
+                .expect("child status is readable")
+                .is_some()
+        );
+    }
 }

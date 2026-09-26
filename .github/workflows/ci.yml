@@ -57,14 +57,16 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build
+      - run: pnpm --filter @wonderland/desktop exec tauri build --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.ci.conf.json
       - name: Verify Windows Core bundle
         shell: pwsh
         run: |
-          $bundles = @(Get-ChildItem -Path 'target/release/bundle' -Recurse -File |
-            Where-Object { $_.Extension -in '.msi', '.exe' })
-          if ($bundles.Count -eq 0) { throw 'Windows installer missing from target/release/bundle' }
-          $bundles | Select-Object -ExpandProperty FullName
+          $msiInstallers = @(Get-ChildItem -Path 'target/release/bundle/msi' -Filter '*.msi' -File)
+          if ($msiInstallers.Count -eq 0) { throw 'MSI installer missing from target/release/bundle/msi' }
+          $nsisInstallers = @(Get-ChildItem -Path 'target/release/bundle/nsis' -Filter '*.exe' -File)
+          if ($nsisInstallers.Count -eq 0) { throw 'NSIS installer missing from target/release/bundle/nsis' }
+          $msiInstallers | Select-Object -ExpandProperty FullName
+          $nsisInstallers | Select-Object -ExpandProperty FullName
       - name: Install package and verify shipped wla CLI
         shell: pwsh
         run: |
@@ -73,8 +75,7 @@ jobs:
           $installRoot = Join-Path $env:TEMP "WonderlandAssistant-InstallCheck-$env:GITHUB_RUN_ID"
           $installerProcess = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installRoot") -Wait -PassThru -WindowStyle Hidden
           if ($installerProcess.ExitCode -ne 0) { throw "Silent installer returned $($installerProcess.ExitCode)." }
-          # Tauri's NSIS bundler strips the target triple from externalBin and installs
-          # sidecars into the install root (unlike app bundle resource directories).
+          # The packaged CLI must sit beside the desktop executable so users can invoke it directly.
           $cli = Join-Path $installRoot 'wla.exe'
           if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) { throw "Installed wla sidecar missing at '$cli'." }
           $appVersion = (Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
@@ -91,6 +92,43 @@ jobs:
           if ($invalid.ExitCode -ne 2) { throw "Invalid CLI command returned exit code $($invalid.ExitCode), expected 2." }
           $failure = Get-Content -LiteralPath $stderr -Raw | ConvertFrom-Json
           if ($failure.ok -or $failure.error.code -ne 'INVALID_REQUEST') { throw 'Installed CLI returned an invalid error contract.' }
+
+      - name: Install MSI and verify bundled CLI
+        shell: pwsh
+        run: |
+          $msiInstallers = @(Get-ChildItem -Path 'target/release/bundle/msi' -Filter '*.msi' -File)
+          if ($msiInstallers.Count -eq 0) { throw 'MSI installer missing from target/release/bundle/msi' }
+          $installRoot = Join-Path $env:TEMP "WonderlandAssistant-MsiCheck-$env:GITHUB_RUN_ID"
+          $profile = Join-Path $env:TEMP "WonderlandAssistant-MsiCliCheck-$env:GITHUB_RUN_ID"
+          $appVersion = (Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $installed = $false
+          try {
+            $msiPath = $msiInstallers[0].FullName
+            $installArguments = @('/i', "`"$msiPath`"", '/qn', '/norestart', "INSTALLDIR=`"$installRoot`"")
+            $installerProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $installArguments -Wait -PassThru -WindowStyle Hidden
+            if ($installerProcess.ExitCode -ne 0) { throw "MSI installer returned $($installerProcess.ExitCode)." }
+            $installed = $true
+
+            # The MSI must install both executable targets into its selected install directory.
+            $cli = Join-Path $installRoot 'wla.exe'
+            if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) { throw "MSI-installed wla sidecar missing at '$cli'." }
+            $desktopApp = Join-Path $installRoot 'wonderland-desktop.exe'
+            if (-not (Test-Path -LiteralPath $desktopApp -PathType Leaf)) { throw "MSI-installed desktop app missing at '$desktopApp'." }
+            $reportedVersion = (& $cli --version).Trim()
+            if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne "wla $appVersion") { throw "MSI CLI version mismatch: '$reportedVersion'." }
+            $statusOutput = & $cli --data-dir $profile core status
+            if ($LASTEXITCODE -ne 0) { throw 'MSI-installed CLI core status command failed.' }
+            $status = ($statusOutput -join "`n") | ConvertFrom-Json
+            if (-not $status.ok -or $status.data.version -ne $appVersion -or $status.data.desktopRunning) { throw 'MSI-installed CLI returned an invalid core status response.' }
+          }
+          finally {
+            if ($installed) {
+              $uninstallArguments = @('/x', "`"$($msiInstallers[0].FullName)`"", '/qn', '/norestart')
+              $uninstallerProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $uninstallArguments -Wait -PassThru -WindowStyle Hidden
+              if ($uninstallerProcess.ExitCode -ne 0) { throw "MSI uninstaller returned $($uninstallerProcess.ExitCode)." }
+              if (Test-Path -LiteralPath (Join-Path $installRoot 'wla.exe')) { throw 'MSI uninstaller left the CLI installed.' }
+            }
+          }
 
   supply-chain:
     name: Supply chain（cargo-deny）
