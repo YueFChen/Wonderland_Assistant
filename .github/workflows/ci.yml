@@ -98,6 +98,9 @@ jobs:
         run: |
           $msiInstallers = @(Get-ChildItem -Path 'target/release/bundle/msi' -Filter '*.msi' -File)
           if ($msiInstallers.Count -eq 0) { throw 'MSI installer missing from target/release/bundle/msi' }
+          # The earlier NSIS smoke test writes its install path here; clear that CI-created search value so this MSI test uses its own isolated target.
+          $nsisInstallRegistryKey = 'HKCU:\Software\Yuef Chen\Wonderland Assistant'
+          if (Test-Path -LiteralPath $nsisInstallRegistryKey) { Remove-Item -LiteralPath $nsisInstallRegistryKey -Recurse -Force }
           $installRoot = Join-Path $env:TEMP "WonderlandAssistant-MsiCheck-$env:GITHUB_RUN_ID"
           $profile = Join-Path $env:TEMP "WonderlandAssistant-MsiCliCheck-$env:GITHUB_RUN_ID"
           $appVersion = (Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
