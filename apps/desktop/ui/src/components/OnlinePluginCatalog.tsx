@@ -31,14 +31,15 @@ export function OnlinePluginCatalog({ onInstalled }: {
 
   const visiblePlugins = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase()
-    return (catalog?.plugins ?? []).filter(({ entry }) =>
-      normalized === '' || [entry.name, entry.id, entry.description, entry.author]
+    return (catalog?.plugins ?? []).filter(({ registration }) =>
+      normalized === '' || [registration.name, registration.id, registration.description, registration.author]
         .some((value) => value.toLocaleLowerCase().includes(normalized)),
     )
   }, [catalog, query])
 
   const install = async (item: PluginCatalogSnapshot['plugins'][number]) => {
-    const { entry } = item
+    const { entry, registration } = item
+    if (!entry) return
     setBusy(entry.id)
     setFailure('')
     try {
@@ -59,10 +60,10 @@ export function OnlinePluginCatalog({ onInstalled }: {
         ? serviceLines.join('\n')
         : t('settings.plugins.catalog.noServices')
       const confirmation = t('settings.plugins.catalog.confirm', {
-        name: entry.name,
+        name: registration.name,
         version: entry.version,
-        author: entry.author,
-        repository: entry.repositoryUrl,
+        author: registration.author,
+        repository: registration.repositoryUrl,
         previousSource,
         capabilities: requested,
         services: requestedServices,
@@ -72,7 +73,7 @@ export function OnlinePluginCatalog({ onInstalled }: {
       onInstalled(states)
       setCatalog((current) => current && ({
         ...current,
-        plugins: current.plugins.map((candidate) => candidate.entry.id === entry.id
+        plugins: current.plugins.map((candidate) => candidate.registration.id === entry.id
           ? { ...candidate, installedVersion: entry.version, installable: false }
           : candidate),
       }))
@@ -129,43 +130,47 @@ export function OnlinePluginCatalog({ onInstalled }: {
       ) : visiblePlugins.length > 0 ? (
         <ul className="grid gap-2.5 md:grid-cols-2 2xl:grid-cols-3">
           {visiblePlugins.map((item) => {
-            const { entry } = item
-            const installed = item.installedVersion === entry.version
+            const { registration, entry } = item
+            const installed = entry !== null && item.installedVersion === entry.version
             return (
-              <li key={`${entry.id}@${entry.version}`} className="flex min-h-44 min-w-0 flex-col justify-between rounded-xl border border-glass-line bg-glass-subtle p-3">
+              <li key={registration.id} className="flex min-h-44 min-w-0 flex-col justify-between rounded-xl border border-glass-line bg-glass-subtle p-3">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="min-w-0 break-words text-xs font-semibold text-ink">{entry.name}</h3>
-                    <span className="rounded-full border border-glass-line px-2 py-0.5 text-[10px] text-ink-faint">v{entry.version}</span>
-                    {!item.compatible && <span className="rounded-full border border-[var(--app-danger-line)] px-2 py-0.5 text-[10px] text-[var(--app-danger)]">{t('settings.plugins.catalog.incompatible')}</span>}
+                    <h3 className="min-w-0 break-words text-xs font-semibold text-ink">{registration.name}</h3>
+                    {entry
+                      ? <span className="rounded-full border border-glass-line px-2 py-0.5 text-[10px] text-ink-faint">v{entry.version}</span>
+                      : <span className="rounded-full border border-glass-line px-2 py-0.5 text-[10px] text-ink-faint">{t('settings.plugins.catalog.updateUnavailable')}</span>}
+                    {entry && !item.compatible && <span className="rounded-full border border-[var(--app-danger-line)] px-2 py-0.5 text-[10px] text-[var(--app-danger)]">{t('settings.plugins.catalog.incompatible')}</span>}
                   </div>
-                  <p className="mt-0.5 break-all text-[10px] text-ink-faint">{entry.id} · {t('settings.plugins.catalog.author', { author: entry.author })}</p>
-                  <p className="mt-1.5 line-clamp-2 text-[11px] leading-4 text-ink-muted">{entry.description}</p>
+                  <p className="mt-0.5 break-all text-[10px] text-ink-faint">{registration.id} · {t('settings.plugins.catalog.author', { author: registration.author })}</p>
+                  <p className="mt-1.5 line-clamp-2 text-[11px] leading-4 text-ink-muted">{registration.description}</p>
                   {item.installedVersion && (
                     <p className="mt-1.5 text-[10px] text-ink-faint">{t('settings.plugins.catalog.installedVersion', { version: item.installedVersion })}</p>
                   )}
-                  <p className="mt-1 text-[10px] text-ink-faint">{t('settings.plugins.catalog.capabilities', { count: entry.capabilities.length })}</p>
+                  {entry && <p className="mt-1 text-[10px] text-ink-faint">{t('settings.plugins.catalog.capabilities', { count: entry.capabilities.length })}</p>}
                 </div>
                 <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 border-t border-glass-line pt-2">
-                  <span className="text-[10px] text-ink-faint">{entry.platform.architecture} · {formatBytes(entry.sizeBytes)}</span>
+                  <span className="text-[10px] text-ink-faint">{entry ? `${entry.platform.architecture} · ${formatBytes(entry.sizeBytes)}` : registration.repositoryUrl}</span>
                   <button
                     type="button"
-                    disabled={!item.installable || busy !== '' || loading}
+                    disabled={!entry || !item.installable || busy !== '' || loading}
                     onClick={() => void install(item)}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-brand-600 px-2.5 py-1.5 text-[11px] font-medium text-white transition hover:bg-brand-500 disabled:cursor-default disabled:opacity-50"
                   >
                     <Download className="h-3.5 w-3.5" aria-hidden />
-                    {busy === entry.id
+                    {busy === registration.id
                       ? t('settings.plugins.catalog.installing')
-                      : installed
-                        ? t('settings.plugins.catalog.installed')
-                        : item.installable && item.installedVersion
-                        ? t('settings.plugins.catalog.update')
-                          : item.installedVersion
-                            ? t('settings.plugins.catalog.noUpdate')
-                            : item.compatible
-                              ? t('settings.plugins.catalog.install')
-                              : t('settings.plugins.catalog.incompatible')}
+                      : !entry
+                        ? t('settings.plugins.catalog.updateUnavailable')
+                        : installed
+                          ? t('settings.plugins.catalog.installed')
+                          : item.installable && item.installedVersion
+                            ? t('settings.plugins.catalog.update')
+                            : item.installedVersion
+                              ? t('settings.plugins.catalog.noUpdate')
+                              : item.compatible
+                                ? t('settings.plugins.catalog.install')
+                                : t('settings.plugins.catalog.incompatible')}
                   </button>
                 </div>
               </li>

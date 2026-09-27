@@ -12,6 +12,16 @@ export interface PluginEventPayload {
   payload: unknown
 }
 
+export interface PluginCatalogRegistration {
+  id: string
+  name: string
+  description: string
+  author: string
+  repositoryUrl: string
+  updateManifestUrl: string
+  signingPublicKey: string
+}
+
 export interface PluginCatalogEntry {
   id: string
   name: string
@@ -40,10 +50,12 @@ export interface PluginCatalogSnapshot {
   generatedAt: string
   stale: boolean
   plugins: Array<{
-    entry: PluginCatalogEntry
+    registration: PluginCatalogRegistration
+    entry: PluginCatalogEntry | null
     compatible: boolean
     installedVersion: string | null
     installable: boolean
+    stale: boolean
   }>
 }
 

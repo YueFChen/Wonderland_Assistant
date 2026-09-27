@@ -34,6 +34,7 @@ semver = "1"
 sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 wonderland-kernel = { path = "../../../crates/kernel" }
 wonderland-account = { path = "../../../crates/account" }
 wonderland-config = { path = "../../../crates/config" }

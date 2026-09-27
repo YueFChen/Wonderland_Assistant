@@ -20,8 +20,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// base64 encoding, while bounding memory use before serialization.
 const MAX_HTTP_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
 const PLUGIN_CATALOG_URL: &str =
-    "https://yuefchen.github.io/Wonderland_Plugin_Catalog/catalog/v1/index.json";
+    "https://yuefchen.github.io/Wonderland_Plugin_Catalog/catalog/v2/index.json";
 const PLUGIN_CATALOG_MAX_BYTES: usize = 2 * 1024 * 1024;
+const PLUGIN_UPDATE_MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 const PLUGIN_PACKAGE_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 /// 固定 UA：米哈游接口对 UA 敏感，不使用随机值以免触发风控。
@@ -298,6 +299,14 @@ impl PluginCatalogClient {
         let response = self.package.get(url).send().await.map_err(classify)?;
         read_limited_response(response, PLUGIN_PACKAGE_MAX_BYTES).await
     }
+
+    pub async fn get_update_manifest(&self, url: &str) -> Result<Vec<u8>, KernelError> {
+        if !is_valid_plugin_update_manifest_url(url) {
+            return Err(KernelError::InvalidInput);
+        }
+        let response = self.package.get(url).send().await.map_err(classify)?;
+        read_limited_response(response, PLUGIN_UPDATE_MANIFEST_MAX_BYTES).await
+    }
 }
 
 /// Only accept immutable versioned GitHub Release asset URLs, never arbitrary HTTPS URLs.
@@ -335,6 +344,43 @@ pub fn is_valid_plugin_release_url(raw: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
         && parts[5].ends_with(".wplug")
+        && parts[5]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+
+/// Only accept the stable latest-release manifest asset for a GitHub plugin repository.
+pub fn is_valid_plugin_update_manifest_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(parts) = url.path_segments() else {
+        return false;
+    };
+    let parts = parts.collect::<Vec<_>>();
+    parts.len() == 6
+        && parts[2] == "releases"
+        && parts[3] == "latest"
+        && parts[4] == "download"
+        && !parts[0].is_empty()
+        && !parts[1].is_empty()
+        && parts[5].ends_with("-update.json")
+        && parts[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && parts[1]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
         && parts[5]
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
@@ -764,6 +810,25 @@ mod tests {
             assert!(ensure_allowed(url, &unrestricted).is_err(), "{url}");
         }
         assert!(ensure_allowed("http://127.0.0.1:8080/", &["127.0.0.1".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn update_manifest_url_is_limited_to_latest_github_release_assets() {
+        assert!(is_valid_plugin_update_manifest_url(
+            "https://github.com/YueFChen/my_wonderland/releases/latest/download/my_wonderland-update.json"
+        ));
+        for raw in [
+            "http://github.com/YueFChen/my_wonderland/releases/latest/download/my_wonderland-update.json",
+            "https://github.com.evil.example/YueFChen/my_wonderland/releases/latest/download/my_wonderland-update.json",
+            "https://github.com/YueFChen/my_wonderland/releases/download/v1/my_wonderland-update.json",
+            "https://github.com/YueFChen/my_wonderland/releases/latest/download/my_wonderland-update.json?redirect=evil",
+            "https://github.com/YueFChen/my_wonderland/releases/latest/download/update.json",
+        ] {
+            assert!(
+                !is_valid_plugin_update_manifest_url(raw),
+                "URL should be rejected: {raw}"
+            );
+        }
     }
 
     #[tokio::test]

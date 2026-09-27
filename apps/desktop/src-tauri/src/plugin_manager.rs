@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use ring::signature::{ED25519, UnparsedPublicKey};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,9 +33,11 @@ use crate::{plugin_package, plugin_runtime::PluginProcess};
 
 const MANAGER_CONFIG_FILE: &str = "plugin-manager.json";
 const LEGACY_CONFIG_FILE: &str = "plugins.json";
-const CATALOG_CACHE_FILE: &str = "plugin-catalog-v1.json";
+const CATALOG_CACHE_FILE: &str = "plugin-catalog-v2.json";
+const CATALOG_UPDATE_CACHE_DIR: &str = "plugin-catalog-updates-v2";
 const CATALOG_MAX_BYTES: usize = 2 * 1024 * 1024;
 const CATALOG_MAX_ITEMS: usize = 500;
+const CATALOG_UPDATE_MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 const PLUGIN_PACKAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,11 +45,50 @@ const PLUGIN_PACKAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 struct PluginCatalogIndex {
     schema_version: u32,
     generated_at: String,
-    plugins: Vec<PluginCatalogEntry>,
+    plugins: Vec<PluginCatalogRegistration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginCatalogRegistration {
+    id: String,
+    name: String,
+    description: String,
+    author: String,
+    repository_url: String,
+    update_manifest_url: String,
+    signing_public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SignedPluginUpdateManifest {
+    schema_version: u32,
+    payload: String,
+    signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginUpdateManifest {
+    schema_version: u32,
+    id: String,
+    version: String,
+    release_notes_url: Option<String>,
+    download_url: String,
+    sha256: String,
+    size_bytes: u64,
+    host_compatibility: HostCompatibility,
+    ui_bridge_compatibility: Option<ProtocolCompatibility>,
+    platform: PluginPlatform,
+    capabilities: Vec<String>,
+    network_public_hosts: Vec<String>,
+    provides: Vec<PluginService>,
+    requires: Vec<PluginServiceRequirement>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PluginCatalogEntry {
     id: String,
     name: String,
@@ -62,11 +104,8 @@ struct PluginCatalogEntry {
     ui_bridge_compatibility: Option<ProtocolCompatibility>,
     platform: PluginPlatform,
     capabilities: Vec<String>,
-    #[serde(default)]
     network_public_hosts: Vec<String>,
-    #[serde(default)]
     provides: Vec<PluginService>,
-    #[serde(default)]
     requires: Vec<PluginServiceRequirement>,
 }
 
@@ -88,10 +127,12 @@ pub struct PluginUiLaunchInfo {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginCatalogItem {
-    entry: PluginCatalogEntry,
+    registration: PluginCatalogRegistration,
+    entry: Option<PluginCatalogEntry>,
     compatible: bool,
     installed_version: Option<String>,
     installable: bool,
+    stale: bool,
 }
 
 #[derive(Clone)]
@@ -2398,7 +2439,7 @@ pub fn plugins_list(
     Ok(manager.snapshots())
 }
 
-/// Reads the reviewed, public plugin catalog. A validated last-known copy is returned offline.
+/// Reads the public plugin registry and each plugin's signed update manifest.
 #[tauri::command]
 pub async fn plugins_catalog_list(
     window: WebviewWindow,
@@ -2426,13 +2467,41 @@ pub async fn plugins_catalog_list(
         .into_iter()
         .map(|state| (state.manifest.id, state.manifest.version))
         .collect::<BTreeMap<_, _>>();
-    let plugins = index
-        .plugins
-        .into_iter()
-        .map(|entry| {
-            let compatible = catalog_entry_is_compatible(&entry);
-            let installed_version = installed_versions.get(&entry.id).cloned();
-            let installable = compatible
+    let update_cache_dir = app_data_dir.join(CATALOG_UPDATE_CACHE_DIR);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut tasks = Vec::with_capacity(index.plugins.len());
+    for registration in index.plugins {
+        let client = client.clone();
+        let update_cache_dir = update_cache_dir.clone();
+        let semaphore = Arc::clone(&semaphore);
+        tasks.push(tokio::spawn(async move {
+            let permit = semaphore.acquire_owned().await;
+            let result = match permit {
+                Ok(_permit) => {
+                    load_registered_plugin_update(&client, &registration, &update_cache_dir, true)
+                        .await
+                }
+                Err(_) => Err(plugin_error(
+                    "UPDATE_MANIFEST_UNAVAILABLE",
+                    "Plugin update information is unavailable.",
+                )),
+            };
+            (registration, result)
+        }));
+    }
+    let mut plugins = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let Ok((registration, update_result)) = task.await else {
+            continue;
+        };
+        let installed_version = installed_versions.get(&registration.id).cloned();
+        let (entry, update_stale) = match update_result {
+            Ok((entry, stale)) => (Some(entry), stale),
+            Err(_) => (None, true),
+        };
+        let compatible = entry.as_ref().is_some_and(catalog_entry_is_compatible);
+        let installable = entry.as_ref().is_some_and(|entry| {
+            compatible
                 && installed_version.as_deref().is_none_or(|installed| {
                     let current = Version::parse(&entry.version);
                     let installed = Version::parse(installed);
@@ -2440,15 +2509,19 @@ pub async fn plugins_catalog_list(
                         .ok()
                         .zip(installed.ok())
                         .is_some_and(|(current, installed)| current > installed)
-                });
-            PluginCatalogItem {
-                entry,
-                compatible,
-                installed_version,
-                installable,
-            }
-        })
-        .collect();
+                })
+        });
+        plugins.push(PluginCatalogItem {
+            registration,
+            entry,
+            compatible,
+            installed_version,
+            installable,
+            stale: update_stale,
+        });
+    }
+    plugins.sort_by(|left, right| left.registration.id.cmp(&right.registration.id));
+    let stale = stale || plugins.iter().any(|item| item.stale);
     Ok(PluginCatalogSnapshot {
         generated_at: index.generated_at,
         stale,
@@ -2456,8 +2529,8 @@ pub async fn plugins_catalog_list(
     })
 }
 
-/// Downloads one reviewed catalog version, verifies its digest and manifest, then installs it
-/// through the same package validation and atomic replacement path as a local .wplug file.
+/// Downloads the latest signed plugin update, verifies its package digest and manifest, then
+/// installs it through the same package validation and atomic replacement path as a local file.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogInstallRequest {
@@ -2494,16 +2567,29 @@ pub async fn plugins_catalog_install(
         .await
         .map_err(|error| plugin_error("CATALOG_UNAVAILABLE", &error.to_string()))?;
     let index = parse_catalog_index(&catalog_bytes)?;
-    let entry = index
+    let registration = index
         .plugins
         .into_iter()
-        .find(|entry| entry.id == plugin_id && entry.version == version)
+        .find(|entry| entry.id == plugin_id)
         .ok_or_else(|| {
             plugin_error(
-                "CATALOG_VERSION_MISSING",
-                "This plugin version is no longer listed in the catalog. Refresh and try again.",
+                "CATALOG_PLUGIN_MISSING",
+                "This plugin is no longer listed in the catalog. Refresh and try again.",
             )
         })?;
+    let (entry, _) = load_registered_plugin_update(
+        &client,
+        &registration,
+        &app_data_dir.join(CATALOG_UPDATE_CACHE_DIR),
+        false,
+    )
+    .await?;
+    if entry.version != version {
+        return Err(plugin_error(
+            "CATALOG_CHANGED",
+            "The plugin version changed after the catalog was displayed. Refresh and review it again.",
+        ));
+    }
     if !catalog_entry_is_compatible(&entry) {
         return Err(plugin_error(
             "INCOMPATIBLE_CORE",
@@ -2589,6 +2675,133 @@ pub async fn plugins_catalog_install(
     .map_err(|error| plugin_error("INTERNAL", &format!("Plugin installation failed: {error}")))?
 }
 
+async fn load_registered_plugin_update(
+    client: &wonderland_net::PluginCatalogClient,
+    registration: &PluginCatalogRegistration,
+    cache_dir: &Path,
+    allow_cached: bool,
+) -> Result<(PluginCatalogEntry, bool), PluginError> {
+    let cache_path = cache_dir.join(format!("{}.json", registration.id));
+    let remote_error = match client
+        .get_update_manifest(&registration.update_manifest_url)
+        .await
+    {
+        Ok(bytes) => match parse_signed_update_manifest(&bytes, registration) {
+            Ok(entry) => {
+                if fs::create_dir_all(cache_dir).is_ok() {
+                    let _ = fs::write(&cache_path, bytes);
+                }
+                return Ok((entry, false));
+            }
+            Err(error) => error,
+        },
+        Err(error) => plugin_error("UPDATE_MANIFEST_UNAVAILABLE", &error.to_string()),
+    };
+
+    if allow_cached
+        && let Ok(bytes) = fs::read(&cache_path)
+        && let Ok(entry) = parse_signed_update_manifest(&bytes, registration)
+    {
+        return Ok((entry, true));
+    }
+    Err(remote_error)
+}
+
+fn parse_signed_update_manifest(
+    bytes: &[u8],
+    registration: &PluginCatalogRegistration,
+) -> Result<PluginCatalogEntry, PluginError> {
+    if bytes.len() > CATALOG_UPDATE_MANIFEST_MAX_BYTES {
+        return Err(plugin_error(
+            "INVALID_UPDATE_MANIFEST",
+            "Plugin update information is too large.",
+        ));
+    }
+    let envelope: SignedPluginUpdateManifest = serde_json::from_slice(bytes).map_err(|_| {
+        plugin_error(
+            "INVALID_UPDATE_MANIFEST",
+            "Plugin update information has an invalid format.",
+        )
+    })?;
+    if envelope.schema_version != 1 || envelope.payload.len() > CATALOG_UPDATE_MANIFEST_MAX_BYTES {
+        return Err(plugin_error(
+            "INVALID_UPDATE_MANIFEST",
+            "Plugin update information has invalid metadata.",
+        ));
+    }
+    if envelope.signature.len() != 128
+        || !envelope
+            .signature
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(plugin_error(
+            "INVALID_UPDATE_MANIFEST",
+            "Plugin update signature is invalid.",
+        ));
+    }
+    let public_key = hex::decode(&registration.signing_public_key).map_err(|_| {
+        plugin_error(
+            "INVALID_CATALOG",
+            "The registered plugin signing key is invalid.",
+        )
+    })?;
+    let signature = hex::decode(&envelope.signature).map_err(|_| {
+        plugin_error(
+            "INVALID_UPDATE_MANIFEST",
+            "Plugin update signature is invalid.",
+        )
+    })?;
+    if public_key.len() != 32 || signature.len() != 64 {
+        return Err(plugin_error(
+            "INVALID_UPDATE_MANIFEST",
+            "Plugin update signature has an invalid length.",
+        ));
+    }
+    UnparsedPublicKey::new(&ED25519, &public_key)
+        .verify(envelope.payload.as_bytes(), &signature)
+        .map_err(|_| {
+            plugin_error(
+                "INVALID_UPDATE_SIGNATURE",
+                "Plugin update signature does not match the registered publisher key.",
+            )
+        })?;
+
+    let update: PluginUpdateManifest = serde_json::from_str(&envelope.payload).map_err(|_| {
+        plugin_error(
+            "INVALID_UPDATE_MANIFEST",
+            "Signed plugin update data has an invalid format.",
+        )
+    })?;
+    if update.schema_version != 1 || update.id != registration.id {
+        return Err(plugin_error(
+            "INVALID_UPDATE_MANIFEST",
+            "Signed plugin update data does not match the registered plugin.",
+        ));
+    }
+    let entry = PluginCatalogEntry {
+        id: registration.id.clone(),
+        name: registration.name.clone(),
+        description: registration.description.clone(),
+        author: registration.author.clone(),
+        repository_url: registration.repository_url.clone(),
+        version: update.version,
+        release_notes_url: update.release_notes_url,
+        download_url: update.download_url,
+        sha256: update.sha256,
+        size_bytes: update.size_bytes,
+        host_compatibility: update.host_compatibility,
+        ui_bridge_compatibility: update.ui_bridge_compatibility,
+        platform: update.platform,
+        capabilities: update.capabilities,
+        network_public_hosts: update.network_public_hosts,
+        provides: update.provides,
+        requires: update.requires,
+    };
+    validate_catalog_entry(&entry)?;
+    Ok(entry)
+}
+
 fn parse_catalog_index(bytes: &[u8]) -> Result<PluginCatalogIndex, PluginError> {
     if bytes.len() > CATALOG_MAX_BYTES {
         return Err(plugin_error(
@@ -2598,7 +2811,7 @@ fn parse_catalog_index(bytes: &[u8]) -> Result<PluginCatalogIndex, PluginError> 
     }
     let index: PluginCatalogIndex = serde_json::from_slice(bytes)
         .map_err(|_| plugin_error("INVALID_CATALOG", "Plugin catalog format is invalid."))?;
-    if index.schema_version != 1
+    if index.schema_version != 2
         || index.plugins.len() > CATALOG_MAX_ITEMS
         || index.generated_at.len() > 64
         || chrono::DateTime::parse_from_rfc3339(&index.generated_at).is_err()
@@ -2610,7 +2823,7 @@ fn parse_catalog_index(bytes: &[u8]) -> Result<PluginCatalogIndex, PluginError> 
     }
     let mut ids = BTreeSet::new();
     for entry in &index.plugins {
-        validate_catalog_entry(entry)?;
+        validate_catalog_registration(entry)?;
         if !ids.insert(entry.id.as_str()) {
             return Err(plugin_error(
                 "INVALID_CATALOG",
@@ -2619,6 +2832,38 @@ fn parse_catalog_index(bytes: &[u8]) -> Result<PluginCatalogIndex, PluginError> 
         }
     }
     Ok(index)
+}
+
+fn validate_catalog_registration(
+    registration: &PluginCatalogRegistration,
+) -> Result<(), PluginError> {
+    let public_key = hex::decode(&registration.signing_public_key).ok();
+    let expected_update_url = format!(
+        "{}/releases/latest/download/{}-update.json",
+        registration.repository_url, registration.id
+    );
+    if !valid_plugin_id(&registration.id)
+        || registration.name.trim().is_empty()
+        || registration.name.chars().count() > 120
+        || registration.description.chars().count() > 2000
+        || registration.author.trim().is_empty()
+        || registration.author.chars().count() > 120
+        || !valid_github_repository_url(&registration.repository_url)
+        || registration.update_manifest_url != expected_update_url
+        || !wonderland_net::is_valid_plugin_update_manifest_url(&registration.update_manifest_url)
+        || registration.signing_public_key.len() != 64
+        || !registration
+            .signing_public_key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || public_key.as_ref().is_none_or(|key| key.len() != 32)
+    {
+        return Err(plugin_error(
+            "INVALID_CATALOG",
+            "A plugin registration contains invalid metadata.",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_catalog_entry(entry: &PluginCatalogEntry) -> Result<(), PluginError> {
@@ -2772,6 +3017,113 @@ fn validate_catalog_entry(entry: &PluginCatalogEntry) -> Result<(), PluginError>
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod signed_catalog_update_tests {
+    use super::*;
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    fn test_key_pair() -> Ed25519KeyPair {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    }
+
+    fn registration(key_pair: &Ed25519KeyPair) -> PluginCatalogRegistration {
+        PluginCatalogRegistration {
+            id: "my_wonderland".to_owned(),
+            name: "我的奇域".to_owned(),
+            description: "查询并归档奇域作品数据。".to_owned(),
+            author: "YueFChen".to_owned(),
+            repository_url: "https://github.com/YueFChen/my_wonderland".to_owned(),
+            update_manifest_url: "https://github.com/YueFChen/my_wonderland/releases/latest/download/my_wonderland-update.json".to_owned(),
+            signing_public_key: hex::encode(key_pair.public_key().as_ref()),
+        }
+    }
+
+    fn update_payload(version: &str) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "id": "my_wonderland",
+            "version": version,
+            "releaseNotesUrl": format!("https://github.com/YueFChen/my_wonderland/releases/tag/v{version}"),
+            "downloadUrl": format!("https://github.com/YueFChen/my_wonderland/releases/download/v{version}/my_wonderland-{version}-windows-x86_64.wplug"),
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "sizeBytes": 1,
+            "hostCompatibility": {
+                "minCoreVersion": "0.1.0",
+                "maxCoreVersionExclusive": "1.0.0",
+                "protocol": { "minVersion": "1.0.0", "maxVersionExclusive": "2.0.0" }
+            },
+            "uiBridgeCompatibility": { "minVersion": "1.0.0", "maxVersionExclusive": "2.0.0" },
+            "platform": { "os": "windows", "architecture": "x86_64", "abi": "msvc" },
+            "capabilities": ["account.read", "account.authed_get"],
+            "networkPublicHosts": [],
+            "provides": [],
+            "requires": []
+        })
+    }
+
+    fn signed_envelope(key_pair: &Ed25519KeyPair, payload: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "payload": payload,
+            "signature": hex::encode(key_pair.sign(payload.as_bytes()).as_ref()),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn verifies_registered_ed25519_key_and_signed_update_fields() {
+        let key_pair = test_key_pair();
+        let registration = registration(&key_pair);
+        let payload = serde_json::to_string(&update_payload("0.1.1")).unwrap();
+        let entry =
+            parse_signed_update_manifest(&signed_envelope(&key_pair, &payload), &registration)
+                .unwrap();
+        assert_eq!(entry.id, registration.id);
+        assert_eq!(entry.version, "0.1.1");
+        assert_eq!(entry.capabilities, ["account.read", "account.authed_get"]);
+    }
+
+    #[test]
+    fn rejects_update_payload_changed_after_signing() {
+        let key_pair = test_key_pair();
+        let registration = registration(&key_pair);
+        let original = serde_json::to_string(&update_payload("0.1.1")).unwrap();
+        let signed = signed_envelope(&key_pair, &original);
+        let mut envelope: Value = serde_json::from_slice(&signed).unwrap();
+        envelope["payload"] =
+            Value::String(serde_json::to_string(&update_payload("0.1.2")).unwrap());
+        let tampered = serde_json::to_vec(&envelope).unwrap();
+        assert!(parse_signed_update_manifest(&tampered, &registration).is_err());
+    }
+
+    #[test]
+    fn catalog_requires_the_new_identity_only_schema() {
+        let index = json!({
+            "schemaVersion": 2,
+            "generatedAt": "2026-09-27T00:00:00Z",
+            "plugins": [{
+                "id": "my_wonderland",
+                "name": "我的奇域",
+                "description": "查询并归档奇域作品数据。",
+                "author": "YueFChen",
+                "repositoryUrl": "https://github.com/YueFChen/my_wonderland",
+                "updateManifestUrl": "https://github.com/YueFChen/my_wonderland/releases/latest/download/my_wonderland-update.json",
+                "signingPublicKey": "0000000000000000000000000000000000000000000000000000000000000000"
+            }]
+        });
+        assert!(parse_catalog_index(&serde_json::to_vec(&index).unwrap()).is_ok());
+        let old_index = json!({
+            "schemaVersion": 1,
+            "generatedAt": "2026-09-27T00:00:00Z",
+            "plugins": []
+        });
+        assert!(parse_catalog_index(&serde_json::to_vec(&old_index).unwrap()).is_err());
+    }
 }
 
 fn valid_github_repository_url(raw: &str) -> bool {
