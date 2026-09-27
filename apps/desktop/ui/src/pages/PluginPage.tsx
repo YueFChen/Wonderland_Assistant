@@ -12,7 +12,7 @@ import {
 } from '../plugins/cliUiCommandBus'
 
 import { t } from '../i18n'
-import { pluginApi, usePlugins, type PluginEventPayload } from '../plugins/api'
+import { pluginApi, usePlugins, type PluginEventPayload, type PluginUiLaunchInfo } from '../plugins/api'
 import { buildContributionRegistry, findContribution } from '../plugins/contributions'
 import type { WorkspaceContribution } from '../plugins/contributions'
 import { MAX_OPEN_ACTIVITY_SURFACES, readWorkspaceLayout, setActiveSidebarContribution, useWorkspaceLayout } from '../plugins/workspaceLayout'
@@ -344,7 +344,9 @@ export function PluginSurface({
   const sentCliCommands = useRef(new Set<string>())
   const subscribedTopics = useRef(new Set<string>())
   const handshakeTimer = useRef<number | null>(null)
-  const [url, setUrl] = useState('')
+  const negotiatedBridgeVersion = useRef<string | null>(null)
+  const [launchInfo, setLaunchInfo] = useState<PluginUiLaunchInfo | null>(null)
+  const url = launchInfo?.url ?? ''
   const [loaderFailure, setLoaderFailure] = useState('')
   const [ready, setReady] = useState(false)
   const [bridgeError, setBridgeError] = useState('')
@@ -363,13 +365,13 @@ export function PluginSurface({
   const sendToPlugin = useCallback((message: Record<string, unknown>) => {
     frame.current?.contentWindow?.postMessage({
       protocol: BRIDGE_PROTOCOL,
-      bridgeVersion: UI_BRIDGE_VERSION,
+      bridgeVersion: negotiatedBridgeVersion.current ?? launchInfo?.bridgeVersions[0] ?? UI_BRIDGE_VERSION,
       pluginId: state.manifest.id,
       contributionId: contribution.contributionId,
       nonce: nonce.current,
       ...message,
     }, '*')
-  }, [contribution.contributionId, state.manifest.id])
+  }, [contribution.contributionId, launchInfo, state.manifest.id])
 
   const deliverCliCommand = useCallback((command: CliPluginUiCommand) => {
     if (!active || !ready || sentCliCommands.current.has(command.requestId)) return
@@ -421,11 +423,11 @@ export function PluginSurface({
 
   useEffect(() => {
     let live = true
-    setUrl('')
+    setLaunchInfo(null)
     setLoaderFailure('')
     setReady(false)
     void pluginApi.uiUrl(state.manifest.id)
-      .then((next) => { if (live) setUrl(next) })
+      .then((next) => { if (live) setLaunchInfo(next) })
       .catch((cause) => { if (live) setLoaderFailure(errorText(cause)) })
     return () => { live = false }
   }, [loadGeneration, state.manifest.id])
@@ -440,15 +442,24 @@ export function PluginSurface({
       if (!frameWindow || event.source !== frameWindow || event.origin !== 'null') return
       const validation = validatePluginUiBridgeMessage(event.data, {
         protocol: BRIDGE_PROTOCOL,
-        bridgeVersion: UI_BRIDGE_VERSION,
+        bridgeVersion: negotiatedBridgeVersion.current ?? launchInfo?.bridgeVersions[0] ?? UI_BRIDGE_VERSION,
         pluginId: state.manifest.id,
         contributionId: contribution.contributionId,
         nonce: nonce.current,
-      })
+      }, negotiatedBridgeVersion.current ? [] : launchInfo?.bridgeVersions ?? [])
       if (validation === 'ignore') return
       const message = event.data as Partial<PluginUiMessage>
 
       if (validation === 'bridge-version-mismatch') {
+        if (
+          message.type === 'ready'
+          && negotiatedBridgeVersion.current !== null
+          && typeof message.bridgeVersion === 'string'
+          && launchInfo?.bridgeVersions.includes(message.bridgeVersion)
+        ) {
+          // A multi-version plugin may answer more than one init candidate; keep the first choice.
+          return
+        }
         if (handshakeTimer.current !== null) {
           window.clearTimeout(handshakeTimer.current)
           handshakeTimer.current = null
@@ -459,6 +470,20 @@ export function PluginSurface({
       }
 
       if (message.type === 'ready') {
+        if (
+          typeof message.bridgeVersion !== 'string'
+          || !launchInfo?.bridgeVersions.includes(message.bridgeVersion)
+          || (negotiatedBridgeVersion.current !== null && negotiatedBridgeVersion.current !== message.bridgeVersion)
+        ) {
+          if (handshakeTimer.current !== null) {
+            window.clearTimeout(handshakeTimer.current)
+            handshakeTimer.current = null
+          }
+          setReady(false)
+          setBridgeError(t('pluginPage.bridgeMismatch'))
+          return
+        }
+        negotiatedBridgeVersion.current = message.bridgeVersion
         if (handshakeTimer.current !== null) {
           window.clearTimeout(handshakeTimer.current)
           handshakeTimer.current = null
@@ -559,7 +584,7 @@ export function PluginSurface({
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
-  }, [active, contribution.contributionId, followsTheme, onOpenView, providesSidebar, resolvedTheme, sendToPlugin, state.manifest.id])
+  }, [active, contribution.contributionId, followsTheme, launchInfo, onOpenView, providesSidebar, resolvedTheme, sendToPlugin, state.manifest.id])
 
   useEffect(() => {
     if (!ready) return
@@ -608,21 +633,34 @@ export function PluginSurface({
   const initializeFrame = () => {
     setReady(false)
     setBridgeError('')
+    negotiatedBridgeVersion.current = null
+    // A fresh nonce binds each iframe load to its own handshake session.
+    nonce.current = crypto.randomUUID()
     subscribedTopics.current.clear()
     if (handshakeTimer.current !== null) window.clearTimeout(handshakeTimer.current)
+    handshakeTimer.current = null
+    const bridgeVersions = launchInfo?.bridgeVersions ?? []
+    if (bridgeVersions.length === 0) {
+      setBridgeError(t('pluginPage.bridgeMismatch'))
+      return
+    }
     handshakeTimer.current = window.setTimeout(() => {
       handshakeTimer.current = null
       setBridgeError(t('pluginPage.bridgeTimeout'))
     }, 10_000)
-    frame.current?.contentWindow?.postMessage({
-      protocol: BRIDGE_PROTOCOL,
-      bridgeVersion: UI_BRIDGE_VERSION,
-      pluginId: state.manifest.id,
-      contributionId: contribution.contributionId,
-      nonce: nonce.current,
-      type: 'host_init',
-      context: { lifecycle: active ? 'active' : 'inactive', surface },
-    }, '*')
+    // Newer SDKs accept the first version; older SDKs ignore it and accept their own version.
+    // All candidates come from Core's supported set intersected with the plugin's declared range.
+    for (const bridgeVersion of bridgeVersions) {
+      frame.current?.contentWindow?.postMessage({
+        protocol: BRIDGE_PROTOCOL,
+        bridgeVersion,
+        pluginId: state.manifest.id,
+        contributionId: contribution.contributionId,
+        nonce: nonce.current,
+        type: 'host_init',
+        context: { lifecycle: active ? 'active' : 'inactive', surface },
+      }, '*')
+    }
   }
 
   const retry = () => {
@@ -633,7 +671,7 @@ export function PluginSurface({
     setReady(false)
     setBridgeError('')
     if (loaderFailure) {
-      setUrl('')
+      setLaunchInfo(null)
       setLoaderFailure('')
       setLoadGeneration((value) => value + 1)
     } else {

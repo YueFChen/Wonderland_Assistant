@@ -19,8 +19,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use wonderland_kernel::logging::warn;
 use wonderland_plugin_protocol::{
-    PluginError, PluginErrorMessage, PluginEvent, PluginHello, PluginRequest, PluginResult,
-    PluginRuntimeState,
+    PROTOCOL_ID, PROTOCOL_VERSION, PluginError, PluginErrorMessage, PluginEvent, PluginHello,
+    PluginRequest, PluginResult, PluginRuntimeState,
 };
 
 use crate::plugin_manager::PluginManager;
@@ -29,7 +29,6 @@ const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_REQUESTS_PER_SESSION: usize = 65_536;
-const MAX_PICKED_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PICKED_FILE_CHUNK_BYTES: u64 = 1024 * 1024;
 const MAX_PICKED_FILE_INLINE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_EXPORTED_FILE_BYTES: usize = 20 * 1024 * 1024;
@@ -46,6 +45,7 @@ pub(crate) struct PluginProcess {
     alive: AtomicBool,
     plugin_id: String,
     granted_capabilities: HashSet<String>,
+    network_public_hosts: Vec<String>,
     data_dir: PathBuf,
     export_dir: PathBuf,
     picked_files: Mutex<HashMap<String, PickedFile>>,
@@ -125,6 +125,7 @@ impl PluginProcess {
             alive: AtomicBool::new(true),
             plugin_id: plugin_id.clone(),
             granted_capabilities: granted_capabilities.iter().cloned().collect(),
+            network_public_hosts: state.manifest.network_public_hosts.clone(),
             data_dir,
             export_dir: documents_dir
                 .join("Wonderland Assistant")
@@ -148,8 +149,8 @@ impl PluginProcess {
             })?;
 
         let hello = json!({
-            "protocol": "wonderland-plugin",
-            "version": "1.0.0",
+            "protocol": PROTOCOL_ID,
+            "version": PROTOCOL_VERSION,
             "type": "hello",
             "role": "host",
             "pluginId": state.manifest.id,
@@ -169,8 +170,8 @@ impl PluginProcess {
                 message,
                 details: None,
             })?;
-        if hello.protocol != "wonderland-plugin"
-            || hello.version != "1.0.0"
+        if hello.protocol != PROTOCOL_ID
+            || hello.version != PROTOCOL_VERSION
             || hello.message_type != "hello"
             || hello.role != "plugin"
             || hello.plugin_id != state.manifest.id
@@ -236,8 +237,8 @@ impl PluginProcess {
             pending.insert(request_id.to_owned(), tx);
         }
         let frame = json!({
-            "protocol": "wonderland-plugin",
-            "version": "1.0.0",
+            "protocol": PROTOCOL_ID,
+            "version": PROTOCOL_VERSION,
             "type": "request",
             "id": request_id,
             "method": method,
@@ -277,8 +278,8 @@ impl PluginProcess {
             ));
         }
         self.write_frame(&json!({
-            "protocol": "wonderland-plugin",
-            "version": "1.0.0",
+            "protocol": PROTOCOL_ID,
+            "version": PROTOCOL_VERSION,
             "type": "cancel",
             "id": request_id,
         }))
@@ -591,15 +592,15 @@ fn read_stdout(
                 };
                 let reply = match process.host_service(&app, &request.method, &request.params) {
                     Ok(result) => json!({
-                        "protocol": "wonderland-plugin",
-                        "version": "1.0.0",
+                        "protocol": PROTOCOL_ID,
+                        "version": PROTOCOL_VERSION,
                         "type": "result",
                         "id": request.id,
                         "result": result,
                     }),
                     Err(error) => json!({
-                        "protocol": "wonderland-plugin",
-                        "version": "1.0.0",
+                        "protocol": PROTOCOL_ID,
+                        "version": PROTOCOL_VERSION,
                         "type": "error",
                         "id": request.id,
                         "error": error,
@@ -673,7 +674,7 @@ impl PluginProcess {
         match method {
             "core.account.snapshot" => account_snapshot(app),
             "core.account.authed_get" => account_authed_get(app, params),
-            "core.network.public" => network_public(params),
+            "core.network.public" => network_public(params, &self.network_public_hosts),
             "core.network.model" => self.network_model(params),
             "core.secrets.plugin.get" => self.secret_get(params),
             "core.secrets.plugin.set" => self.secret_set(params),
@@ -724,33 +725,43 @@ impl PluginProcess {
     }
 
     fn pick_file(&self, app: &AppHandle, params: &Value) -> Result<Value, PluginError> {
-        let extensions = params
-            .get("extensions")
-            .and_then(Value::as_array)
-            .filter(|items| !items.is_empty() && items.len() <= 8)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "File picker extensions are invalid."))?
-            .iter()
-            .map(|item| item.as_str())
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "File picker extensions are invalid."))?;
+        let extensions = match params.get("extensions") {
+            None => Vec::new(),
+            Some(value) => value
+                .as_array()
+                .filter(|items| items.len() <= 128)
+                .ok_or_else(|| {
+                    plugin_error("INVALID_INPUT", "File picker extensions are invalid.")
+                })?
+                .iter()
+                .map(|item| item.as_str())
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    plugin_error("INVALID_INPUT", "File picker extensions are invalid.")
+                })?,
+        };
         if extensions.iter().any(|extension| {
-            !matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "json" | "csv" | "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
-            )
+            extension.is_empty()
+                || extension.len() > 32
+                || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
         }) {
-            return Err(plugin_error("INVALID_INPUT", "File type is not supported."));
+            return Err(plugin_error(
+                "INVALID_INPUT",
+                "File picker extensions are invalid.",
+            ));
         }
-        let max_bytes = params
-            .get("maxBytes")
-            .and_then(Value::as_u64)
-            .filter(|size| (1..=MAX_PICKED_FILE_BYTES).contains(size))
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "File size limit is invalid."))?;
-        let file = app
-            .dialog()
-            .file()
-            .add_filter("Supported files", &extensions)
-            .blocking_pick_file();
+        let max_bytes = match params.get("maxBytes") {
+            None => u64::MAX,
+            Some(value) => value
+                .as_u64()
+                .filter(|size| *size > 0)
+                .ok_or_else(|| plugin_error("INVALID_INPUT", "File size limit is invalid."))?,
+        };
+        let mut dialog = app.dialog().file();
+        if !extensions.is_empty() {
+            dialog = dialog.add_filter("Plugin files", &extensions);
+        }
+        let file = dialog.blocking_pick_file();
         let Some(file) = file else {
             return Ok(json!({ "cancelled": true }));
         };
@@ -778,18 +789,17 @@ impl PluginProcess {
             .and_then(|extension| extension.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if !extensions
-            .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(&extension))
+        if !extensions.is_empty()
+            && !extensions
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&extension))
         {
             return Err(plugin_error(
                 "INVALID_INPUT",
                 "Selected file type does not match the requested file types.",
             ));
         }
-        let mime_type = file_mime_type(&extension)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Selected file type is not supported."))?
-            .to_owned();
+        let mime_type = file_mime_type(&extension).to_owned();
         let token = file_handle_token()?;
         let mut picked_files = self
             .picked_files
@@ -868,12 +878,19 @@ impl PluginProcess {
             plugin_error("INTERNAL", &format!("Cannot read selected file: {error}"))
         })?;
         let mut bytes = Vec::with_capacity(metadata.len().min(picked.max_bytes) as usize);
-        file.take(picked.max_bytes + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| {
-                plugin_error("INTERNAL", &format!("Cannot read selected file: {error}"))
-            })?;
-        if bytes.len() as u64 > picked.max_bytes {
+        file.take(
+            picked
+                .max_bytes
+                .min(MAX_PICKED_FILE_INLINE_BYTES)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            plugin_error("INTERNAL", &format!("Cannot read selected file: {error}"))
+        })?;
+        if bytes.len() as u64 > picked.max_bytes
+            || bytes.len() as u64 > MAX_PICKED_FILE_INLINE_BYTES
+        {
             return Err(plugin_error(
                 "RESOURCE_LIMIT",
                 "Selected file exceeds its size limit.",
@@ -1296,7 +1313,7 @@ fn account_authed_get(app: &AppHandle, params: &Value) -> Result<Value, PluginEr
     Ok(json!({ "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
 }
 
-fn network_public(params: &Value) -> Result<Value, PluginError> {
+fn network_public(params: &Value, allowed_hosts: &[String]) -> Result<Value, PluginError> {
     let method = params
         .get("method")
         .and_then(Value::as_str)
@@ -1305,7 +1322,11 @@ fn network_public(params: &Value) -> Result<Value, PluginError> {
     let url = params
         .get("url")
         .and_then(Value::as_str)
-        .filter(|url| url.len() <= 2048 && url.starts_with("https://"))
+        .filter(|url| {
+            url.len() <= 2048
+                && (url.starts_with("https://")
+                    || allowed_hosts.is_empty() && url.starts_with("http://"))
+        })
         .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network URL is invalid."))?;
     let headers = params
         .get("headers")
@@ -1370,7 +1391,7 @@ fn network_public(params: &Value) -> Result<Value, PluginError> {
         .collect::<Result<Vec<_>, PluginError>>()?;
     let bytes = match method {
         "GET" => tauri::async_runtime::block_on(
-            wonderland_net::HttpClient::new()
+            wonderland_net::HttpClient::with_allowed_hosts(allowed_hosts.to_vec())
                 .map_err(|_| plugin_error("INTERNAL", "Public network client is unavailable."))?
                 .get_bytes(
                     url,
@@ -1394,7 +1415,7 @@ fn network_public(params: &Value) -> Result<Value, PluginError> {
                 .filter(|body| body.len() <= 1_048_576)
                 .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network body is invalid."))?;
             tauri::async_runtime::block_on(
-                wonderland_net::HttpClient::new()
+                wonderland_net::HttpClient::with_allowed_hosts(allowed_hosts.to_vec())
                     .map_err(|_| plugin_error("INTERNAL", "Public network client is unavailable."))?
                     .post_json(
                         url,
@@ -1471,16 +1492,16 @@ fn file_handle_token() -> Result<String, PluginError> {
     Ok(hex::encode(bytes))
 }
 
-fn file_mime_type(extension: &str) -> Option<&'static str> {
+fn file_mime_type(extension: &str) -> &'static str {
     match extension {
-        "json" => Some("application/json"),
-        "csv" => Some("text/csv"),
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "webp" => Some("image/webp"),
-        "gif" => Some("image/gif"),
-        "bmp" => Some("image/bmp"),
-        _ => None,
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
     }
 }
 
@@ -1501,14 +1522,14 @@ fn safe_export_name(name: &str) -> bool {
 }
 
 fn valid_envelope(frame: &Value) -> bool {
-    frame.get("protocol").and_then(Value::as_str) == Some("wonderland-plugin")
-        && frame.get("version").and_then(Value::as_str) == Some("1.0.0")
+    frame.get("protocol").and_then(Value::as_str) == Some(PROTOCOL_ID)
+        && frame.get("version").and_then(Value::as_str) == Some(PROTOCOL_VERSION)
         && frame.get("type").and_then(Value::as_str).is_some()
 }
 
 fn valid_message(protocol: &str, version: &str, message_type: &str) -> bool {
-    protocol == "wonderland-plugin"
-        && version == "1.0.0"
+    protocol == PROTOCOL_ID
+        && version == PROTOCOL_VERSION
         && matches!(
             message_type,
             "hello" | "request" | "result" | "error" | "event" | "cancel"

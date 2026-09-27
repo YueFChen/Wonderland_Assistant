@@ -1,6 +1,8 @@
+import { UI_BRIDGE_PROTOCOL, UI_BRIDGE_VERSION } from '@wonderland/plugin-protocol'
+
+export { UI_BRIDGE_PROTOCOL, UI_BRIDGE_VERSION }
+
 /** Browser-only client for the versioned UI Host Bridge. It never imports Core React state. */
-export const UI_BRIDGE_PROTOCOL = 'wonderland-plugin-ui'
-export const UI_BRIDGE_VERSION = '1.1.0'
 
 export interface PluginUiEvent {
   pluginId: string
@@ -117,6 +119,7 @@ export function createPluginHostClient(pluginId: string): PluginHostClient {
     if (
       !message
       || message.protocol !== UI_BRIDGE_PROTOCOL
+      // Core sends candidates newest first; this SDK accepts only the exact contract it implements.
       || message.bridgeVersion !== UI_BRIDGE_VERSION
       || message.pluginId !== pluginId
       || message.contributionId !== contributionId

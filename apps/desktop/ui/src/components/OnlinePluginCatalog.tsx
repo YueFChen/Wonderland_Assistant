@@ -47,11 +47,13 @@ export function OnlinePluginCatalog({ onInstalled }: {
         ? `${installed.installationSource.kind === 'catalog' ? 'GitHub' : '本地'}：${installed.installationSource.origin}`
         : installed ? t('settings.plugins.source.unknown') : t('settings.plugins.source.none')
       const requested = entry.capabilities.length > 0
-        ? entry.capabilities.map((capability) => `• ${capability}`).join('\n')
+        ? entry.capabilities.map((capability) => capability === 'network.public'
+          ? `• ${capability}：${entry.networkPublicHosts.length > 0 ? entry.networkPublicHosts.join('、') : '全部 HTTP(S) 目标'}`
+          : `• ${capability}`).join('\n')
         : t('settings.plugins.catalog.noCapabilities')
       const serviceLines = [
         ...entry.provides.map((service) => `• ${service.id}@${service.version}：${service.methods.join('、')}`),
-        ...entry.requires.map((service) => `• ${service.id}（${service.minVersion} ≤ version < ${service.maxVersionExclusive}，${service.optional ? '可选' : '必需'}）：${service.methods.join('、')}`),
+        ...entry.requires.map((service) => `• ${service.id}（${service.minVersion} ≤ version < ${service.maxVersionExclusive}，${service.optional ? '可选' : '必需'}）：${(service.methods ?? []).join('、')}`),
       ]
       const requestedServices = serviceLines.length > 0
         ? serviceLines.join('\n')

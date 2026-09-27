@@ -10,7 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use wonderland_plugin_protocol::{
-    PluginManifest, PluginUiCommandEffect, PluginUiContributionKind, UI_BRIDGE_VERSION,
+    PROTOCOL_SUPPORTED_VERSIONS, PluginManifest, PluginUiCommandEffect, PluginUiContributionKind,
+    UI_BRIDGE_SUPPORTED_VERSIONS, UI_BRIDGE_VERSION,
 };
 use zip::ZipArchive;
 
@@ -105,11 +106,13 @@ pub(crate) fn install_archive(
     source: &Path,
     installed_root: &Path,
     overwrite: bool,
+    reviewed_manifest: &PluginManifest,
 ) -> Result<InspectedPlugin, String> {
     let staging = staging_directory(installed_root)?;
     let result = (|| {
         extract_archive(source, &staging)?;
         let inspected = inspect_directory(&staging, false)?;
+        ensure_reviewed_manifest(reviewed_manifest, &inspected.manifest)?;
         commit_staging(&staging, installed_root, &inspected.manifest, overwrite)?;
         let destination = install_path(installed_root, &inspected.manifest);
         inspect_directory(&destination, false)
@@ -124,6 +127,7 @@ pub(crate) fn install_development_directory(
     source: &Path,
     installed_root: &Path,
     overwrite: bool,
+    reviewed_manifest: &PluginManifest,
 ) -> Result<InspectedPlugin, String> {
     if !cfg!(debug_assertions) {
         return Err("Development-directory installation is disabled in release builds.".to_owned());
@@ -133,6 +137,7 @@ pub(crate) fn install_development_directory(
     let result = (|| {
         copy_package_tree(source, &staging)?;
         let inspected = inspect_directory(&staging, true)?;
+        ensure_reviewed_manifest(reviewed_manifest, &inspected.manifest)?;
         commit_staging(&staging, installed_root, &inspected.manifest, overwrite)?;
         let destination = install_path(installed_root, &inspected.manifest);
         inspect_directory(&destination, true)
@@ -141,6 +146,21 @@ pub(crate) fn install_development_directory(
         let _ = fs::remove_dir_all(&staging);
     }
     result
+}
+
+pub(crate) fn ensure_reviewed_manifest(
+    reviewed: &PluginManifest,
+    actual: &PluginManifest,
+) -> Result<(), String> {
+    let reviewed = serde_json::to_value(reviewed)
+        .map_err(|_| "Cannot compare the reviewed plugin manifest.".to_owned())?;
+    let actual = serde_json::to_value(actual)
+        .map_err(|_| "Cannot compare the installed plugin manifest.".to_owned())?;
+    if reviewed == actual {
+        Ok(())
+    } else {
+        Err("Plugin manifest changed after review; review the package again.".to_owned())
+    }
 }
 
 pub(crate) fn scan_installed_root(
@@ -841,6 +861,28 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
             ));
         }
     }
+    if manifest.network_public_hosts.len() > 32
+        || manifest
+            .network_public_hosts
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != manifest.network_public_hosts.len()
+        || manifest
+            .network_public_hosts
+            .iter()
+            .any(|host| !wonderland_net::valid_public_host(host))
+        || (!manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == "network.public")
+            && !manifest.network_public_hosts.is_empty())
+    {
+        return Err(
+            "Plugin public network hosts must be unique, valid, and declared with network.public."
+                .to_owned(),
+        );
+    }
     if manifest.provides.len() > 32 || manifest.requires.len() > 32 {
         return Err("Plugin declares too many services.".to_owned());
     }
@@ -896,9 +938,11 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
                 requirement.id
             ));
         }
-        if requirement.methods.is_empty() || requirement.methods.len() > 128 {
+        // Empty is accepted for schema-v2 manifests written before method requirements existed.
+        // It identifies the service dependency but grants no callable methods.
+        if requirement.methods.len() > 128 {
             return Err(format!(
-                "Required service '{}' must declare between one and 128 methods.",
+                "Required service '{}' cannot declare more than 128 methods.",
                 requirement.id
             ));
         }
@@ -962,11 +1006,35 @@ fn validate_provided_service_methods(
     Ok(())
 }
 
+/// Returns the Core-supported versions a plugin declares it can use, newest first.
+/// Compatibility checks and UI launch negotiation must use this same range rule.
+pub(crate) fn supported_versions_in_range(
+    supported_versions: &[&str],
+    min_version: &str,
+    max_version_exclusive: &str,
+) -> Vec<String> {
+    let (Ok(min), Ok(max)) = (
+        Version::parse(min_version),
+        Version::parse(max_version_exclusive),
+    ) else {
+        return Vec::new();
+    };
+    if min >= max {
+        return Vec::new();
+    }
+
+    supported_versions
+        .iter()
+        .rev()
+        .filter(|version| {
+            Version::parse(version).is_ok_and(|version| version >= min && version < max)
+        })
+        .map(|version| (*version).to_owned())
+        .collect()
+}
+
 fn is_compatible(manifest: &PluginManifest) -> bool {
     let Ok(core) = Version::parse(env!("CARGO_PKG_VERSION")) else {
-        return false;
-    };
-    let Ok(protocol) = Version::parse(wonderland_plugin_protocol::PROTOCOL_VERSION) else {
         return false;
     };
     let Ok(min_core) = Version::parse(&manifest.host_compatibility.min_core_version) else {
@@ -976,23 +1044,19 @@ fn is_compatible(manifest: &PluginManifest) -> bool {
     else {
         return false;
     };
-    let Ok(min_protocol) = Version::parse(&manifest.host_compatibility.protocol.min_version) else {
-        return false;
-    };
-    let Ok(max_protocol) =
-        Version::parse(&manifest.host_compatibility.protocol.max_version_exclusive)
-    else {
-        return false;
-    };
+    let protocol_compatible = !supported_versions_in_range(
+        PROTOCOL_SUPPORTED_VERSIONS,
+        &manifest.host_compatibility.protocol.min_version,
+        &manifest.host_compatibility.protocol.max_version_exclusive,
+    )
+    .is_empty();
     let ui_compatible = manifest.ui.as_ref().is_none_or(|ui| {
-        let (Ok(ui_bridge), Ok(min_ui_bridge), Ok(max_ui_bridge)) = (
-            Version::parse(UI_BRIDGE_VERSION),
-            Version::parse(&ui.bridge_compatibility.min_version),
-            Version::parse(&ui.bridge_compatibility.max_version_exclusive),
-        ) else {
-            return false;
-        };
-        ui_bridge >= min_ui_bridge && ui_bridge < max_ui_bridge
+        !supported_versions_in_range(
+            UI_BRIDGE_SUPPORTED_VERSIONS,
+            &ui.bridge_compatibility.min_version,
+            &ui.bridge_compatibility.max_version_exclusive,
+        )
+        .is_empty()
     });
     let expected_os = if cfg!(windows) {
         "windows"
@@ -1007,8 +1071,7 @@ fn is_compatible(manifest: &PluginManifest) -> bool {
     };
     core >= min_core
         && core < max_core
-        && protocol >= min_protocol
-        && protocol < max_protocol
+        && protocol_compatible
         && ui_compatible
         && manifest.platform.os == expected_os
         && manifest.platform.architecture == expected_arch
@@ -1236,6 +1299,113 @@ fn validate_hex_hash(value: &str) -> bool {
 mod tests {
     use super::*;
     use wonderland_plugin_protocol::{PluginUiCommand, PluginUiCommandEffect};
+
+    #[test]
+    fn public_network_scope_is_optional_but_declared_hosts_are_exact() {
+        let mut manifest: PluginManifest = serde_json::from_str(include_str!(
+            "../tests/fixtures/comment_collector_manifest.json"
+        ))
+        .unwrap();
+        manifest.capabilities.push("network.public".to_owned());
+        validate_manifest(&manifest).unwrap();
+
+        manifest.network_public_hosts = vec!["api.example.com".to_owned()];
+        validate_manifest(&manifest).unwrap();
+        for invalid in ["*.example.com", "API.example.com", "api.example.com:443"] {
+            manifest.network_public_hosts = vec![invalid.to_owned()];
+            assert!(validate_manifest(&manifest).is_err(), "{invalid}");
+        }
+        manifest.network_public_hosts = vec!["api.example.com".to_owned(); 2];
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn install_rejects_a_manifest_changed_after_review() {
+        let reviewed: PluginManifest = serde_json::from_str(include_str!(
+            "../tests/fixtures/comment_collector_manifest.json"
+        ))
+        .unwrap();
+        let mut actual = reviewed.clone();
+        ensure_reviewed_manifest(&reviewed, &actual).unwrap();
+        actual.capabilities.push("network.public".to_owned());
+        assert!(ensure_reviewed_manifest(&reviewed, &actual).is_err());
+        actual
+            .network_public_hosts
+            .push("api.example.com".to_owned());
+        assert!(ensure_reviewed_manifest(&reviewed, &actual).is_err());
+    }
+
+    #[test]
+    fn supported_protocol_ranges_match_versions_the_runtime_can_speak() {
+        let core_protocols =
+            supported_versions_in_range(PROTOCOL_SUPPORTED_VERSIONS, "0.0.0", "999.0.0");
+        let core_bridges =
+            supported_versions_in_range(UI_BRIDGE_SUPPORTED_VERSIONS, "0.0.0", "999.0.0");
+        assert_eq!(
+            core_protocols.first().map(String::as_str),
+            Some(wonderland_plugin_protocol::PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            core_bridges.first().map(String::as_str),
+            Some(UI_BRIDGE_VERSION)
+        );
+        assert_eq!(
+            supported_versions_in_range(&["1.0.0", "1.1.0"], "1.0.0", "2.0.0"),
+            ["1.1.0", "1.0.0"]
+        );
+        assert_eq!(
+            supported_versions_in_range(&["1.0.0", "1.1.0"], "1.0.0", "1.1.0"),
+            ["1.0.0"]
+        );
+        assert!(supported_versions_in_range(&["1.0.0"], "1.1.0", "2.0.0").is_empty());
+    }
+
+    #[test]
+    fn bridge_compatibility_keeps_the_previous_minor_available() {
+        assert_eq!(
+            supported_versions_in_range(UI_BRIDGE_SUPPORTED_VERSIONS, "1.0.0", "1.1.0"),
+            ["1.0.0"]
+        );
+        assert_eq!(
+            supported_versions_in_range(UI_BRIDGE_SUPPORTED_VERSIONS, "1.1.0", "2.0.0"),
+            ["1.1.0"]
+        );
+    }
+
+    #[test]
+    fn old_manifest_service_requirements_deserialize_without_methods() {
+        let requirement: wonderland_plugin_protocol::PluginServiceRequirement =
+            serde_json::from_value(serde_json::json!({
+                "id": "wonderland.comments.archive",
+                "minVersion": "1.0.0",
+                "maxVersionExclusive": "2.0.0",
+                "optional": true
+            }))
+            .unwrap();
+        assert!(requirement.methods.is_empty());
+        assert!(
+            serde_json::to_value(requirement)
+                .unwrap()
+                .get("methods")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn range_only_legacy_service_requirement_still_validates() {
+        let mut manifest: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/knowledge_library_manifest.json"
+        ))
+        .unwrap();
+        manifest["requires"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("methods");
+        let manifest: PluginManifest = serde_json::from_value(manifest).unwrap();
+
+        validate_manifest(&manifest).unwrap();
+        assert!(manifest.requires[0].methods.is_empty());
+    }
 
     #[test]
     fn path_validation_rejects_windows_and_traversal_paths() {

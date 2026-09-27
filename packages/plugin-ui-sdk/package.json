@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "dependencies": {
+    "@wonderland/plugin-protocol": "workspace:*"
+  },
   "exports": {
     ".": "./src/index.ts"
   }

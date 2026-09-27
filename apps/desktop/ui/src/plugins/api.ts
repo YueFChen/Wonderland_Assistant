@@ -31,6 +31,7 @@ export interface PluginCatalogEntry {
   uiBridgeCompatibility: { minVersion: string; maxVersionExclusive: string } | null
   platform: { os: string; architecture: string; abi: string }
   capabilities: string[]
+  networkPublicHosts: string[]
   provides: PluginService[]
   requires: PluginServiceRequirement[]
 }
@@ -44,6 +45,12 @@ export interface PluginCatalogSnapshot {
     installedVersion: string | null
     installable: boolean
   }>
+}
+
+export interface PluginUiLaunchInfo {
+  url: string
+  /** Core and the plugin manifest's declared range, newest compatible bridge first. */
+  bridgeVersions: string[]
 }
 
 /** Core 只暴露稳定的插件宿主命令，不按插件业务拆分 Tauri IPC。 */
@@ -61,7 +68,7 @@ export const pluginApi = {
     invoke<PluginRuntimeState[]>('plugins_set_enabled', { pluginId, enabled }),
   setCapabilities: (pluginId: string, capabilities: string[]) =>
     invoke<PluginRuntimeState[]>('plugins_set_capabilities', { pluginId, capabilities }),
-  uiUrl: (pluginId: string) => invoke<string>('plugins_ui_url', { pluginId }),
+  uiUrl: (pluginId: string) => invoke<PluginUiLaunchInfo>('plugins_ui_url', { pluginId }),
   callWithId: <T>(pluginId: string, method: string, params: unknown = {}, requestId: string = crypto.randomUUID()) => {
     return {
       requestId,

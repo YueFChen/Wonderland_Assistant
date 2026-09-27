@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use wonderland_plugin_protocol::PluginServiceResolution;
+use wonderland_plugin_protocol::{PROTOCOL_ID, PROTOCOL_VERSION, PluginServiceResolution};
 
 mod failure;
 pub use failure::PluginFailure;
@@ -23,8 +23,9 @@ pub use account::{AccountSnapshot, AccountStatus, AccountSummary, GameRoleSummar
 mod request;
 pub use request::{ActiveRequestGuard, RequestTracker};
 
-const PROTOCOL: &str = "wonderland-plugin";
-const VERSION: &str = "1.0.0";
+// The SDK and Core consume the same protocol version source so wire checks cannot drift.
+const PROTOCOL: &str = PROTOCOL_ID;
+const VERSION: &str = PROTOCOL_VERSION;
 const MAX_FRAME_BYTES: u64 = 32 * 1024 * 1024;
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(60);
 const PLUGIN_SERVICE_TIMEOUT: Duration = Duration::from_secs(35);

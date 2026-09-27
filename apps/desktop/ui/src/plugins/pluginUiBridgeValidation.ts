@@ -8,10 +8,11 @@ export interface PluginUiBridgeIdentity {
 
 export type PluginUiBridgeValidation = 'accept' | 'bridge-version-mismatch' | 'ignore'
 
-/** Validates the identity and version fields shared by all plugin UI bridge messages. */
+/** Validates bridge identity; negotiable versions apply only to the initial ready response. */
 export function validatePluginUiBridgeMessage(
   value: unknown,
   expected: PluginUiBridgeIdentity,
+  negotiableBridgeVersions: readonly string[] = [],
 ): PluginUiBridgeValidation {
   if (typeof value !== 'object' || value === null) return 'ignore'
   const message = value as Partial<PluginUiBridgeIdentity> & { type?: unknown }
@@ -23,7 +24,10 @@ export function validatePluginUiBridgeMessage(
   ) return 'ignore'
 
   if (message.bridgeVersion !== expected.bridgeVersion) {
-    return message.type === 'ready' ? 'bridge-version-mismatch' : 'ignore'
+    if (message.type !== 'ready') return 'ignore'
+    return negotiableBridgeVersions.includes(message.bridgeVersion ?? '')
+      ? 'accept'
+      : 'bridge-version-mismatch'
   }
   return 'accept'
 }

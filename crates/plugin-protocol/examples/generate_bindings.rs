@@ -7,6 +7,14 @@ const HEADER: &str = "// Generated from Rust by crates/plugin-protocol/examples/
 fn main() {
     let cfg = Config::default();
     let mut output = String::from(HEADER);
+    output.push_str(&format!(
+        "export const UI_BRIDGE_PROTOCOL = {} as const\n",
+        serde_json::to_string(UI_BRIDGE_PROTOCOL).unwrap()
+    ));
+    output.push_str(&format!(
+        "export const UI_BRIDGE_VERSION = {} as const\n",
+        serde_json::to_string(UI_BRIDGE_VERSION).unwrap()
+    ));
     macro_rules! emit {
         ($($ty:ty),* $(,)?) => { $(output.push_str("export "); output.push_str(&<$ty>::decl(&cfg)); output.push('\n');)* };
     }

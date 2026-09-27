@@ -25,6 +25,34 @@ test('reports a bridge mismatch only for an otherwise matching ready message', (
   )
 })
 
+test('accepts a ready version from the host-negotiated compatibility range', () => {
+  const current = { ...expected, bridgeVersion: '1.1.0' }
+  assert.equal(
+    validatePluginUiBridgeMessage(
+      { ...current, bridgeVersion: '1.0.0', type: 'ready' },
+      current,
+      ['1.1.0', '1.0.0'],
+    ),
+    'accept',
+  )
+  assert.equal(
+    validatePluginUiBridgeMessage(
+      { ...current, bridgeVersion: '0.9.0', type: 'ready' },
+      current,
+      ['1.1.0', '1.0.0'],
+    ),
+    'bridge-version-mismatch',
+  )
+  assert.equal(
+    validatePluginUiBridgeMessage(
+      { ...current, bridgeVersion: '1.0.0', type: 'publish' },
+      current,
+      ['1.1.0', '1.0.0'],
+    ),
+    'ignore',
+  )
+})
+
 test('ignores messages from a different contribution or nonce', () => {
   assert.equal(
     validatePluginUiBridgeMessage({ ...expected, contributionId: 'other', type: 'ready' }, expected),

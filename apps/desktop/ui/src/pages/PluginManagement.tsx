@@ -282,7 +282,9 @@ function PluginCard({ state, busy, onToggle, onUninstall, onCapabilitiesChange }
                   }}
                   className="h-3.5 w-3.5 accent-brand-500"
                 />
-                <span>{capability}</span>
+                <span>{capability === 'network.public'
+                  ? `${capability}（${state.manifest.networkPublicHosts?.length ? state.manifest.networkPublicHosts.join('、') : '全部 HTTP(S) 目标'}）`
+                  : capability}</span>
               </label>
             ))}
           </fieldset>

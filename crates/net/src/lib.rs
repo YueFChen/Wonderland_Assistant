@@ -27,26 +27,52 @@ const PLUGIN_PACKAGE_MAX_BYTES: usize = 100 * 1024 * 1024;
 /// 固定 UA：米哈游接口对 UA 敏感，不使用随机值以免触发风控。
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
 
-/// 允许出站的主机。
+/// Core account/platform requests keep their own fixed destinations.
 ///
 /// 精确匹配主机名，不接受子域。
-const ALLOWED_HOSTS: &[&str] = &[
+const CORE_PLATFORM_HOSTS: &[&str] = &[
     "api-takumi.mihoyo.com",
     "api-micreator.mihoyo.com",
     "bbs-api.miyoushe.com",
     "act-webstatic.mihoyo.com",
 ];
 
-/// Parse and validate once so the host checked here is the same host reqwest will contact.
-fn ensure_allowed(raw: &str) -> Result<reqwest::Url, KernelError> {
+/// Accept only canonical, exact DNS-style host names in plugin declarations.
+pub fn valid_public_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+/// Parse once so the checked host is the same host reqwest will contact.
+fn ensure_allowed(raw: &str, allowed_hosts: &[String]) -> Result<reqwest::Url, KernelError> {
     let url = reqwest::Url::parse(raw).map_err(|_| KernelError::InvalidInput)?;
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    if url.scheme() == "https"
+    let destination_allowed = if allowed_hosts.is_empty() {
+        matches!(url.scheme(), "http" | "https") && !host.is_empty()
+    } else {
+        url.scheme() == "https"
+            && url.port().is_none()
+            && allowed_hosts.iter().any(|allowed| allowed == &host)
+    };
+    if destination_allowed
         && url.username().is_empty()
         && url.password().is_none()
-        && url.port().is_none()
         && url.fragment().is_none()
-        && ALLOWED_HOSTS.contains(&host.as_str())
     {
         Ok(url)
     } else {
@@ -59,12 +85,26 @@ fn ensure_allowed(raw: &str) -> Result<reqwest::Url, KernelError> {
 #[derive(Clone)]
 pub struct HttpClient {
     cached: Arc<RwLock<Option<(u64, reqwest::Client)>>>,
+    allowed_hosts: Arc<Vec<String>>,
 }
 
 impl HttpClient {
     pub fn new() -> Result<Self, KernelError> {
+        Self::with_allowed_hosts(
+            CORE_PLATFORM_HOSTS
+                .iter()
+                .map(|host| (*host).to_owned())
+                .collect(),
+        )
+    }
+
+    pub fn with_allowed_hosts(allowed_hosts: Vec<String>) -> Result<Self, KernelError> {
+        if allowed_hosts.iter().any(|host| !valid_public_host(host)) {
+            return Err(KernelError::InvalidInput);
+        }
         let client = Self {
             cached: Arc::new(RwLock::new(None)),
+            allowed_hosts: Arc::new(allowed_hosts),
         };
         client.inner()?;
         Ok(client)
@@ -107,7 +147,7 @@ impl HttpClient {
         headers: &[(&str, &str)],
         query: &[(String, String)],
     ) -> Result<Vec<u8>, KernelError> {
-        let url = ensure_allowed(url)?;
+        let url = ensure_allowed(url, &self.allowed_hosts)?;
         let inner = self.inner()?;
         for attempt in 0..3 {
             let mut request = inner.get(url.clone()).query(query);
@@ -150,7 +190,7 @@ impl HttpClient {
         url: &str,
         headers: &[(&str, &str)],
     ) -> Result<T, KernelError> {
-        let url = ensure_allowed(url)?;
+        let url = ensure_allowed(url, &self.allowed_hosts)?;
         let mut request = self.inner()?.get(url);
         for (name, value) in headers {
             request = request.header(*name, *value);
@@ -176,7 +216,7 @@ impl HttpClient {
         headers: &[(&str, &str)],
         body: &str,
     ) -> Result<Vec<u8>, KernelError> {
-        let url = ensure_allowed(url)?;
+        let url = ensure_allowed(url, &self.allowed_hosts)?;
         let mut request = self
             .inner()?
             .post(url)
@@ -668,7 +708,8 @@ mod tests {
 
     #[test]
     fn outbound_allowlist_checks_the_canonical_url_authority() {
-        let allowed = ensure_allowed("https://API-TAKUMI.MIHOYO.COM:443/path").unwrap();
+        let hosts = vec!["api-takumi.mihoyo.com".to_owned()];
+        let allowed = ensure_allowed("https://API-TAKUMI.MIHOYO.COM:443/path", &hosts).unwrap();
         assert_eq!(allowed.host_str(), Some("api-takumi.mihoyo.com"));
 
         for raw in [
@@ -679,10 +720,50 @@ mod tests {
             "https://api-takumi.mihoyo.com/path#fragment",
         ] {
             assert!(
-                matches!(ensure_allowed(raw), Err(KernelError::InvalidInput)),
+                matches!(ensure_allowed(raw, &hosts), Err(KernelError::InvalidInput)),
                 "URL should be rejected: {raw}"
             );
         }
+        assert!(matches!(
+            ensure_allowed("https://bbs-api.miyoushe.com/", &hosts),
+            Err(KernelError::InvalidInput)
+        ));
+        assert!(
+            ensure_allowed(
+                "https://api.example.com/resource",
+                &["api.example.com".to_owned()]
+            )
+            .is_ok()
+        );
+        assert!(valid_public_host("api.example.com"));
+        for host in [
+            "*.example.com",
+            "EXAMPLE.com",
+            "example.com:443",
+            "bad..example",
+            "-bad.example",
+        ] {
+            assert!(!valid_public_host(host));
+        }
+    }
+
+    #[test]
+    fn empty_host_scope_allows_http_targets_but_not_non_http_urls() {
+        let unrestricted = Vec::new();
+        for url in [
+            "http://127.0.0.1:8080/",
+            "https://api.example.com:8443/path",
+        ] {
+            assert!(ensure_allowed(url, &unrestricted).is_ok(), "{url}");
+        }
+        for url in [
+            "file:///C:/secret",
+            "ftp://example.com/file",
+            "https://user@example.com/",
+        ] {
+            assert!(ensure_allowed(url, &unrestricted).is_err(), "{url}");
+        }
+        assert!(ensure_allowed("http://127.0.0.1:8080/", &["127.0.0.1".to_owned()]).is_err());
     }
 
     #[tokio::test]

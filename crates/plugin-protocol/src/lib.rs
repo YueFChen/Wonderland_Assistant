@@ -9,7 +9,15 @@ use ts_rs::TS;
 
 pub const PROTOCOL_ID: &str = "wonderland-plugin";
 pub const PROTOCOL_VERSION: &str = "1.0.0";
+/// Protocol versions the current Core runtime can actually speak, in ascending order.
+/// Keep this explicit so bumping `PROTOCOL_VERSION` cannot silently drop older support.
+pub const PROTOCOL_SUPPORTED_VERSIONS: &[&str] = &["1.0.0"];
+pub const UI_BRIDGE_PROTOCOL: &str = "wonderland-plugin-ui";
+/// The newest UI bridge contract implemented by Core and the bundled UI SDK.
 pub const UI_BRIDGE_VERSION: &str = "1.1.0";
+/// List every bridge version this host still implements, in ascending order.
+/// Keep the list explicit: a version bump must not silently remove old plugin compatibility.
+pub const UI_BRIDGE_SUPPORTED_VERSIONS: &[&str] = &["1.0.0", "1.1.0"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
@@ -31,6 +39,9 @@ pub struct PluginManifest {
     pub backend: PluginBackend,
     pub contract: String,
     pub capabilities: Vec<String>,
+    /// Exact HTTPS hosts available through core.network.public.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_public_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provides: Vec<PluginService>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -59,6 +70,10 @@ pub struct PluginServiceRequirement {
     pub min_version: String,
     pub max_version_exclusive: String,
     pub optional: bool,
+    /// Empty means a legacy manifest declared only a service ID and version range.
+    /// Such a requirement resolves no callable methods until the plugin declares them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "bindings", ts(as = "Option<Vec<String>>", optional))]
     pub methods: Vec<String>,
 }
 

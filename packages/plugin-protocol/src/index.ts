@@ -1,7 +1,18 @@
 // Generated from Rust by crates/plugin-protocol/examples/generate_bindings.rs. Do not edit.
-export type PluginManifest = { manifestVersion: number, id: string, name: string, version: string, description?: string | null, icon?: string | null, hostCompatibility: HostCompatibility, platform: PluginPlatform, ui?: PluginUi | null, backend: PluginBackend, contract: string, capabilities: Array<string>, provides?: Array<PluginService>, requires?: Array<PluginServiceRequirement>, };
+export const UI_BRIDGE_PROTOCOL = "wonderland-plugin-ui" as const
+export const UI_BRIDGE_VERSION = "1.1.0" as const
+export type PluginManifest = { manifestVersion: number, id: string, name: string, version: string, description?: string | null, icon?: string | null, hostCompatibility: HostCompatibility, platform: PluginPlatform, ui?: PluginUi | null, backend: PluginBackend, contract: string, capabilities: Array<string>,
+/**
+ * Exact HTTPS hosts available through core.network.public.
+ */
+networkPublicHosts?: Array<string>, provides?: Array<PluginService>, requires?: Array<PluginServiceRequirement>, };
 export type PluginService = { id: string, version: string, methods: Array<string>, };
-export type PluginServiceRequirement = { id: string, minVersion: string, maxVersionExclusive: string, optional: boolean, methods: Array<string>, };
+export type PluginServiceRequirement = { id: string, minVersion: string, maxVersionExclusive: string, optional: boolean,
+/**
+ * Empty means a legacy manifest declared only a service ID and version range.
+ * Such a requirement resolves no callable methods until the plugin declares them.
+ */
+methods?: Array<string>, };
 export type PluginServiceResolution = { serviceId: string, providerId: string, version: string, methods: Array<string>, };
 export type HostCompatibility = { minCoreVersion: string, maxCoreVersionExclusive: string, protocol: ProtocolCompatibility, };
 export type ProtocolCompatibility = { minVersion: string, maxVersionExclusive: string, };

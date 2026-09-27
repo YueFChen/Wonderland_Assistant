@@ -21,11 +21,11 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use wonderland_kernel::AppContext;
 use wonderland_kernel::logging::warn;
 use wonderland_plugin_protocol::{
-    HostCompatibility, InstallationState, PluginBackend, PluginError, PluginFailure,
-    PluginInstallSource, PluginManifest, PluginPlatform, PluginRuntimeState, PluginService,
-    PluginServiceRequirement, PluginServiceResolution, PluginUi, PluginUiCommand,
+    HostCompatibility, InstallationState, PROTOCOL_SUPPORTED_VERSIONS, PluginBackend, PluginError,
+    PluginFailure, PluginInstallSource, PluginManifest, PluginPlatform, PluginRuntimeState,
+    PluginService, PluginServiceRequirement, PluginServiceResolution, PluginUi, PluginUiCommand,
     PluginUiCommandEffect, PluginUiContribution, PluginUiContributionKind, ProtocolCompatibility,
-    RuntimeState,
+    RuntimeState, UI_BRIDGE_SUPPORTED_VERSIONS,
 };
 
 use crate::{plugin_package, plugin_runtime::PluginProcess};
@@ -63,6 +63,8 @@ struct PluginCatalogEntry {
     platform: PluginPlatform,
     capabilities: Vec<String>,
     #[serde(default)]
+    network_public_hosts: Vec<String>,
+    #[serde(default)]
     provides: Vec<PluginService>,
     #[serde(default)]
     requires: Vec<PluginServiceRequirement>,
@@ -74,6 +76,13 @@ pub struct PluginCatalogSnapshot {
     generated_at: String,
     stale: bool,
     plugins: Vec<PluginCatalogItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginUiLaunchInfo {
+    url: String,
+    bridge_versions: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -450,7 +459,7 @@ impl PluginManager {
         }
         let manifest = plugin_package::manifest_for_install_source(&source)
             .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
-        self.install(source, true, true)?;
+        self.install(source, true, true, Some(&manifest))?;
         self.set_enabled(&manifest.id, true)
     }
 
@@ -503,6 +512,7 @@ impl PluginManager {
             source,
             overwrite,
             Some(&approved_capabilities),
+            Some(&manifest),
             PluginInstallSource {
                 kind: "local".to_owned(),
                 origin: origin.to_string_lossy().into_owned(),
@@ -530,6 +540,11 @@ impl PluginManager {
             && manifest.name == entry.name
             && manifest.version == entry.version
             && manifest_capabilities == catalog_capabilities
+            && manifest
+                .network_public_hosts
+                .iter()
+                .collect::<BTreeSet<_>>()
+                == entry.network_public_hosts.iter().collect::<BTreeSet<_>>()
             && manifest.provides == entry.provides
             && manifest.requires == entry.requires
             && manifest.host_compatibility.min_core_version
@@ -570,6 +585,7 @@ impl PluginManager {
             source,
             true,
             Some(&entry.capabilities),
+            Some(&manifest),
             PluginInstallSource {
                 kind: "catalog".to_owned(),
                 origin: entry.repository_url.clone(),
@@ -584,6 +600,7 @@ impl PluginManager {
         source: PathBuf,
         overwrite: bool,
         approved_source_change: bool,
+        reviewed_manifest: Option<&PluginManifest>,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
         let origin = source.canonicalize().map_err(|error| {
             plugin_error(
@@ -595,6 +612,7 @@ impl PluginManager {
             source,
             overwrite,
             None,
+            reviewed_manifest,
             PluginInstallSource {
                 kind: "local".to_owned(),
                 origin: origin.to_string_lossy().into_owned(),
@@ -609,11 +627,16 @@ impl PluginManager {
         source: PathBuf,
         overwrite: bool,
         approved_capabilities: Option<&[String]>,
+        reviewed_manifest: Option<&PluginManifest>,
         install_source: PluginInstallSource,
         approved_source_change: bool,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
         let source_manifest = plugin_package::manifest_for_install_source(&source)
             .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
+        if let Some(reviewed) = reviewed_manifest {
+            plugin_package::ensure_reviewed_manifest(reviewed, &source_manifest)
+                .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
+        }
         let replacing_same_version = overwrite
             && plugin_package::install_path(&self.inner.installed_root, &source_manifest).exists();
         let (previous_version, previous_source, previous_grants) = {
@@ -672,9 +695,15 @@ impl PluginManager {
                 &source,
                 &self.inner.installed_root,
                 overwrite,
+                &source_manifest,
             )
         } else {
-            plugin_package::install_archive(&source, &self.inner.installed_root, overwrite)
+            plugin_package::install_archive(
+                &source,
+                &self.inner.installed_root,
+                overwrite,
+                &source_manifest,
+            )
         };
         let inspected = match inspected_result {
             Ok(inspected) => inspected,
@@ -1473,7 +1502,7 @@ impl PluginManager {
             .cancel(request_id)
     }
 
-    fn plugin_ui_url(&self, plugin_id: &str) -> Result<String, PluginError> {
+    fn plugin_ui_launch_info(&self, plugin_id: &str) -> Result<PluginUiLaunchInfo, PluginError> {
         let state = self
             .inner
             .state
@@ -1508,12 +1537,32 @@ impl PluginManager {
                 "This service plugin does not provide a user interface.",
             )
         })?;
+        // Offer only versions both implemented by this Core and declared by this plugin.
+        let bridge_versions = plugin_package::supported_versions_in_range(
+            UI_BRIDGE_SUPPORTED_VERSIONS,
+            &ui.bridge_compatibility.min_version,
+            &ui.bridge_compatibility.max_version_exclusive,
+        );
+        if bridge_versions.is_empty() {
+            return Err(plugin_error(
+                "INCOMPATIBLE_CORE",
+                "Plugin UI does not support any bridge version provided by this Core.",
+            ));
+        }
         let origin = if cfg!(windows) {
             "http://plugin-asset.localhost"
         } else {
             "plugin-asset://localhost"
         };
-        Ok(format!("{origin}/{plugin_id}/{}", ui.entry))
+        Ok(PluginUiLaunchInfo {
+            url: format!("{origin}/{plugin_id}/{}", ui.entry),
+            bridge_versions,
+        })
+    }
+
+    fn plugin_ui_url(&self, plugin_id: &str) -> Result<String, PluginError> {
+        self.plugin_ui_launch_info(plugin_id)
+            .map(|launch| launch.url)
     }
 
     fn read_plugin_asset(&self, path: &str, method: &str) -> (u16, String, Vec<u8>) {
@@ -2623,6 +2672,7 @@ fn validate_catalog_entry(entry: &PluginCatalogEntry) -> Result<(), PluginError>
                     .all(|method| valid_service_method(method))
                 && service.methods.iter().collect::<BTreeSet<_>>().len() == service.methods.len()
         })
+        // Range-only dependencies remain valid for schema-v2 entries predating method lists.
         && entry.requires.iter().all(|requirement| {
             let min = Version::parse(&requirement.min_version);
             let max = Version::parse(&requirement.max_version_exclusive);
@@ -2630,7 +2680,6 @@ fn validate_catalog_entry(entry: &PluginCatalogEntry) -> Result<(), PluginError>
                 && min.is_ok()
                 && max.is_ok()
                 && min.ok().zip(max.ok()).is_some_and(|(min, max)| min < max)
-                && !requirement.methods.is_empty()
                 && requirement.methods.len() <= 128
                 && requirement
                     .methods
@@ -2694,6 +2743,22 @@ fn validate_catalog_entry(entry: &PluginCatalogEntry) -> Result<(), PluginError>
         || entry.size_bytes == 0
         || entry.size_bytes > PLUGIN_PACKAGE_MAX_BYTES
         || capabilities.len() != entry.capabilities.len()
+        || entry.network_public_hosts.len() > 32
+        || entry
+            .network_public_hosts
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != entry.network_public_hosts.len()
+        || entry
+            .network_public_hosts
+            .iter()
+            .any(|host| !wonderland_net::valid_public_host(host))
+        || (!entry
+            .capabilities
+            .iter()
+            .any(|capability| capability == "network.public")
+            && !entry.network_public_hosts.is_empty())
         || !services_valid
         || entry
             .capabilities
@@ -2727,34 +2792,29 @@ fn catalog_entry_is_compatible(entry: &PluginCatalogEntry) -> bool {
     let Ok(core) = Version::parse(env!("CARGO_PKG_VERSION")) else {
         return false;
     };
-    let Ok(protocol) = Version::parse(wonderland_plugin_protocol::PROTOCOL_VERSION) else {
-        return false;
-    };
     let Ok(min_core) = Version::parse(&entry.host_compatibility.min_core_version) else {
         return false;
     };
     let Ok(max_core) = Version::parse(&entry.host_compatibility.max_core_version_exclusive) else {
         return false;
     };
-    let Ok(min_protocol) = Version::parse(&entry.host_compatibility.protocol.min_version) else {
-        return false;
-    };
-    let Ok(max_protocol) = Version::parse(&entry.host_compatibility.protocol.max_version_exclusive)
-    else {
-        return false;
-    };
+    // Catalog installability must agree with the versions Core can actually run.
+    let protocol_compatible = !plugin_package::supported_versions_in_range(
+        PROTOCOL_SUPPORTED_VERSIONS,
+        &entry.host_compatibility.protocol.min_version,
+        &entry.host_compatibility.protocol.max_version_exclusive,
+    )
+    .is_empty();
     let ui_compatible = entry
         .ui_bridge_compatibility
         .as_ref()
         .is_none_or(|compatibility| {
-            let (Ok(current), Ok(min), Ok(max)) = (
-                Version::parse(wonderland_plugin_protocol::UI_BRIDGE_VERSION),
-                Version::parse(&compatibility.min_version),
-                Version::parse(&compatibility.max_version_exclusive),
-            ) else {
-                return false;
-            };
-            current >= min && current < max
+            !plugin_package::supported_versions_in_range(
+                UI_BRIDGE_SUPPORTED_VERSIONS,
+                &compatibility.min_version,
+                &compatibility.max_version_exclusive,
+            )
+            .is_empty()
         });
     entry.platform.os == "windows"
         && (cfg!(target_arch = "x86_64") && entry.platform.architecture == "x86_64"
@@ -2762,8 +2822,7 @@ fn catalog_entry_is_compatible(entry: &PluginCatalogEntry) -> bool {
         && entry.platform.abi == "msvc"
         && core >= min_core
         && core < max_core
-        && protocol >= min_protocol
-        && protocol < max_protocol
+        && protocol_compatible
         && ui_compatible
 }
 
@@ -2829,7 +2888,18 @@ pub async fn plugins_install(
         let capabilities = if manifest.capabilities.is_empty() {
             "无".to_owned()
         } else {
-            manifest.capabilities.join("、")
+            manifest.capabilities.iter().map(|capability| {
+                if capability == "network.public" {
+                    let scope = if manifest.network_public_hosts.is_empty() {
+                        "全部 HTTP(S) 目标".to_owned()
+                    } else {
+                        manifest.network_public_hosts.join("、")
+                    };
+                    format!("network.public（{scope}）")
+                } else {
+                    capability.clone()
+                }
+            }).collect::<Vec<_>>().join("、")
         };
         let confirmed = app
             .dialog()
@@ -2857,7 +2927,7 @@ pub async fn plugins_install(
         if !confirmed {
             return Ok(manager.snapshots());
         }
-        manager.install(source, same_version_path.exists(), true)
+        manager.install(source, same_version_path.exists(), true, Some(&manifest))
     })
     .await
     .map_err(|error| plugin_error("INTERNAL", &format!("Plugin installation failed: {error}")))?
@@ -2912,9 +2982,9 @@ pub fn plugins_ui_url(
     window: WebviewWindow,
     manager: State<'_, PluginManager>,
     plugin_id: String,
-) -> Result<String, PluginError> {
+) -> Result<PluginUiLaunchInfo, PluginError> {
     ensure_main(&window)?;
-    manager.plugin_ui_url(&plugin_id)
+    manager.plugin_ui_launch_info(&plugin_id)
 }
 
 #[tauri::command]
@@ -3117,6 +3187,7 @@ fn invalid_snapshot(id: &str, message: &str) -> PluginRuntimeState {
             },
             contract: "contract.json".to_owned(),
             capabilities: Vec::new(),
+            network_public_hosts: Vec::new(),
             provides: Vec::new(),
             requires: Vec::new(),
         },

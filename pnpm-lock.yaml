@@ -76,7 +76,11 @@ importers:
 
   packages/plugin-protocol: {}
 
-  packages/plugin-ui-sdk: {}
+  packages/plugin-ui-sdk:
+    dependencies:
+      '@wonderland/plugin-protocol':
+        specifier: workspace:*
+        version: link:../plugin-protocol
 
   packages/ui:
     devDependencies:
