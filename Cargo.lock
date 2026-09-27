@@ -5365,6 +5365,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-process",
  "tauri-plugin-updater",
+ "tokio",
  "windows-sys 0.61.2",
  "winreg",
  "wonderland-account",

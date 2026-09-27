@@ -38,7 +38,7 @@ export function WorkspacePage() {
     void pluginApi.catalog()
       .then((snapshot) => {
         if (live) {
-          setPluginAuthors(Object.fromEntries(snapshot.plugins.map(({ entry }) => [entry.id, entry.author])))
+          setPluginAuthors(Object.fromEntries(snapshot.plugins.map(({ registration }) => [registration.id, registration.author])))
         }
       })
       .catch(() => {
