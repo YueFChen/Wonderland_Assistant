@@ -4,6 +4,9 @@ import { RouterProvider } from 'react-router-dom'
 
 import { router } from './router'
 import { ThemeProvider } from './theme/ThemeProvider'
+import { NotificationProvider } from './components/Notifications'
+import { CoreUpdateProvider } from './components/CoreUpdateProvider'
+import { CloseBehaviorProvider } from './components/CloseBehaviorProvider'
 import './styles/index.css'
 
 const container = document.getElementById('root')
@@ -14,7 +17,13 @@ if (!container) {
 createRoot(container).render(
   <StrictMode>
     <ThemeProvider>
-      <RouterProvider router={router} />
+      <NotificationProvider>
+        <CoreUpdateProvider>
+          <CloseBehaviorProvider>
+            <RouterProvider router={router} />
+          </CloseBehaviorProvider>
+        </CoreUpdateProvider>
+      </NotificationProvider>
     </ThemeProvider>
   </StrictMode>,
 )

@@ -1,4 +1,4 @@
-import { ArrowRight, Clock3, LayoutGrid, Puzzle, Settings2 } from 'lucide-react'
+import { ArrowRight, Bell, Clock3, LayoutGrid, Puzzle, Settings2, X } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 
 import brandAvatar from '../assets/brand-avatar.png'
@@ -7,6 +7,7 @@ import { buildContributionRegistry, openContribution } from '../plugins/contribu
 import { pluginIcon } from '../plugins/icons'
 import { usePlugins } from '../plugins/api'
 import { useWorkspaceLayout } from '../plugins/workspaceLayout'
+import { useNotifications } from '../components/Notifications'
 import './HomePage.css'
 
 /** Home is the branded entry point for the Wonderland plugin workspace. */
@@ -14,6 +15,7 @@ export function HomePage() {
   const navigate = useNavigate()
   const { states } = usePlugins()
   const { layout } = useWorkspaceLayout()
+  const { homeNotifications, dismissHomeNotification } = useNotifications()
   const registry = buildContributionRegistry(states)
   const recent = [...layout.openContributionIds]
     .reverse()
@@ -48,6 +50,30 @@ export function HomePage() {
 
       <div className="flex min-h-0 min-w-0 flex-1 overflow-y-auto px-7 py-8 md:px-10 xl:px-14 xl:py-12 2xl:px-20">
         <div className="mx-auto my-auto w-full max-w-3xl space-y-8 xl:max-w-5xl 2xl:max-w-6xl">
+          {homeNotifications.length > 0 && (
+            <section aria-labelledby="home-notifications-heading" className="glass-card rounded-2xl border border-brand-500/20 p-4 sm:p-5">
+              <div className="mb-3 flex items-center gap-2 text-brand-500">
+                <Bell className="h-4 w-4" aria-hidden />
+                <h2 id="home-notifications-heading" className="text-xs font-bold uppercase tracking-[0.16em]">{t('home.notificationsTitle')}</h2>
+                <span className="ml-auto text-[11px] text-ink-faint">{homeNotifications.length}</span>
+              </div>
+              <ul className="divide-y divide-glass-line">
+                {homeNotifications.map((notice) => (
+                  <li key={notice.id} className="flex items-start gap-3 py-3 first:pt-0 last:pb-0">
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-semibold text-ink">{notice.title}</span>
+                      <span className="mt-1 block whitespace-pre-wrap text-xs leading-5 text-ink-muted">{notice.message}</span>
+                    </span>
+                    {notice.href && <Link to={notice.href} className="shrink-0 pt-0.5 text-xs font-semibold text-brand-500 hover:text-brand-400">{t('home.notificationOpen')}</Link>}
+                    <button type="button" onClick={() => dismissHomeNotification(notice.id)} className="shrink-0 rounded-md p-1 text-ink-faint hover:bg-glass-hover hover:text-ink" aria-label={t('notifications.dismiss')}>
+                      <X className="h-3.5 w-3.5" aria-hidden />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
           <section aria-labelledby="home-recent-heading" className="border-t border-dashed border-glass-line pt-7">
             <div className="mb-3 flex items-center justify-between gap-3">
               <h2 id="home-recent-heading" className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.16em] text-ink-faint">

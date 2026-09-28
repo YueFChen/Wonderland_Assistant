@@ -3,6 +3,7 @@ import { Outlet } from 'react-router-dom'
 import { TitleBar } from '../components/TitleBar'
 import { AppBackdrop } from '../components/AppBackdrop'
 import { CliUiBridge } from '../components/CliUiBridge'
+import { TrayNavigationController } from '../components/TrayNavigationController'
 
 /** 全应用共用的无边框窗口骨架。 */
 export function AppLayout() {
@@ -14,6 +15,7 @@ export function AppLayout() {
         <Outlet />
       </div>
       <CliUiBridge />
+      <TrayNavigationController />
     </div>
   )
 }

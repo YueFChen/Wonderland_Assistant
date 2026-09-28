@@ -11,6 +11,7 @@ mod plugin_schema;
 mod reveal;
 mod state;
 mod theme;
+mod tray;
 mod user_data;
 
 use std::ffi::OsString;
@@ -18,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use wonderland_logging::Logging;
 
 /// Main window label shared with `tauri.conf.json` and native commands.
@@ -394,6 +395,16 @@ fn run_application(cli: Option<CliInvocation>, desktop_data_dir: Option<PathBuf>
 
             app.manage(plugin_manager.clone());
             if !cli_mode {
+                tray::initialize(app)?;
+                if let Some(main_window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                    let close_event_window = main_window.clone();
+                    main_window.on_window_event(move |event| {
+                        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                            api.prevent_close();
+                            let _ = close_event_window.emit("core-close-requested", ());
+                        }
+                    });
+                }
                 let server = cli_ipc::CliIpcServer::start(
                     app.handle(),
                     plugin_manager.clone(),
@@ -474,6 +485,8 @@ fn run_application(cli: Option<CliInvocation>, desktop_data_dir: Option<PathBuf>
             network::network_proxy_test,
             core_update::core_update_check,
             core_update::core_update_install,
+            tray::core_exit,
+            tray::tray_sync_pinned,
             user_data::user_data_get,
             user_data::user_data_migrate_custom,
             user_data::user_data_migrate_default,

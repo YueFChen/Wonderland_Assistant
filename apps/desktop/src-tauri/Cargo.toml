@@ -3,6 +3,7 @@ name = "wonderland-desktop"
 description = "Wonderland Assistant 桌面壳：路由、IPC 与插件宿主。"
 version.workspace = true
 edition.workspace = true
+default-run = "wonderland-desktop"
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -23,7 +24,7 @@ tauri-build = { version = "2", features = [] }
 custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
