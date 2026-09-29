@@ -570,10 +570,7 @@ fn dispatch(
     pending: &CliUiPending,
     args: &[String],
 ) -> Result<Value, CliError> {
-    if args[0] == "app"
-        && args.get(1).is_some_and(|arg| arg == "wake")
-        && args.len() == 2
-    {
+    if args[0] == "app" && args.get(1).is_some_and(|arg| arg == "wake") && args.len() == 2 {
         crate::tray::show_main_window(app)
             .map_err(|error| CliError::new("WINDOW_UNAVAILABLE", error))?;
         return Ok(serde_json::json!({

@@ -189,10 +189,10 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             })
         }
     };
-    if let Some(navigation) = navigation {
-        if show_main_window(app).is_ok() {
-            let _ = app.emit(NAVIGATION_EVENT, navigation);
-        }
+    if let Some(navigation) = navigation
+        && show_main_window(app).is_ok()
+    {
+        let _ = app.emit(NAVIGATION_EVENT, navigation);
     }
 }
 
