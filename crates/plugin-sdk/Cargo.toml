@@ -11,4 +11,4 @@ publish = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
-wonderland-plugin-protocol = { version = "0.1.3", path = "../plugin-protocol" }
+wonderland-plugin-protocol = { version = "0.1.4", path = "../plugin-protocol" }

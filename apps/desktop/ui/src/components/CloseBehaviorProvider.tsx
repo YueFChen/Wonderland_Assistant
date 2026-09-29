@@ -1,31 +1,38 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { isTauri } from '@tauri-apps/api/core'
 import { Power, X } from 'lucide-react'
 
 import { t } from '../i18n'
 import { coreApi } from '../core/api'
-
-const CLOSE_CHOICE_KEY = 'wonderland.core.close-choice.v1'
-
-type CloseChoice = 'tray' | 'exit'
+import { readCloseBehavior, writeCloseBehavior, type CloseBehavior } from '../closeBehavior'
+import { useNotifications } from './Notifications'
 
 export function CloseBehaviorProvider({ children }: { children: ReactNode }) {
+  const { notify } = useNotifications()
   const [dialogOpen, setDialogOpen] = useState(false)
   const [rememberChoice, setRememberChoice] = useState(false)
   const [busy, setBusy] = useState(false)
+
+  const hideToTray = useCallback(async () => {
+    try {
+      await getCurrentWindow().hide()
+    } catch {
+      notify(t('closeChoice.hideFailed'), { tone: 'error' })
+    }
+  }, [notify])
 
   useEffect(() => {
     if (!isTauri()) return
     let live = true
     let unlisten: (() => void) | undefined
     void coreApi.onCloseRequested(() => {
-      const saved = readCloseChoice()
-      if (saved === 'tray') {
-        void getCurrentWindow().hide()
+      const behavior = readCloseBehavior()
+      if (behavior === 'tray') {
+        void hideToTray()
         return
       }
-      if (saved === 'exit') {
+      if (behavior === 'exit') {
         void coreApi.exit()
         return
       }
@@ -39,20 +46,20 @@ export function CloseBehaviorProvider({ children }: { children: ReactNode }) {
       live = false
       unlisten?.()
     }
-  }, [])
+  }, [hideToTray])
 
-  const choose = async (choice: CloseChoice) => {
+  const choose = async (choice: Exclude<CloseBehavior, 'ask'>) => {
     setBusy(true)
     if (rememberChoice) {
       try {
-        localStorage.setItem(CLOSE_CHOICE_KEY, choice)
+        writeCloseBehavior(choice)
       } catch {
         // The explicit choice still applies to this close when storage is unavailable.
       }
     }
     setDialogOpen(false)
     try {
-      if (choice === 'tray') await getCurrentWindow().hide()
+      if (choice === 'tray') await hideToTray()
       else await coreApi.exit()
     } finally {
       setBusy(false)
@@ -91,13 +98,4 @@ export function CloseBehaviorProvider({ children }: { children: ReactNode }) {
       )}
     </>
   )
-}
-
-function readCloseChoice(): CloseChoice | null {
-  try {
-    const value = localStorage.getItem(CLOSE_CHOICE_KEY)
-    return value === 'tray' || value === 'exit' ? value : null
-  } catch {
-    return null
-  }
 }

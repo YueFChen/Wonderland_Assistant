@@ -11,6 +11,7 @@ import { loggingApi } from '../logging/api'
 import { useTheme, type ResolvedTheme } from '../theme/ThemeProvider'
 import { userDataApi } from '../user-data/api'
 import { setStartupMemoryEnabled, startupMemoryEnabled } from '../startupMemory'
+import { readCloseBehavior, writeCloseBehavior, type CloseBehavior } from '../closeBehavior'
 import { t, type MessageKey } from '../i18n'
 import { AccountManagementSection } from './AccountSection'
 import { CoreUpdateCard } from '../components/CoreUpdateCard'
@@ -78,8 +79,9 @@ export function SettingsPage() {
         </SettingsGroup>
 
         <SettingsGroup title={t('settings.section.app')} hint={t('settings.section.appHint')}>
-          <div className="grid grid-cols-1 items-stretch gap-4 md:grid-cols-2">
+          <div className="grid grid-cols-1 items-stretch gap-4 md:grid-cols-3">
             <StartupMemoryCard />
+            <CloseBehaviorCard />
             <CoreUpdateCard />
           </div>
         </SettingsGroup>
@@ -154,6 +156,47 @@ function StartupMemoryCard() {
         label={t('settings.startupMemory.title')}
         onChange={changeEnabled}
       />
+    </section>
+  )
+}
+
+function CloseBehaviorCard() {
+  const [behavior, setBehavior] = useState<CloseBehavior>(readCloseBehavior)
+  const [failure, setFailure] = useState('')
+
+  const changeBehavior = (next: CloseBehavior) => {
+    setFailure('')
+    try {
+      writeCloseBehavior(next)
+      setBehavior(next)
+    } catch {
+      setFailure(t('settings.closeBehavior.saveFailed'))
+    }
+  }
+
+  return (
+    <section className="glass-card rounded-card p-6">
+      <SectionHead title={t('settings.closeBehavior.title')} hint={t('settings.closeBehavior.hint')} />
+      <label className="mt-4 flex flex-wrap items-center gap-3 text-sm text-ink-muted">
+        <span>{t('settings.closeBehavior.label')}</span>
+        <select
+          value={behavior}
+          onChange={(event) => changeBehavior(event.target.value as CloseBehavior)}
+          className="rounded-lg border border-[var(--app-field-border)] bg-[var(--app-field)] px-2.5 py-1.5 text-sm text-ink transition"
+        >
+          <option value="ask">{t('settings.closeBehavior.ask')}</option>
+          <option value="tray">{t('settings.closeBehavior.tray')}</option>
+          <option value="exit">{t('settings.closeBehavior.exit')}</option>
+        </select>
+      </label>
+      <p className="mt-3 text-xs leading-relaxed text-ink-faint">
+        {behavior === 'ask'
+          ? t('settings.closeBehavior.askHint')
+          : behavior === 'tray'
+            ? t('settings.closeBehavior.trayHint')
+            : t('settings.closeBehavior.exitHint')}
+      </p>
+      {failure && <p role="alert" className="mt-3 text-sm text-[var(--app-danger)]">{failure}</p>}
     </section>
   )
 }
