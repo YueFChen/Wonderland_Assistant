@@ -1186,15 +1186,8 @@ impl PluginManager {
         let package_removal = (|| {
             if install_directory.exists() {
                 reject_symlink(&install_directory)?;
-                fs::remove_dir_all(&install_directory).map_err(|error| {
-                    plugin_error(
-                        "INTERNAL",
-                        &format!(
-                            "Cannot remove plugin files at {}: {error}",
-                            install_directory.display()
-                        ),
-                    )
-                })
+                fs::remove_dir_all(&install_directory)
+                    .map_err(|error| plugin_package_removal_error(&install_directory, error))
             } else {
                 Ok(())
             }
@@ -3901,6 +3894,20 @@ fn select_install_grants(
         .filter(|capability| requested.contains(capability))
         .cloned()
         .collect()
+}
+
+fn plugin_package_removal_error(path: &Path, error: std::io::Error) -> PluginError {
+    let message = format!("Cannot remove plugin files at {}: {error}", path.display());
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(5) {
+        return plugin_error(
+            "INTERNAL",
+            &format!(
+                "{message} The plugin may still be in use by an external MCP client. Close the AI client that launched this plugin's MCP server, then retry uninstalling. The plugin remains installed but disabled, and its local data has not been removed."
+            ),
+        );
+    }
+    plugin_error("INTERNAL", &message)
 }
 
 fn clear_plugin_preferences(preferences: &mut Preferences, plugin_id: &str) {

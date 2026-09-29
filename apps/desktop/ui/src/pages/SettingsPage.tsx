@@ -5,7 +5,18 @@ import type {
   ThemeMode,
   UserDataState,
 } from '@wonderland/core-bindings'
-import { Check, FolderOpen, HardDrive, ImagePlus, Monitor, Moon, Palette, Sun, Trash2, type LucideIcon } from 'lucide-react'
+import {
+  Check,
+  FolderOpen,
+  HardDrive,
+  ImagePlus,
+  Monitor,
+  Moon,
+  Palette,
+  Sun,
+  Trash2,
+  type LucideIcon,
+} from 'lucide-react'
 
 import { loggingApi } from '../logging/api'
 import { useTheme, type ResolvedTheme } from '../theme/ThemeProvider'
@@ -40,7 +51,7 @@ const LOG_LEVELS: { value: LogLevel; labelKey: MessageKey; hintKey: MessageKey }
   { value: 'trace', labelKey: 'settings.logLevel.trace', hintKey: 'settings.logLevel.traceHint' },
 ]
 
-/** 设置页：按账号、应用行为、外观、数据与诊断分组。 */
+/** 设置页：按账号、应用、网络、外观和维护分组。 */
 export function SettingsPage() {
   const [userData, setUserData] = useState<UserDataState | null>(null)
   const [userDataFailure, setUserDataFailure] = useState('')
@@ -68,33 +79,28 @@ export function SettingsPage() {
 
   return (
     <section className="w-full">
-      <header className="mb-7">
-        <h1 className="text-xl font-bold text-ink">{t('settings.title')}</h1>
-        <p className="mt-1 text-sm text-ink-faint">{t('settings.description')}</p>
-      </header>
-
-      <div className="space-y-7">
-        <SettingsGroup title={t('settings.section.account')}>
+      <div className="min-w-0 space-y-8">
+        <SettingsGroup id="settings-account" title={t('settings.section.account')}>
           <AccountManagementSection />
         </SettingsGroup>
 
-        <SettingsGroup title={t('settings.section.app')} hint={t('settings.section.appHint')}>
-          <div className="grid grid-cols-1 items-stretch gap-4 md:grid-cols-3">
+        <SettingsGroup id="settings-app" title={t('settings.section.app')}>
+          <div className="glass-card divide-y divide-glass-line overflow-hidden rounded-card">
             <StartupMemoryCard />
             <CloseBehaviorCard />
-            <CoreUpdateCard />
+            <CoreUpdateCard compact />
           </div>
         </SettingsGroup>
 
-        <SettingsGroup title={t('settings.section.network')} hint={t('settings.section.networkHint')}>
+        <SettingsGroup id="settings-network" title={t('settings.section.network')}>
           <NetworkProxyCard />
         </SettingsGroup>
 
-        <SettingsGroup title={t('settings.section.appearance')}>
+        <SettingsGroup id="settings-appearance" title={t('settings.section.appearance')}>
           <AppearanceCard />
         </SettingsGroup>
 
-        <SettingsGroup title={t('settings.section.maintenance')} hint={t('settings.section.maintenanceHint')}>
+        <SettingsGroup id="settings-maintenance" title={t('settings.section.maintenance')}>
           <div className="settings-layout">
             <div className="settings-card-grid">
               <UserDataCard state={userData} setState={setUserData} loadFailure={userDataFailure} />
@@ -121,16 +127,15 @@ export function SettingsPage() {
   )
 }
 
-function SettingsGroup({ title, hint, children }: {
+function SettingsGroup({ id, title, children }: {
+  id: string
   title: string
-  hint?: string
   children: ReactNode
 }) {
   return (
-    <section className="min-w-0">
+    <section id={id} aria-labelledby={`${id}-title`} className="min-w-0">
       <div className="mb-3">
-        <h2 className="text-sm font-semibold text-ink">{title}</h2>
-        {hint && <p className="mt-1 text-xs leading-relaxed text-ink-faint">{hint}</p>}
+        <h2 id={`${id}-title`} className="text-sm font-semibold text-ink">{title}</h2>
       </div>
       {children}
     </section>
@@ -146,7 +151,7 @@ function StartupMemoryCard() {
   }
 
   return (
-    <section className="glass-card flex h-full items-center justify-between gap-4 rounded-card p-4">
+    <section className="flex items-center justify-between gap-4 px-4 py-4">
       <div className="min-w-0">
         <h3 className="text-sm font-semibold text-ink">{t('settings.startupMemory.title')}</h3>
         <p className="mt-1 text-xs leading-relaxed text-ink-muted">{t('settings.startupMemory.description')}</p>
@@ -175,27 +180,31 @@ function CloseBehaviorCard() {
   }
 
   return (
-    <section className="glass-card rounded-card p-6">
-      <SectionHead title={t('settings.closeBehavior.title')} hint={t('settings.closeBehavior.hint')} />
-      <label className="mt-4 flex flex-wrap items-center gap-3 text-sm text-ink-muted">
-        <span>{t('settings.closeBehavior.label')}</span>
-        <select
-          value={behavior}
-          onChange={(event) => changeBehavior(event.target.value as CloseBehavior)}
-          className="rounded-lg border border-[var(--app-field-border)] bg-[var(--app-field)] px-2.5 py-1.5 text-sm text-ink transition"
-        >
-          <option value="ask">{t('settings.closeBehavior.ask')}</option>
-          <option value="tray">{t('settings.closeBehavior.tray')}</option>
-          <option value="exit">{t('settings.closeBehavior.exit')}</option>
-        </select>
-      </label>
-      <p className="mt-3 text-xs leading-relaxed text-ink-faint">
-        {behavior === 'ask'
-          ? t('settings.closeBehavior.askHint')
-          : behavior === 'tray'
-            ? t('settings.closeBehavior.trayHint')
-            : t('settings.closeBehavior.exitHint')}
-      </p>
+    <section className="px-4 py-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold text-ink">{t('settings.closeBehavior.title')}</h3>
+          <p className="mt-1 text-xs leading-relaxed text-ink-muted">
+            {behavior === 'ask'
+              ? t('settings.closeBehavior.askHint')
+              : behavior === 'tray'
+                ? t('settings.closeBehavior.trayHint')
+                : t('settings.closeBehavior.exitHint')}
+          </p>
+        </div>
+        <label className="flex shrink-0 items-center gap-2 text-xs text-ink-muted">
+          <span>{t('settings.closeBehavior.label')}</span>
+          <select
+            value={behavior}
+            onChange={(event) => changeBehavior(event.target.value as CloseBehavior)}
+            className="rounded-lg border border-[var(--app-field-border)] bg-[var(--app-field)] px-2.5 py-1.5 text-sm text-ink transition"
+          >
+            <option value="ask">{t('settings.closeBehavior.ask')}</option>
+            <option value="tray">{t('settings.closeBehavior.tray')}</option>
+            <option value="exit">{t('settings.closeBehavior.exit')}</option>
+          </select>
+        </label>
+      </div>
       {failure && <p role="alert" className="mt-3 text-sm text-[var(--app-danger)]">{failure}</p>}
     </section>
   )

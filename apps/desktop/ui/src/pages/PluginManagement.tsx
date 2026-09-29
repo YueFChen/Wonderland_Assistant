@@ -139,6 +139,9 @@ export function PluginManagement({ states, error, setStates }: {
           <p className="mt-2 text-sm leading-relaxed text-ink-muted">
             {t('settings.plugins.uninstallDescription', { name: uninstallTarget.manifest.name })}
           </p>
+          <p className="mt-2 text-xs leading-relaxed text-ink-faint">
+            {t('settings.plugins.uninstallMcpHint')}
+          </p>
           <fieldset className="mt-4 space-y-2" disabled={busy === uninstallTarget.manifest.id}>
             <legend className="sr-only">{t('settings.plugins.uninstallTitle')}</legend>
             <label className="flex cursor-pointer gap-3 rounded-xl border border-glass-line bg-glass-subtle p-3 transition hover:bg-glass-hover">

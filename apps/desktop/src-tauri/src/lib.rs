@@ -349,10 +349,33 @@ fn run_application(cli: Option<CliInvocation>, desktop_data_dir: Option<PathBuf>
             let instance_guard = match cli_ipc::SingleInstanceGuard::acquire(&selected_data_dir) {
                 Ok(guard) => guard,
                 Err(error) if !cli_mode => {
-                    let _ = cli_ipc::try_send_to_desktop(
-                        &["app".to_owned(), "open".to_owned()],
-                        Some(&selected_data_dir),
-                    );
+                    let mut wake_succeeded = false;
+                    for _ in 0..10 {
+                        match cli_ipc::try_wake_desktop(&selected_data_dir) {
+                            Ok(Some(true)) => {
+                                wake_succeeded = true;
+                                break;
+                            }
+                            Ok(Some(false)) => {
+                                wake_succeeded = matches!(
+                                    cli_ipc::try_wake_desktop_legacy(&selected_data_dir),
+                                    Ok(Some(true))
+                                );
+                                break;
+                            }
+                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                            Err(_) => {
+                                wake_succeeded = matches!(
+                                    cli_ipc::try_wake_desktop_legacy(&selected_data_dir),
+                                    Ok(Some(true))
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    if !wake_succeeded {
+                        eprintln!("无法唤醒已运行的 Wonderland Assistant Core 窗口。");
+                    }
                     app.handle().exit(0);
                     let _ = error;
                     return Ok(());

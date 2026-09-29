@@ -14,7 +14,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, State, WebviewWindow};
 use wonderland_plugin_protocol::PluginError;
 
 use crate::plugin_manager::PluginManager;
@@ -23,6 +23,7 @@ const ENDPOINT_FILE: &str = "wonderland-assistant-cli-v1.json";
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const WAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLI_UI_EVENT: &str = "cli:ui-request";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +371,14 @@ pub fn try_send_to_desktop(
     args: &[String],
     requested_data_dir: Option<&Path>,
 ) -> Result<Option<Response>, CliError> {
+    try_send_to_desktop_with_timeout(args, requested_data_dir, REQUEST_TIMEOUT)
+}
+
+fn try_send_to_desktop_with_timeout(
+    args: &[String],
+    requested_data_dir: Option<&Path>,
+    response_timeout: Duration,
+) -> Result<Option<Response>, CliError> {
     let endpoint_path = endpoint_path();
     let contents = match fs::read(&endpoint_path) {
         Ok(contents) => contents,
@@ -391,7 +400,7 @@ pub fn try_send_to_desktop(
         Err(_) => return Ok(None),
     };
     stream
-        .set_read_timeout(Some(REQUEST_TIMEOUT))
+        .set_read_timeout(Some(response_timeout))
         .map_err(|error| CliError::new("IPC_FAILED", error.to_string()))?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
@@ -420,6 +429,22 @@ pub fn try_send_to_desktop(
         ));
     }
     Ok(Some(response))
+}
+
+pub fn try_wake_desktop(data_dir: &Path) -> Result<Option<bool>, CliError> {
+    let args = ["app".to_owned(), "wake".to_owned()];
+    match try_send_to_desktop_with_timeout(&args, Some(data_dir), WAKE_TIMEOUT)? {
+        Some(response) => Ok(Some(response.ok)),
+        None => Ok(None),
+    }
+}
+
+pub fn try_wake_desktop_legacy(data_dir: &Path) -> Result<Option<bool>, CliError> {
+    let args = ["app".to_owned(), "open".to_owned()];
+    match try_send_to_desktop_with_timeout(&args, Some(data_dir), WAKE_TIMEOUT)? {
+        Some(response) => Ok(Some(response.ok)),
+        None => Ok(None),
+    }
 }
 
 pub fn print_response(response: Response) -> i32 {
@@ -545,6 +570,22 @@ fn dispatch(
     pending: &CliUiPending,
     args: &[String],
 ) -> Result<Value, CliError> {
+    if args[0] == "app"
+        && args.get(1).is_some_and(|arg| arg == "wake")
+        && args.len() == 2
+    {
+        crate::tray::show_main_window(app)
+            .map_err(|error| CliError::new("WINDOW_UNAVAILABLE", error))?;
+        return Ok(serde_json::json!({
+            "desktopRunning": true,
+            "windowShown": true,
+        }));
+    }
+    if args[0] == "app" && args.get(1).is_some_and(|arg| arg == "open") {
+        crate::tray::show_main_window(app)
+            .map_err(|error| CliError::new("WINDOW_UNAVAILABLE", error))?;
+        return pending.request(app, args.to_vec());
+    }
     if args[0] == "ui"
         && args.get(1).is_some_and(|arg| arg == "command")
         && args.get(2).is_some_and(|arg| arg == "list")
@@ -561,13 +602,6 @@ fn dispatch(
             .map_err(CliError::from_plugin)?;
     }
     if args[0] == "app" || args[0] == "ui" {
-        if args[0] == "app"
-            && args.get(1).is_some_and(|arg| arg == "open")
-            && let Some(window) = app.get_webview_window(crate::MAIN_WINDOW_LABEL)
-        {
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
         return pending.request(app, args.to_vec());
     }
     let arguments = args.iter().cloned().map(Into::into).collect::<Vec<_>>();

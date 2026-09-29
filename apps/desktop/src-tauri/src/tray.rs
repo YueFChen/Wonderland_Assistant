@@ -61,7 +61,7 @@ pub fn initialize(app: &mut App) -> tauri::Result<()> {
                     ..
                 }
             ) {
-                show_main_window(tray.app_handle());
+                let _ = show_main_window(tray.app_handle());
             }
         });
     if let Some(icon) = app.default_window_icon() {
@@ -190,17 +190,20 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         }
     };
     if let Some(navigation) = navigation {
-        show_main_window(app);
-        let _ = app.emit(NAVIGATION_EVENT, navigation);
+        if show_main_window(app).is_ok() {
+            let _ = app.emit(NAVIGATION_EVENT, navigation);
+        }
     }
 }
 
-fn show_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
+pub(crate) fn show_main_window(app: &AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .ok_or_else(|| "The main window is not available.".to_owned())?;
+    window.unminimize().map_err(|error| error.to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    let _ = window.set_focus();
+    Ok(())
 }
 
 fn menu_id(plugin_id: &str, contribution_id: &str) -> String {
