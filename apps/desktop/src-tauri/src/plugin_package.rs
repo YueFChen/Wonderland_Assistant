@@ -147,17 +147,17 @@ pub(crate) fn install_archive(
             || inspect_directory(&destination, false),
         )
     })();
-    if result.is_err() {
-        if let Err(error) = fs::remove_dir_all(&staging) {
-            warn!(
-                install_id,
-                plugin_id,
-                version,
-                phase = "staging_cleanup",
-                reason = %error,
-                "插件包安装失败后清理暂存目录失败"
-            );
-        }
+    if result.is_err()
+        && let Err(error) = fs::remove_dir_all(&staging)
+    {
+        warn!(
+            install_id,
+            plugin_id,
+            version,
+            phase = "staging_cleanup",
+            reason = %error,
+            "插件包安装失败后清理暂存目录失败"
+        );
     }
     result
 }
@@ -203,17 +203,17 @@ pub(crate) fn install_development_directory(
             || inspect_directory(&destination, true),
         )
     })();
-    if result.is_err() {
-        if let Err(error) = fs::remove_dir_all(&staging) {
-            warn!(
-                install_id,
-                plugin_id,
-                version,
-                phase = "staging_cleanup",
-                reason = %error,
-                "插件包安装失败后清理暂存目录失败"
-            );
-        }
+    if result.is_err()
+        && let Err(error) = fs::remove_dir_all(&staging)
+    {
+        warn!(
+            install_id,
+            plugin_id,
+            version,
+            phase = "staging_cleanup",
+            reason = %error,
+            "插件包安装失败后清理暂存目录失败"
+        );
     }
     result
 }
@@ -842,16 +842,6 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
     {
         return Err("Plugin description is too long.".to_owned());
     }
-    if let Some(icon) = &manifest.icon
-        && (icon.is_empty()
-            || icon.len() > 64
-            || !icon.as_bytes()[0].is_ascii_lowercase()
-            || !icon
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
-    {
-        return Err("Plugin icon key is invalid.".to_owned());
-    }
     Version::parse(&manifest.version)
         .map_err(|_| "Plugin version is not valid semantic versioning.".to_owned())?;
     let min_core = Version::parse(&manifest.host_compatibility.min_core_version)
@@ -958,19 +948,6 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
             if !(-1_000..=1_000).contains(&contribution.default_order) {
                 return Err(format!(
                     "Plugin contribution '{}' defaultOrder is out of range.",
-                    contribution.id
-                ));
-            }
-            if contribution.icon.as_deref().is_some_and(|icon| {
-                icon.is_empty()
-                    || icon.len() > 64
-                    || !icon.as_bytes()[0].is_ascii_lowercase()
-                    || !icon.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                    })
-            }) {
-                return Err(format!(
-                    "Plugin contribution '{}' has an invalid icon key.",
                     contribution.id
                 ));
             }

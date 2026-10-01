@@ -1,7 +1,11 @@
 // Generated from Rust by crates/plugin-protocol/examples/generate_bindings.rs. Do not edit.
 export const UI_BRIDGE_PROTOCOL = "wonderland-plugin-ui" as const
 export const UI_BRIDGE_VERSION = "1.1.0" as const
-export type PluginManifest = { manifestVersion: number, id: string, name: string, version: string, description?: string | null, icon?: string | null, hostCompatibility: HostCompatibility, platform: PluginPlatform, ui?: PluginUi | null, backend: PluginBackend, contract: string, capabilities: Array<string>,
+export type PluginManifest = { manifestVersion: number, id: string, name: string, version: string, description?: string | null,
+/**
+ * A legacy built-in icon key or a local package asset such as `asset:ui/icons/logo.svg`.
+ */
+icon?: string | null, hostCompatibility: HostCompatibility, platform: PluginPlatform, ui?: PluginUi | null, backend: PluginBackend, contract: string, capabilities: Array<string>,
 /**
  * Exact HTTPS hosts available through core.network.public.
  */
@@ -18,7 +22,11 @@ export type HostCompatibility = { minCoreVersion: string, maxCoreVersionExclusiv
 export type ProtocolCompatibility = { minVersion: string, maxVersionExclusive: string, };
 export type PluginPlatform = { os: string, architecture: string, abi: string, };
 export type PluginUi = { entry: string, bridgeCompatibility: ProtocolCompatibility, integrations: Array<string>, contributions: Array<PluginUiContribution>, };
-export type PluginUiContribution = { id: string, kind: PluginUiContributionKind, title: string, icon?: string | null, defaultOrder: number, location?: string | null, commands?: Array<PluginUiCommand>, };
+export type PluginUiContribution = { id: string, kind: PluginUiContributionKind, title: string,
+/**
+ * A legacy built-in icon key or a local package asset such as `asset:ui/icons/logo.svg`.
+ */
+icon?: string | null, defaultOrder: number, location?: string | null, commands?: Array<PluginUiCommand>, };
 export type PluginUiContributionKind = "activity" | "view";
 export type PluginUiCommand = { id: string, title: string, inputSchema: unknown, effect: PluginUiCommandEffect, };
 export type PluginUiCommandEffect = "read_only" | "mutating";

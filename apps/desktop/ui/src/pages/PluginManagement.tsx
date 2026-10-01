@@ -4,6 +4,7 @@ import { ChevronDown, Clipboard, PackagePlus, RotateCw, Trash2 } from 'lucide-re
 import { useNavigate } from 'react-router-dom'
 
 import { pluginApi } from '../plugins/api'
+import { PluginIcon } from '../plugins/icons'
 import { t, type MessageKey } from '../i18n'
 import { ToggleSwitch } from '../components/ToggleSwitch'
 
@@ -254,6 +255,9 @@ function PluginCard({ state, busy, onToggle, onUninstall, onCapabilitiesChange, 
   return (
     <li className="flex min-h-44 min-w-0 flex-col justify-between rounded-xl border border-glass-line bg-glass-subtle p-3 transition hover:border-brand-500/25">
       <div className="flex items-center justify-between gap-3">
+        <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-brand-600/15 text-brand-400">
+          <PluginIcon icon={state.manifest.icon ?? 'puzzle'} pluginId={state.manifest.id} className="h-5 w-5" />
+        </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <h3 className="truncate text-sm font-semibold text-ink">{state.manifest.name}</h3>

@@ -757,10 +757,8 @@ impl PluginManager {
                 retrying: keep_retrying,
                 retryable: scan_error.retryable,
             });
-            if !keep_retrying {
-                if let Some(retry) = record.scan_retry.as_mut() {
-                    retry.worker_running = false;
-                }
+            if !keep_retrying && let Some(retry) = record.scan_retry.as_mut() {
+                retry.worker_running = false;
             }
         }
         if !applied {
@@ -900,12 +898,11 @@ impl PluginManager {
             let version = record.snapshot.manifest.version.clone();
             state.plugins.insert(plugin_id.clone(), record);
             update_service_dependency_issues(&mut state.plugins);
-            if preferences_changed {
-                if let Err(error) =
+            if preferences_changed
+                && let Err(error) =
                     persist_preferences(&self.inner.app_data_dir, &state.preferences)
-                {
-                    warn!(plugin_id = %plugin_id, error = %error, "插件扫描恢复后无法保存插件设置");
-                }
+            {
+                warn!(plugin_id = %plugin_id, error = %error, "插件扫描恢复后无法保存插件设置");
             }
             info!(
                 plugin_id = %plugin_id,
@@ -1312,20 +1309,19 @@ impl PluginManager {
             phase = "preflight",
             "开始安装插件包"
         );
-        if let Some(reviewed) = reviewed_manifest {
-            if let Err(message) =
+        if let Some(reviewed) = reviewed_manifest
+            && let Err(message) =
                 plugin_package::ensure_reviewed_manifest(reviewed, &source_manifest)
-            {
-                warn!(
-                    install_id,
-                    plugin_id = %source_manifest.id,
-                    version = %source_manifest.version,
-                    phase = "manifest_review",
-                    error = %message,
-                    "插件包安装失败"
-                );
-                return Err(plugin_error("INVALID_REQUEST", &message));
-            }
+        {
+            warn!(
+                install_id,
+                plugin_id = %source_manifest.id,
+                version = %source_manifest.version,
+                phase = "manifest_review",
+                error = %message,
+                "插件包安装失败"
+            );
+            return Err(plugin_error("INVALID_REQUEST", &message));
         }
         let replacing_same_version = overwrite
             && plugin_package::install_path(&self.inner.installed_root, &source_manifest).exists();
@@ -1433,16 +1429,15 @@ impl PluginManager {
                     error = %message,
                     "插件包安装失败"
                 );
-                if was_running {
-                    if let Err(restore_error) = self.inner.start_one(&source_manifest.id) {
-                        error!(
-                            install_id,
-                            plugin_id = %source_manifest.id,
-                            code = %restore_error.code,
-                            reason = %restore_error.message,
-                            "安装失败后恢复原插件启动失败"
-                        );
-                    }
+                if was_running && let Err(restore_error) = self.inner.start_one(&source_manifest.id)
+                {
+                    error!(
+                        install_id,
+                        plugin_id = %source_manifest.id,
+                        code = %restore_error.code,
+                        reason = %restore_error.message,
+                        "安装失败后恢复原插件启动失败"
+                    );
                 }
                 return Err(plugin_error("INVALID_REQUEST", &message));
             }
@@ -2468,8 +2463,12 @@ impl PluginManager {
                 b"plugin asset not found".to_vec(),
             );
         };
-        if record.snapshot.installation != InstallationState::Installed || !record.snapshot.enabled
-        {
+        let is_icon_asset = relative.starts_with("ui/icons/");
+        let package_available = matches!(
+            record.snapshot.installation,
+            InstallationState::Installed | InstallationState::Incompatible
+        );
+        if !package_available || (!is_icon_asset && !record.snapshot.enabled) {
             return (
                 404,
                 "text/plain; charset=utf-8".to_owned(),
@@ -2498,6 +2497,20 @@ impl PluginManager {
                 b"plugin asset not found".to_vec(),
             );
         }
+        if is_icon_asset
+            && !matches!(
+                canonical
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("svg" | "png" | "webp")
+            )
+        {
+            return (
+                404,
+                "text/plain; charset=utf-8".to_owned(),
+                b"plugin icon not found".to_vec(),
+            );
+        }
         let Ok(metadata) = fs::metadata(&canonical) else {
             return (
                 404,
@@ -2505,7 +2518,12 @@ impl PluginManager {
                 b"plugin asset not found".to_vec(),
             );
         };
-        if metadata.len() > 128 * 1024 * 1024 {
+        let max_bytes = if is_icon_asset {
+            512 * 1024
+        } else {
+            128 * 1024 * 1024
+        };
+        if metadata.len() > max_bytes {
             return (
                 413,
                 "text/plain; charset=utf-8".to_owned(),

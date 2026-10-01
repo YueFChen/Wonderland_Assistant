@@ -2,7 +2,7 @@
 //!
 //! 本 crate 不依赖 kernel、Tauri 或任何插件业务 crate，因此插件可独立依赖它。
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 #[cfg(feature = "bindings")]
 use ts_rs::TS;
@@ -19,6 +19,14 @@ pub const UI_BRIDGE_VERSION: &str = "1.1.0";
 /// Keep the list explicit: a version bump must not silently remove old plugin compatibility.
 pub const UI_BRIDGE_SUPPORTED_VERSIONS: &[&str] = &["1.0.0", "1.1.0"];
 
+/// Icons are decorative metadata. Invalid icon values must not make an otherwise valid plugin fail to load.
+fn deserialize_optional_icon<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer).unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -30,7 +38,12 @@ pub struct PluginManifest {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A legacy built-in icon key or a local package asset such as `asset:ui/icons/logo.svg`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_icon",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub icon: Option<String>,
     pub host_compatibility: HostCompatibility,
     pub platform: PluginPlatform,
@@ -137,7 +150,12 @@ pub struct PluginUiContribution {
     pub id: String,
     pub kind: PluginUiContributionKind,
     pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A legacy built-in icon key or a local package asset such as `asset:ui/icons/logo.svg`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_icon",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub icon: Option<String>,
     pub default_order: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]

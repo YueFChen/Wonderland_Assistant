@@ -9,7 +9,7 @@ import { UserAvatar } from '../account/UserAvatar'
 import { CommandPalette } from '../components/CommandPalette'
 import { PluginSurface } from '../pages/PluginPage'
 import { buildContributionRegistry, findContribution, openContribution } from '../plugins/contributions'
-import { pluginIcon } from '../plugins/icons'
+import { PluginIcon } from '../plugins/icons'
 import { usePlugins } from '../plugins/api'
 import { orderContributions, setActiveSidebarContribution, useWorkspaceLayout } from '../plugins/workspaceLayout'
 import { rememberLastWorkPage } from '../startupMemory'
@@ -142,9 +142,8 @@ export function WorkspaceLayout() {
                 ? <span className="workspace-rail-empty-icon" title={t('workspace.noPinnedTools')}><Grid2X2 aria-hidden /></span>
                 : <p className="workspace-rail-empty">{t('workspace.noPinnedTools')}</p>
             ) : pinned.map((contribution) => {
-              const Icon = pluginIcon(contribution.icon)
               const linkContent = <>
-                <Icon aria-hidden />
+                <PluginIcon icon={contribution.icon} pluginId={contribution.pluginId} className="h-[18px] w-[18px] shrink-0" />
                 {!layout.collapsed && <span className="workspace-rail-link-label">{contribution.title}</span>}
                 {!layout.collapsed && contribution.status !== 'ready' && <span className="workspace-rail-status-dot" data-status={contribution.status} aria-label={t(`workspace.contributionStatus.${contribution.status}`)} />}
               </>

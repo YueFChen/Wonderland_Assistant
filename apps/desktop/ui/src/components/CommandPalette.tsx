@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Search, X } from 'lucide-react'
-import { pluginIcon } from '../plugins/icons'
+import { PluginIcon } from '../plugins/icons'
 import type { WorkspaceContribution } from '../plugins/contributions'
 import { t } from '../i18n'
 
@@ -68,7 +68,6 @@ export function CommandPalette({ open, contributions, onClose, onSelect }: Props
           {filtered.length === 0 ? (
             <p className="px-4 py-8 text-center text-sm text-ink-muted">{t('workspace.noSearchResults')}</p>
           ) : filtered.map((contribution) => {
-            const Icon = pluginIcon(contribution.icon)
             return (
               <button
                 key={contribution.id}
@@ -77,7 +76,7 @@ export function CommandPalette({ open, contributions, onClose, onSelect }: Props
                 onClick={() => onSelect(contribution.id)}
               >
                 <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-brand-600/15 text-brand-400">
-                  <Icon className="h-4 w-4" aria-hidden />
+                  <PluginIcon icon={contribution.icon} pluginId={contribution.pluginId} className="h-4 w-4" />
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-sm font-semibold text-ink">{contribution.title}</span>

@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as Reac
 import { ArrowRight, ArrowLeftRight, ArrowUp, ArrowDown, GripVertical, Pin, Search, Puzzle, RotateCcw, Eye, EyeOff } from 'lucide-react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 
-import { pluginIcon } from '../plugins/icons'
+import { PluginIcon } from '../plugins/icons'
 import { buildContributionRegistry, openContribution } from '../plugins/contributions'
 import { orderContributions, useWorkspaceLayout } from '../plugins/workspaceLayout'
 import { pluginApi, usePlugins } from '../plugins/api'
@@ -84,7 +84,6 @@ export function WorkspacePage() {
   const dragPreviewActivity = dragPreview
     ? activities.find((item) => item.id === dragPreview.activityId)
     : undefined
-  const DragPreviewIcon = dragPreviewActivity ? pluginIcon(dragPreviewActivity.icon) : null
 
   const open = (id: string) => openContribution(registry, id, navigate)
   const endActivityDrag = () => {
@@ -237,11 +236,10 @@ export function WorkspacePage() {
           <h2 className="mb-3 text-xs font-bold uppercase tracking-[0.16em] text-ink-faint">{t('workspace.pinned')}</h2>
           <div className="flex flex-wrap gap-2">
             {pinned.map((item, index) => {
-              const Icon = pluginIcon(item.icon)
               return (
                 <div key={item.id} className="glass-card flex items-center gap-1 rounded-xl p-1.5">
                   <button type="button" onClick={() => open(item.id)} className="inline-flex max-w-64 items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-ink hover:bg-glass-hover" title={item.id}>
-                    <Icon className="h-4 w-4 shrink-0 text-brand-400" aria-hidden />
+                    <PluginIcon icon={item.icon} pluginId={item.pluginId} className="h-4 w-4 shrink-0 text-brand-400" />
                     <span className="truncate">{item.title}</span>
                   </button>
                   <button type="button" disabled={index === 0} onClick={() => move(item.id, -1)} className="rounded-md p-1 text-ink-faint hover:bg-glass-hover hover:text-ink disabled:opacity-30" aria-label={t('workspace.moveUp')} title={t('workspace.moveUp')}>
@@ -283,7 +281,6 @@ export function WorkspacePage() {
         ) : (
           <div className="grid gap-2.5 md:grid-cols-2 2xl:grid-cols-3">
             {previewActivities.map((item) => {
-              const Icon = pluginIcon(item.icon)
               const pinnedItem = layout.pinnedIds.includes(item.id)
               const hiddenItem = layout.hiddenIds.includes(item.id)
               const isDragging = draggedActivityId === item.id
@@ -302,7 +299,7 @@ export function WorkspacePage() {
                   <div className="flex items-start justify-between gap-3">
                     <button type="button" onClick={() => open(item.id)} className="activity-enter flex min-w-0 cursor-pointer items-start gap-3 text-left">
                       <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-brand-600/15 text-brand-400">
-                        <Icon className="h-5 w-5" aria-hidden />
+                        <PluginIcon icon={item.icon} pluginId={item.pluginId} className="h-5 w-5" />
                       </span>
                       <span className="min-w-0">
                         <span className="block truncate font-semibold text-ink">{item.title}</span>
@@ -350,12 +347,12 @@ export function WorkspacePage() {
           </div>
         )}
       </section>
-      {dragPreview && dragPreviewActivity && DragPreviewIcon && (
+      {dragPreview && dragPreviewActivity && (
         <div ref={dragPreviewRef} className="activity-drag-preview glass-card flex min-h-44 flex-col rounded-xl p-3" aria-hidden="true">
           <div className="flex items-start justify-between gap-3">
             <div className="flex min-w-0 items-start gap-3">
               <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-brand-600/15 text-brand-400">
-                <DragPreviewIcon className="h-5 w-5" aria-hidden />
+                <PluginIcon icon={dragPreviewActivity.icon} pluginId={dragPreviewActivity.pluginId} className="h-5 w-5" />
               </span>
               <span className="min-w-0">
                 <span className="block truncate font-semibold text-ink">{dragPreviewActivity.title}</span>

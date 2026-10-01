@@ -1536,8 +1536,7 @@ fn read_stderr(stderr: ChildStderr, plugin_id: String) {
             }
         };
         let diagnostic = String::from_utf8_lossy(&line);
-        let diagnostic =
-            diagnostic.trim_end_matches(|character| character == '\r' || character == '\n');
+        let diagnostic = diagnostic.trim_end_matches(['\r', '\n']);
         log_plugin_diagnostic(
             parse_plugin_log_level(diagnostic),
             &plugin_id,
@@ -1596,7 +1595,7 @@ fn parse_plugin_log_level(line: &str) -> PluginLogLevel {
         return level;
     }
 
-    for token in line.trim_start().split_whitespace().take(4) {
+    for token in line.split_whitespace().take(4) {
         let token = token
             .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_');
         let token = token.rsplit_once('=').map_or(token, |(_, value)| value);

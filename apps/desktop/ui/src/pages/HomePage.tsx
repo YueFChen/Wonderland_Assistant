@@ -4,7 +4,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import brandAvatar from '../assets/brand-avatar.png'
 import { t } from '../i18n'
 import { buildContributionRegistry, openContribution } from '../plugins/contributions'
-import { pluginIcon } from '../plugins/icons'
+import { PluginIcon } from '../plugins/icons'
 import { usePlugins } from '../plugins/api'
 import { useWorkspaceLayout } from '../plugins/workspaceLayout'
 import { useNotifications } from '../components/Notifications'
@@ -92,11 +92,10 @@ export function HomePage() {
             ) : (
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
                 {recent.map((item) => {
-                  const Icon = pluginIcon(item.icon)
                   return (
                     <button key={item.id} type="button" onClick={() => openContribution(registry, item.id, navigate)} className="glass-card flex min-w-0 items-center gap-3 rounded-2xl border border-glass-line p-4 text-left transition hover:-translate-y-0.5 hover:border-brand-500/30 hover:bg-glass-hover">
                       <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-brand-600/10 text-brand-400">
-                        <Icon className="h-5 w-5" aria-hidden />
+                        <PluginIcon icon={item.icon} pluginId={item.pluginId} className="h-5 w-5" />
                       </span>
                       <span className="min-w-0 flex-1">
                         <span className="block truncate text-sm font-semibold text-ink">{item.title}</span>
