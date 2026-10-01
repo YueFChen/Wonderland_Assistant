@@ -583,6 +583,11 @@ fn dispatch(
             .map_err(|error| CliError::new("WINDOW_UNAVAILABLE", error))?;
         return pending.request(app, args.to_vec());
     }
+    if args.len() == 2 && args[0] == "app" && args[1] == "activate" {
+        crate::tray::show_main_window(app)
+            .map_err(|error| CliError::new("WINDOW_UNAVAILABLE", error))?;
+        return Ok(serde_json::json!({ "desktopRunning": true, "windowShown": true }));
+    }
     if args[0] == "ui"
         && args.get(1).is_some_and(|arg| arg == "command")
         && args.get(2).is_some_and(|arg| arg == "list")

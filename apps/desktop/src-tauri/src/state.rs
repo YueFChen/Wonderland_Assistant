@@ -1,6 +1,9 @@
 use std::error::Error;
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Manager};
 use wonderland_account::FsAccountService;
@@ -72,7 +75,7 @@ fn load_account(app_data_dir: PathBuf) -> Result<Arc<dyn AccountService>, Box<dy
     }
 }
 
-/// 安装日志系统；初始化失败时返回 `None`。
+/// 安装日志系统；初始化失败时写入备用诊断，再返回 `None`。
 fn init_logging(level: LogSettings, app_data_dir: &Path) -> Option<Logging> {
     let configured = level.level;
     match wonderland_logging::init(level, app_data_dir) {
@@ -80,6 +83,33 @@ fn init_logging(level: LogSettings, app_data_dir: &Path) -> Option<Logging> {
             info!(level = configured.as_str(), dir = %app_data_dir.display(), "日志已初始化");
             Some(logging)
         }
-        Err(_) => None,
+        Err(error) => {
+            report_logging_init_failure(app_data_dir, &error);
+            None
+        }
+    }
+}
+
+/// 日志订阅器还不可用时，同时尝试写 stderr 与应用数据目录中的备用文件。
+fn report_logging_init_failure(app_data_dir: &Path, error: &dyn std::fmt::Display) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let error = error.to_string().replace(['\r', '\n'], " ");
+    let diagnostic = format!(
+        "timestamp_unix_seconds={timestamp} level=ERROR code=LOGGING_INIT_FAILED data_dir={} error={error}",
+        app_data_dir.display()
+    );
+
+    let _ = writeln!(std::io::stderr().lock(), "日志系统初始化失败：{diagnostic}");
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(app_data_dir.join("wonderland-assistant-startup.log"))
+    {
+        let _ = writeln!(file, "{diagnostic}");
     }
 }

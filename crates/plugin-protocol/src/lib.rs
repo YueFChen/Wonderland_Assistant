@@ -193,6 +193,7 @@ pub struct PluginBackend {
 pub enum InstallationState {
     Missing,
     Installed,
+    Checking,
     Invalid,
     Incompatible,
 }
@@ -231,6 +232,22 @@ pub struct PluginInstallSource {
     pub author: Option<String>,
 }
 
+/// Diagnostics from validating an installed plugin package.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
+pub struct PluginScanDiagnostic {
+    pub core_version: String,
+    pub code: String,
+    pub phase: String,
+    pub message: String,
+    pub retry_attempt: u8,
+    pub retry_limit: u8,
+    pub retrying: bool,
+    pub retryable: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -238,6 +255,8 @@ pub struct PluginInstallSource {
 pub struct PluginRuntimeState {
     pub manifest: PluginManifest,
     pub installation: InstallationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_diagnostic: Option<PluginScanDiagnostic>,
     pub enabled: bool,
     pub runtime: RuntimeState,
     pub last_error: Option<PluginFailure>,

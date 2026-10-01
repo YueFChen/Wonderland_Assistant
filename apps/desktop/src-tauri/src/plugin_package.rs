@@ -9,6 +9,7 @@ use semver::Version;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use wonderland_kernel::logging::{info, warn};
 use wonderland_plugin_protocol::{
     PROTOCOL_SUPPORTED_VERSIONS, PluginManifest, PluginUiCommandEffect, PluginUiContributionKind,
     UI_BRIDGE_SUPPORTED_VERSIONS, UI_BRIDGE_VERSION,
@@ -29,6 +30,15 @@ pub(crate) struct InspectedPlugin {
     pub contract_sha256: String,
     pub compatible: bool,
     pub directory: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanFailure {
+    pub plugin_id: String,
+    pub code: &'static str,
+    pub phase: &'static str,
+    pub message: String,
+    pub retryable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,27 +113,57 @@ pub(crate) fn manifest_for_install_source(source: &Path) -> Result<PluginManifes
 }
 
 pub(crate) fn install_archive(
+    install_id: u64,
     source: &Path,
     installed_root: &Path,
     overwrite: bool,
     reviewed_manifest: &PluginManifest,
 ) -> Result<InspectedPlugin, String> {
-    let staging = staging_directory(installed_root)?;
+    let plugin_id = reviewed_manifest.id.as_str();
+    let version = reviewed_manifest.version.as_str();
+    let staging = run_install_stage(install_id, plugin_id, version, "staging_prepare", || {
+        staging_directory(installed_root)
+    })?;
     let result = (|| {
-        extract_archive(source, &staging)?;
-        let inspected = inspect_directory(&staging, false)?;
-        ensure_reviewed_manifest(reviewed_manifest, &inspected.manifest)?;
-        commit_staging(&staging, installed_root, &inspected.manifest, overwrite)?;
+        run_install_stage(install_id, plugin_id, version, "archive_extraction", || {
+            extract_archive(source, &staging)
+        })?;
+        let inspected =
+            run_install_stage(install_id, plugin_id, version, "staging_validation", || {
+                inspect_directory(&staging, false)
+            })?;
+        run_install_stage(install_id, plugin_id, version, "manifest_review", || {
+            ensure_reviewed_manifest(reviewed_manifest, &inspected.manifest)
+        })?;
+        run_install_stage(install_id, plugin_id, version, "atomic_commit", || {
+            commit_staging(&staging, installed_root, &inspected.manifest, overwrite)
+        })?;
         let destination = install_path(installed_root, &inspected.manifest);
-        inspect_directory(&destination, false)
+        run_install_stage(
+            install_id,
+            plugin_id,
+            version,
+            "installed_validation",
+            || inspect_directory(&destination, false),
+        )
     })();
     if result.is_err() {
-        let _ = fs::remove_dir_all(&staging);
+        if let Err(error) = fs::remove_dir_all(&staging) {
+            warn!(
+                install_id,
+                plugin_id,
+                version,
+                phase = "staging_cleanup",
+                reason = %error,
+                "插件包安装失败后清理暂存目录失败"
+            );
+        }
     }
     result
 }
 
 pub(crate) fn install_development_directory(
+    install_id: u64,
     source: &Path,
     installed_root: &Path,
     overwrite: bool,
@@ -132,20 +172,95 @@ pub(crate) fn install_development_directory(
     if !cfg!(debug_assertions) {
         return Err("Development-directory installation is disabled in release builds.".to_owned());
     }
-    ensure_real_directory(source)?;
-    let staging = staging_directory(installed_root)?;
+    let plugin_id = reviewed_manifest.id.as_str();
+    let version = reviewed_manifest.version.as_str();
+    run_install_stage(install_id, plugin_id, version, "source_validation", || {
+        ensure_real_directory(source)
+    })?;
+    let staging = run_install_stage(install_id, plugin_id, version, "staging_prepare", || {
+        staging_directory(installed_root)
+    })?;
     let result = (|| {
-        copy_package_tree(source, &staging)?;
-        let inspected = inspect_directory(&staging, true)?;
-        ensure_reviewed_manifest(reviewed_manifest, &inspected.manifest)?;
-        commit_staging(&staging, installed_root, &inspected.manifest, overwrite)?;
+        run_install_stage(install_id, plugin_id, version, "development_copy", || {
+            copy_package_tree(source, &staging)
+        })?;
+        let inspected =
+            run_install_stage(install_id, plugin_id, version, "staging_validation", || {
+                inspect_directory(&staging, true)
+            })?;
+        run_install_stage(install_id, plugin_id, version, "manifest_review", || {
+            ensure_reviewed_manifest(reviewed_manifest, &inspected.manifest)
+        })?;
+        run_install_stage(install_id, plugin_id, version, "atomic_commit", || {
+            commit_staging(&staging, installed_root, &inspected.manifest, overwrite)
+        })?;
         let destination = install_path(installed_root, &inspected.manifest);
-        inspect_directory(&destination, true)
+        run_install_stage(
+            install_id,
+            plugin_id,
+            version,
+            "installed_validation",
+            || inspect_directory(&destination, true),
+        )
     })();
     if result.is_err() {
-        let _ = fs::remove_dir_all(&staging);
+        if let Err(error) = fs::remove_dir_all(&staging) {
+            warn!(
+                install_id,
+                plugin_id,
+                version,
+                phase = "staging_cleanup",
+                reason = %error,
+                "插件包安装失败后清理暂存目录失败"
+            );
+        }
     }
     result
+}
+
+fn run_install_stage<T>(
+    install_id: u64,
+    plugin_id: &str,
+    version: &str,
+    phase: &'static str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    info!(
+        install_id,
+        plugin_id,
+        version,
+        phase,
+        status = "started",
+        "插件包安装阶段开始"
+    );
+    let started_at = std::time::Instant::now();
+    match operation() {
+        Ok(value) => {
+            info!(
+                install_id,
+                plugin_id,
+                version,
+                phase,
+                status = "complete",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "插件包安装阶段完成"
+            );
+            Ok(value)
+        }
+        Err(error) => {
+            warn!(
+                install_id,
+                plugin_id,
+                version,
+                phase,
+                status = "failed",
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                reason = %error,
+                "插件包安装阶段失败"
+            );
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn ensure_reviewed_manifest(
@@ -166,15 +281,49 @@ pub(crate) fn ensure_reviewed_manifest(
 pub(crate) fn scan_installed_root(
     root: &Path,
     active_versions: &BTreeMap<String, String>,
-) -> Vec<Result<InspectedPlugin, (String, String)>> {
+) -> Vec<Result<InspectedPlugin, ScanFailure>> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if active_versions.is_empty() {
+                return Vec::new();
+            }
+            return active_versions
+                .keys()
+                .map(|id| {
+                    Err(ScanFailure {
+                        plugin_id: id.clone(),
+                        code: "PLUGIN_SCAN_IO",
+                        phase: "installed_root",
+                        message: format!("Cannot scan plugin directory: {error}"),
+                        retryable: true,
+                    })
+                })
+                .collect();
+        }
         Err(error) => {
-            return vec![Err((
-                String::new(),
-                format!("Cannot scan plugin directory: {error}"),
-            ))];
+            return if active_versions.is_empty() {
+                vec![Err(ScanFailure {
+                    plugin_id: String::new(),
+                    code: "PLUGIN_SCAN_IO",
+                    phase: "installed_root",
+                    message: format!("Cannot scan plugin directory: {error}"),
+                    retryable: true,
+                })]
+            } else {
+                active_versions
+                    .keys()
+                    .map(|id| {
+                        Err(ScanFailure {
+                            plugin_id: id.clone(),
+                            code: "PLUGIN_SCAN_IO",
+                            phase: "installed_root",
+                            message: format!("Cannot scan plugin directory: {error}"),
+                            retryable: true,
+                        })
+                    })
+                    .collect()
+            };
         }
     };
     let mut plugins = Vec::new();
@@ -182,10 +331,25 @@ pub(crate) fn scan_installed_root(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                plugins.push(Err((
-                    String::new(),
-                    format!("Cannot read plugin directory entry: {error}"),
-                )));
+                if active_versions.is_empty() {
+                    plugins.push(Err(ScanFailure {
+                        plugin_id: String::new(),
+                        code: "PLUGIN_SCAN_IO",
+                        phase: "installed_root",
+                        message: format!("Cannot read plugin directory entry: {error}"),
+                        retryable: true,
+                    }));
+                } else {
+                    plugins.extend(active_versions.keys().map(|id| {
+                        Err(ScanFailure {
+                            plugin_id: id.clone(),
+                            code: "PLUGIN_SCAN_IO",
+                            phase: "installed_root",
+                            message: format!("Cannot read plugin directory entry: {error}"),
+                            retryable: true,
+                        })
+                    }));
+                }
                 continue;
             }
         };
@@ -193,74 +357,108 @@ pub(crate) fn scan_installed_root(
         if id.starts_with(".staging-") {
             continue;
         }
-        let path = entry.path();
-        if let Err(error) = ensure_real_directory(&path) {
-            plugins.push(Err((id, error)));
-            continue;
-        }
-        let versions = match fs::read_dir(&path) {
-            Ok(versions) => versions,
-            Err(error) => {
-                plugins.push(Err((
-                    id,
-                    format!("Cannot read installed versions: {error}"),
-                )));
-                continue;
-            }
-        };
-        let mut choices: Vec<(Version, PathBuf)> = Vec::new();
-        let mut invalid_version = None;
-        for version_entry in versions {
-            let version_entry = match version_entry {
-                Ok(version_entry) => version_entry,
-                Err(error) => {
-                    invalid_version = Some(format!("Cannot read version entry: {error}"));
-                    continue;
-                }
-            };
-            let version_path = version_entry.path();
-            if ensure_real_directory(&version_path).is_err() {
-                invalid_version =
-                    Some("Installed plugin version is not a regular directory.".to_owned());
-                continue;
-            }
-            match Version::parse(&version_entry.file_name().to_string_lossy()) {
-                Ok(version) => choices.push((version, version_path)),
-                Err(_) => {
-                    invalid_version =
-                        Some("Installed plugin has an invalid version directory.".to_owned())
-                }
-            }
-        }
-        choices.sort_by(|left, right| right.0.cmp(&left.0));
-        let preferred = active_versions.get(&id).and_then(|active| {
-            choices
-                .iter()
-                .find(|(version, _)| version.to_string() == *active)
-        });
-        if let Some((_, selected)) = preferred.or_else(|| choices.first()) {
-            match inspect_directory(selected, cfg!(debug_assertions)) {
-                Ok(plugin)
-                    if plugin.manifest.id == id
-                        && plugin.manifest.version
-                            == selected
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or_default() =>
-                {
-                    plugins.push(Ok(plugin))
-                }
-                Ok(_) => plugins.push(Err((
-                    id,
-                    "Manifest ID or version does not match its installation directory.".to_owned(),
-                ))),
-                Err(error) => plugins.push(Err((id, error))),
-            }
-        } else if let Some(error) = invalid_version {
-            plugins.push(Err((id, error)));
-        }
+        plugins.push(scan_installed_plugin(
+            root,
+            &id,
+            active_versions.get(&id).map(String::as_str),
+        ));
     }
     plugins
+}
+
+pub(crate) fn scan_installed_plugin(
+    root: &Path,
+    id: &str,
+    active_version: Option<&str>,
+) -> Result<InspectedPlugin, ScanFailure> {
+    let plugin_path = root.join(id);
+    ensure_real_directory(&plugin_path)
+        .map_err(|message| scan_failure(id, "plugin_directory", message))?;
+    let versions = fs::read_dir(&plugin_path).map_err(|error| ScanFailure {
+        plugin_id: id.to_owned(),
+        code: "PLUGIN_SCAN_IO",
+        phase: "version_directory",
+        message: format!("Cannot read installed versions: {error}"),
+        retryable: true,
+    })?;
+
+    let mut choices: Vec<(Version, PathBuf)> = Vec::new();
+    let mut invalid_version = None;
+    for version_entry in versions {
+        let version_entry = version_entry.map_err(|error| ScanFailure {
+            plugin_id: id.to_owned(),
+            code: "PLUGIN_SCAN_IO",
+            phase: "version_directory",
+            message: format!("Cannot read version entry: {error}"),
+            retryable: true,
+        })?;
+        let version_path = version_entry.path();
+        if let Err(message) = ensure_real_directory(&version_path) {
+            invalid_version = Some(message);
+            continue;
+        }
+        match Version::parse(&version_entry.file_name().to_string_lossy()) {
+            Ok(version) => choices.push((version, version_path)),
+            Err(_) => {
+                invalid_version =
+                    Some("Installed plugin has an invalid version directory.".to_owned())
+            }
+        }
+    }
+    choices.sort_by(|left, right| right.0.cmp(&left.0));
+    let preferred = active_version.and_then(|active| {
+        choices
+            .iter()
+            .find(|(version, _)| version.to_string() == active)
+    });
+    if let Some((_, selected)) = preferred.or_else(|| choices.first()) {
+        match inspect_directory(selected, cfg!(debug_assertions)) {
+            Ok(plugin)
+                if plugin.manifest.id == id
+                    && plugin.manifest.version
+                        == selected
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default() =>
+            {
+                Ok(plugin)
+            }
+            Ok(_) => Err(ScanFailure {
+                plugin_id: id.to_owned(),
+                code: "INVALID_PACKAGE",
+                phase: "manifest_validation",
+                message: "Manifest ID or version does not match its installation directory."
+                    .to_owned(),
+                retryable: false,
+            }),
+            Err(message) => Err(scan_failure(id, "package_validation", message)),
+        }
+    } else if let Some(message) = invalid_version {
+        Err(scan_failure(id, "version_directory", message))
+    } else {
+        Err(ScanFailure {
+            plugin_id: id.to_owned(),
+            code: "PLUGIN_PACKAGE_MISSING",
+            phase: "version_directory",
+            message: "No installed plugin version directory was found.".to_owned(),
+            retryable: true,
+        })
+    }
+}
+
+fn scan_failure(id: &str, phase: &'static str, message: String) -> ScanFailure {
+    let retryable = message.starts_with("Cannot ") || message == "Package path does not exist.";
+    ScanFailure {
+        plugin_id: id.to_owned(),
+        code: if retryable {
+            "PLUGIN_SCAN_IO"
+        } else {
+            "INVALID_PACKAGE"
+        },
+        phase,
+        message,
+        retryable,
+    }
 }
 
 pub(crate) fn install_path(root: &Path, manifest: &PluginManifest) -> PathBuf {

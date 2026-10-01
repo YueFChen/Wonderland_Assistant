@@ -23,7 +23,7 @@ export type PluginUiContributionKind = "activity" | "view";
 export type PluginUiCommand = { id: string, title: string, inputSchema: unknown, effect: PluginUiCommandEffect, };
 export type PluginUiCommandEffect = "read_only" | "mutating";
 export type PluginBackend = { entry: string, transport: string, };
-export type InstallationState = "missing" | "installed" | "invalid" | "incompatible";
+export type InstallationState = "missing" | "installed" | "checking" | "invalid" | "incompatible";
 export type RuntimeState = "stopped" | "starting" | "running" | "stopping" | "failed";
 export type PluginFailure = { code: string, message: string,
 /**
@@ -31,7 +31,8 @@ export type PluginFailure = { code: string, message: string,
  */
 occurredAt: string, };
 export type PluginInstallSource = { kind: string, origin: string, author: string | null, };
-export type PluginRuntimeState = { manifest: PluginManifest, installation: InstallationState, enabled: boolean, runtime: RuntimeState, lastError: PluginFailure | null, grantedCapabilities: Array<string>, installationSource: PluginInstallSource | null, serviceDependencyIssues?: Array<string>,
+export type PluginScanDiagnostic = { coreVersion: string, code: string, phase: string, message: string, retryAttempt: number, retryLimit: number, retrying: boolean, retryable: boolean, };
+export type PluginRuntimeState = { manifest: PluginManifest, installation: InstallationState, scanDiagnostic?: PluginScanDiagnostic | null, enabled: boolean, runtime: RuntimeState, lastError: PluginFailure | null, grantedCapabilities: Array<string>, installationSource: PluginInstallSource | null, serviceDependencyIssues?: Array<string>,
 /**
  * Expected per-plugin persistent data directory managed by Core.
  */

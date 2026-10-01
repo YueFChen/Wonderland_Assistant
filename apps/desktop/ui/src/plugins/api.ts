@@ -68,6 +68,8 @@ export interface PluginUiLaunchInfo {
 /** Core 只暴露稳定的插件宿主命令，不按插件业务拆分 Tauri IPC。 */
 export const pluginApi = {
   states: () => invoke<PluginRuntimeState[]>('plugins_list'),
+  retryScan: (pluginId: string) =>
+    invoke<PluginRuntimeState[]>('plugins_retry_scan', { pluginId }),
   catalog: () => invoke<PluginCatalogSnapshot>('plugins_catalog_list'),
   installCatalog: (pluginId: string, version: string, expectedSha256: string, approvedCapabilities: string[], approvedSourceChange: boolean) =>
     invoke<PluginRuntimeState[]>('plugins_catalog_install', {

@@ -1,4 +1,4 @@
-import { Database, Image, Images, Languages, MessageCircle, MessagesSquare, PenLine, Puzzle, type LucideIcon } from 'lucide-react'
+import { Database, Image, Images, Languages, MessageCircle, MessagesSquare, PenLine, Puzzle, Radar, type LucideIcon } from 'lucide-react'
 
 /** 插件 manifest 注册图标名；宿主只负责把名字映射到统一图标组件。 */
 const ICONS: Record<string, LucideIcon> = {
@@ -10,6 +10,7 @@ const ICONS: Record<string, LucideIcon> = {
   'pen-line': PenLine,
   puzzle: Puzzle,
   languages: Languages,
+  radar: Radar,
 }
 
 export function pluginIcon(name: string): LucideIcon {

@@ -17,7 +17,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
-use wonderland_kernel::logging::warn;
+use wonderland_kernel::logging::{debug, error, info, trace, warn};
 use wonderland_plugin_protocol::{
     PROTOCOL_ID, PROTOCOL_VERSION, PluginError, PluginErrorMessage, PluginEvent, PluginHello,
     PluginRequest, PluginResult, PluginRuntimeState,
@@ -35,6 +35,7 @@ const MAX_EXPORTED_FILE_BYTES: usize = 20 * 1024 * 1024;
 const FILE_HANDLE_TTL: Duration = Duration::from_secs(5 * 60);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_PLUGIN_STDERR_LINE_BYTES: usize = 8 * 1024;
 
 pub(crate) struct PluginProcess {
     child: Mutex<Child>,
@@ -103,6 +104,14 @@ impl PluginProcess {
             message: format!("Unable to start plugin backend: {error}"),
             details: None,
         })?;
+        let process_id = child.id();
+        info!(
+            plugin_id = %plugin_id,
+            version = %state.manifest.version,
+            process_id,
+            phase = "process_spawn",
+            "插件后端进程已创建"
+        );
         let stdin = child
             .stdin
             .take()
@@ -141,9 +150,10 @@ impl PluginProcess {
             .map_err(|error| {
                 internal_error(&format!("Cannot start plugin stdout reader: {error}"))
             })?;
+        let stderr_plugin_id = plugin_id.clone();
         thread::Builder::new()
             .name(format!("plugin-{plugin_id}-stderr"))
-            .spawn(move || read_stderr(stderr, plugin_id.clone()))
+            .spawn(move || read_stderr(stderr, stderr_plugin_id))
             .map_err(|error| {
                 internal_error(&format!("Cannot start plugin stderr reader: {error}"))
             })?;
@@ -178,6 +188,18 @@ impl PluginProcess {
             || hello.plugin_version != state.manifest.version
             || hello.contract_sha256 != contract_sha256
         {
+            warn!(
+                plugin_id = %plugin_id,
+                expected_version = %state.manifest.version,
+                protocol_matches = hello.protocol == PROTOCOL_ID,
+                protocol_version_matches = hello.version == PROTOCOL_VERSION,
+                role_matches = hello.role == "plugin",
+                plugin_id_matches = hello.plugin_id == state.manifest.id,
+                plugin_version_matches = hello.plugin_version == state.manifest.version,
+                contract_matches = hello.contract_sha256 == contract_sha256,
+                phase = "handshake_validation",
+                "插件握手身份或合约校验失败"
+            );
             return Err(PluginError {
                 code: "PLUGIN_START_FAILED".to_owned(),
                 message: "Plugin handshake identity or contract does not match its manifest."
@@ -185,6 +207,13 @@ impl PluginProcess {
                 details: None,
             });
         }
+        info!(
+            plugin_id = %plugin_id,
+            version = %hello.plugin_version,
+            protocol_version = hello.version,
+            phase = "handshake",
+            "插件握手成功"
+        );
         Ok(process)
     }
 
@@ -337,6 +366,12 @@ impl PluginProcess {
             .and_then(|()| stdin.flush())
             .map_err(|error| {
                 self.alive.store(false, Ordering::Release);
+                warn!(
+                    plugin_id = %self.plugin_id,
+                    phase = "protocol_write",
+                    reason = %error,
+                    "向插件后端发送协议消息失败"
+                );
                 plugin_error(
                     "PLUGIN_CRASHED",
                     &format!("Plugin process is not accepting input: {error}"),
@@ -473,6 +508,16 @@ fn read_stdout(
             first_frame = false;
             let hello =
                 serde_json::from_value::<PluginHello>(frame).map_err(|error| error.to_string());
+            if let Err(message) = &hello
+                && let Some(process) = process.upgrade()
+            {
+                warn!(
+                    plugin_id = %process.plugin_id,
+                    phase = "handshake",
+                    reason = %message,
+                    "插件握手响应无效"
+                );
+            }
             if let Some(process) = process.upgrade()
                 && let Ok(mut waiter) = process.hello_waiter.lock()
                 && let Some(waiter) = waiter.take()
@@ -620,7 +665,15 @@ fn read_stdout(
     };
 
     if let Some(process) = process.upgrade() {
-        process.alive.store(false, Ordering::Release);
+        if process.alive.swap(false, Ordering::AcqRel) {
+            warn!(
+                plugin_id = %process.plugin_id,
+                code = %exit_error.code,
+                reason = %exit_error.message,
+                phase = "protocol_stream",
+                "插件后端通信流已结束"
+            );
+        }
         if let Ok(mut waiter) = process.hello_waiter.lock()
             && let Some(waiter) = waiter.take()
         {
@@ -1472,16 +1525,142 @@ fn model_service_error(error: wonderland_net::ModelError) -> PluginError {
 
 fn read_stderr(stderr: ChildStderr, plugin_id: String) {
     let mut reader = BufReader::new(stderr);
-    let mut line = String::new();
+    let mut line = Vec::with_capacity(MAX_PLUGIN_STDERR_LINE_BYTES);
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {
-                let diagnostic: String = line.chars().take(2_048).collect();
-                warn!(plugin_id = %plugin_id, diagnostic = %diagnostic.trim_end(), "插件后端诊断输出");
+        let truncated = match read_bounded_line(&mut reader, &mut line) {
+            Ok(Some(truncated)) => truncated,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(plugin_id = %plugin_id, reason = %error, "读取插件后端标准错误失败");
+                return;
             }
+        };
+        let diagnostic = String::from_utf8_lossy(&line);
+        let diagnostic =
+            diagnostic.trim_end_matches(|character| character == '\r' || character == '\n');
+        log_plugin_diagnostic(
+            parse_plugin_log_level(diagnostic),
+            &plugin_id,
+            diagnostic,
+            truncated,
+        );
+    }
+}
+
+/// 从 stderr 中至多缓冲一条限定长度的文本，并排空超出上限的部分。
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Option<bool>> {
+    line.clear();
+    let mut read_any = false;
+    let mut truncated = false;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(read_any.then_some(truncated));
         }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        let consumed = content_len + if newline.is_some() { 1 } else { 0 };
+        let copied = content_len.min(MAX_PLUGIN_STDERR_LINE_BYTES - line.len());
+        line.extend_from_slice(&available[..copied]);
+        truncated |= copied < content_len;
+        read_any = true;
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            return Ok(Some(truncated));
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PluginLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+/// Parses common tracing prefixes and JSON `level` fields; unknown lines remain visible as info.
+fn parse_plugin_log_level(line: &str) -> PluginLogLevel {
+    if line.trim_start().starts_with('{')
+        && let Ok(value) = serde_json::from_str::<Value>(line)
+        && let Some(level) = value.get("level").and_then(Value::as_str)
+        && let Some(level) = parse_plugin_log_level_token(level)
+    {
+        return level;
+    }
+
+    for token in line.trim_start().split_whitespace().take(4) {
+        let token = token
+            .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_');
+        let token = token.rsplit_once('=').map_or(token, |(_, value)| value);
+        if let Some(level) = parse_plugin_log_level_token(token) {
+            return level;
+        }
+    }
+
+    PluginLogLevel::Info
+}
+
+fn parse_plugin_log_level_token(token: &str) -> Option<PluginLogLevel> {
+    if token.eq_ignore_ascii_case("error") {
+        Some(PluginLogLevel::Error)
+    } else if token.eq_ignore_ascii_case("warn") || token.eq_ignore_ascii_case("warning") {
+        Some(PluginLogLevel::Warn)
+    } else if token.eq_ignore_ascii_case("info") {
+        Some(PluginLogLevel::Info)
+    } else if token.eq_ignore_ascii_case("debug") {
+        Some(PluginLogLevel::Debug)
+    } else if token.eq_ignore_ascii_case("trace") {
+        Some(PluginLogLevel::Trace)
+    } else {
+        None
+    }
+}
+
+fn log_plugin_diagnostic(
+    level: PluginLogLevel,
+    plugin_id: &str,
+    diagnostic: &str,
+    truncated: bool,
+) {
+    match level {
+        PluginLogLevel::Error => error!(
+            plugin_id = %plugin_id,
+            diagnostic = %diagnostic,
+            diagnostic_truncated = truncated,
+            "插件后端诊断输出"
+        ),
+        PluginLogLevel::Warn => warn!(
+            plugin_id = %plugin_id,
+            diagnostic = %diagnostic,
+            diagnostic_truncated = truncated,
+            "插件后端诊断输出"
+        ),
+        PluginLogLevel::Info => info!(
+            plugin_id = %plugin_id,
+            diagnostic = %diagnostic,
+            diagnostic_truncated = truncated,
+            "插件后端诊断输出"
+        ),
+        PluginLogLevel::Debug => debug!(
+            plugin_id = %plugin_id,
+            diagnostic = %diagnostic,
+            diagnostic_truncated = truncated,
+            "插件后端诊断输出"
+        ),
+        PluginLogLevel::Trace => trace!(
+            plugin_id = %plugin_id,
+            diagnostic = %diagnostic,
+            diagnostic_truncated = truncated,
+            "插件后端诊断输出"
+        ),
     }
 }
 

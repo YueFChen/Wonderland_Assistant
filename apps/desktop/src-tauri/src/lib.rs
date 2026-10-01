@@ -477,6 +477,7 @@ fn run_application(cli: Option<CliInvocation>, desktop_data_dir: Option<PathBuf>
         })
         .invoke_handler(tauri::generate_handler![
             plugin_manager::plugins_list,
+            plugin_manager::plugins_retry_scan,
             plugin_manager::plugins_catalog_list,
             plugin_manager::plugins_catalog_install,
             plugin_manager::plugins_install,

@@ -5,9 +5,11 @@ mod redact;
 
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
+use tracing_appender::non_blocking::{ErrorCounter, NonBlockingBuilder, WorkerGuard};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::{fmt, registry, reload};
@@ -18,6 +20,12 @@ use wonderland_kernel::logging::{
 
 /// 非阻塞写入队列的最大行数。
 const BUFFERED_LINES_LIMIT: usize = 8_192;
+const DROP_MONITOR_INTERVAL: Duration = Duration::from_secs(5);
+
+struct DropMonitor {
+    stop: mpsc::Sender<()>,
+    worker: JoinHandle<()>,
+}
 
 /// 已安装的日志系统：改级别句柄 + 后台写入守卫。
 ///
@@ -26,6 +34,8 @@ pub struct Logging {
     filter: filter::FilterHandle,
     /// 后台写入守卫。
     guard: Mutex<Option<WorkerGuard>>,
+    /// 监测 lossy 队列丢弃日志的后台任务。
+    drop_monitor: Mutex<Option<DropMonitor>>,
 }
 
 impl Logging {
@@ -38,6 +48,13 @@ impl Logging {
     ///
     /// 排空待写日志并停止后台写入线程。仅在应用退出时调用。
     pub fn shutdown(&self) {
+        if let Ok(mut monitor) = self.drop_monitor.lock()
+            && let Some(monitor) = monitor.take()
+        {
+            let _ = monitor.stop.send(());
+            let _ = monitor.worker.join();
+        }
+
         if let Ok(mut guard) = self.guard.lock() {
             drop(guard.take());
         }
@@ -66,6 +83,7 @@ fn init_with(
         .lossy(true)
         .buffered_lines_limit(BUFFERED_LINES_LIMIT)
         .finish(appender);
+    let error_counter = writer.error_counter();
 
     let (filter_layer, handle) =
         reload::Layer::new(filter::build(rust_log.as_deref(), settings.level));
@@ -89,11 +107,60 @@ fn init_with(
         .map_err(|error| KernelError::Other(format!("日志系统已初始化过：{error}")))?;
 
     install_panic_hook();
+    let drop_monitor = match start_drop_monitor(error_counter) {
+        Ok(monitor) => Some(monitor),
+        Err(error) => {
+            error!(reason = %error, "日志丢弃监测器启动失败");
+            None
+        }
+    };
 
     Ok(Logging {
         filter: filter::FilterHandle::new(handle, rust_log),
         guard: Mutex::new(Some(guard)),
+        drop_monitor: Mutex::new(drop_monitor),
     })
+}
+
+/// 定期报告非阻塞队列丢弃的日志行数。
+fn start_drop_monitor(error_counter: ErrorCounter) -> std::io::Result<DropMonitor> {
+    let (stop, receiver) = mpsc::channel();
+    let worker = thread::Builder::new()
+        .name("wonderland-log-drop-monitor".to_owned())
+        .spawn(move || {
+            let mut reported = 0;
+            loop {
+                match receiver.recv_timeout(DROP_MONITOR_INTERVAL) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        report_dropped_lines(&error_counter, &mut reported);
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        report_dropped_lines(&error_counter, &mut reported);
+                    }
+                }
+            }
+        })?;
+
+    Ok(DropMonitor { stop, worker })
+}
+
+fn report_dropped_lines(error_counter: &ErrorCounter, reported: &mut usize) {
+    let total = error_counter.dropped_lines();
+    if total <= *reported {
+        return;
+    }
+
+    error!(
+        dropped_lines = total - *reported,
+        total_dropped_lines = total,
+        "非阻塞日志队列已丢弃日志"
+    );
+
+    // lossy writer 在队列满时仍返回成功；只有计数未继续增加时才能确认提示没有被丢弃。
+    if error_counter.dropped_lines() == total {
+        *reported = total;
+    }
 }
 
 /// 创建按天轮转的日志文件 appender。

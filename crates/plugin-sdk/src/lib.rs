@@ -164,6 +164,27 @@ where
         + Sync
         + 'static,
 {
+    serve_with_startup(plugin_id, plugin_version, contract, |_| {}, dispatch)
+}
+
+/// Serve a protocol backend and invoke `startup` after the Core handshake succeeds.
+///
+/// The startup callback receives a cloneable host client so plugins can launch
+/// background work that continues while the Core process remains alive.
+pub fn serve_with_startup<F, S>(
+    plugin_id: &'static str,
+    plugin_version: &'static str,
+    contract: &'static str,
+    startup: S,
+    dispatch: F,
+) -> Result<(), String>
+where
+    F: Fn(HostClient, String, Value, Option<String>) -> Result<Value, PluginError>
+        + Send
+        + Sync
+        + 'static,
+    S: FnOnce(HostClient),
+{
     let writer = Arc::new(Mutex::new(BufWriter::new(std::io::stdout())));
     let host = HostClient::new(writer.clone());
     let stdin = std::io::stdin();
@@ -180,6 +201,8 @@ where
     let hash = sha256_hex(contract.as_bytes());
     write_frame(&writer, &json!({"protocol": PROTOCOL, "version": VERSION, "type": "hello", "role": "plugin", "pluginId": plugin_id, "pluginVersion": plugin_version, "contractSha256": hash}))
         .map_err(|error| format!("Cannot write plugin hello: {error}"))?;
+
+    startup(host.clone());
 
     let dispatch = Arc::new(dispatch);
     loop {

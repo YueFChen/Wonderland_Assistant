@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { PluginRuntimeState } from '@wonderland/plugin-protocol'
-import { ChevronDown, PackagePlus, Trash2 } from 'lucide-react'
+import { ChevronDown, Clipboard, PackagePlus, RotateCw, Trash2 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 
 import { pluginApi } from '../plugins/api'
@@ -77,6 +77,18 @@ export function PluginManagement({ states, error, setStates }: {
     }
   }
 
+  const retryScan = async (state: PluginRuntimeState) => {
+    setBusy(state.manifest.id)
+    setFailure('')
+    try {
+      setStates(await pluginApi.retryScan(state.manifest.id))
+    } catch (cause) {
+      setFailure(t('settings.plugins.scan.retryFailed', { error: errorText(cause) }))
+    } finally {
+      setBusy('')
+    }
+  }
+
   return (
     <>
     <section className="glass-card rounded-2xl border border-glass-line p-3 sm:p-4">
@@ -120,6 +132,7 @@ export function PluginManagement({ states, error, setStates }: {
                 setUninstallTarget(state)
               }}
               onCapabilitiesChange={(capabilities) => void setCapabilities(state, capabilities)}
+              onRetryScan={() => void retryScan(state)}
             />
           ))}
         </ul>
@@ -205,15 +218,33 @@ export function PluginManagement({ states, error, setStates }: {
   )
 }
 
-function PluginCard({ state, busy, onToggle, onUninstall, onCapabilitiesChange }: {
+function PluginCard({ state, busy, onToggle, onUninstall, onCapabilitiesChange, onRetryScan }: {
   state: PluginRuntimeState
   busy: boolean
   onToggle: (enabled: boolean) => void
   onUninstall: () => void
   onCapabilitiesChange: (capabilities: string[]) => void
+  onRetryScan: () => void
 }) {
+  const [copiedDiagnostic, setCopiedDiagnostic] = useState(false)
   const enabled = state.enabled
-  const issue = state.lastError?.message ?? state.serviceDependencyIssues?.join(' · ')
+  const issue = state.scanDiagnostic?.message ?? state.lastError?.message ?? state.serviceDependencyIssues?.join(' · ')
+  const copyScanDiagnostic = async () => {
+    if (!state.scanDiagnostic) return
+    const text = JSON.stringify({
+      pluginId: state.manifest.id,
+      pluginVersion: state.manifest.version,
+      occurredAt: state.lastError?.occurredAt ?? null,
+      ...state.scanDiagnostic,
+    }, null, 2)
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopiedDiagnostic(true)
+      window.setTimeout(() => setCopiedDiagnostic(false), 1800)
+    } catch {
+      setCopiedDiagnostic(false)
+    }
+  }
   const sourceLabel = state.installationSource?.kind === 'catalog'
     ? t('settings.plugins.source.catalog', { author: state.installationSource.author ?? t('workspace.authorUnknown') })
     : state.installationSource?.kind === 'local'
@@ -231,7 +262,13 @@ function PluginCard({ state, busy, onToggle, onUninstall, onCapabilitiesChange }
             </span>
             {state.installation !== 'installed' && (
               <span className="rounded-full border border-[var(--app-danger-line)] px-1.5 py-0.5 text-[10px] text-[var(--app-danger)]">
-                {t(state.installation === 'invalid' ? 'pluginPage.invalid' : 'pluginPage.incompatible')}
+                {t(state.installation === 'invalid'
+                  ? 'pluginPage.invalid'
+                  : state.installation === 'checking'
+                    ? state.scanDiagnostic?.retrying
+                      ? 'settings.plugins.scan.checking'
+                      : 'settings.plugins.scan.waiting'
+                    : 'pluginPage.incompatible')}
               </span>
             )}
           </div>
@@ -241,6 +278,49 @@ function PluginCard({ state, busy, onToggle, onUninstall, onCapabilitiesChange }
           <p className={`mt-1 truncate text-[11px] ${issue ? 'text-[var(--app-danger)]' : 'text-ink-muted'}`} title={issue ?? undefined}>
             {issue ?? t(`settings.plugins.runtime.${state.runtime}`)}
           </p>
+          {state.scanDiagnostic && (
+            <div className="mt-2 rounded-lg border border-glass-line bg-glass px-2.5 py-2">
+              <p className="text-[10px] font-medium text-ink-muted">
+                {state.scanDiagnostic.retrying
+                  ? t('settings.plugins.scan.retrying', {
+                    attempt: state.scanDiagnostic.retryAttempt,
+                    limit: state.scanDiagnostic.retryLimit,
+                  })
+                  : state.scanDiagnostic.retryable
+                    ? t('settings.plugins.scan.retryAvailable')
+                    : t('settings.plugins.scan.permanentFailure')}
+              </p>
+              <p className="mt-1 break-all font-mono text-[10px] text-ink-faint" title={`${state.scanDiagnostic.code} · ${state.scanDiagnostic.phase}`}>
+                {state.scanDiagnostic.code} · {state.scanDiagnostic.phase}
+              </p>
+              <p className="mt-1 max-h-16 overflow-auto whitespace-pre-wrap break-words text-[10px] leading-4 text-ink-faint">
+                {state.scanDiagnostic.message}
+              </p>
+              <div className="mt-2 flex gap-2">
+                {state.scanDiagnostic.code !== 'PLUGIN_SCAN_RETRY_UNAVAILABLE' && (
+                  <button
+                    type="button"
+                    disabled={busy || state.scanDiagnostic.retrying}
+                    onClick={onRetryScan}
+                    className="inline-flex items-center gap-1 rounded-md border border-glass-line px-2 py-1 text-[10px] text-ink-muted transition hover:bg-glass-hover disabled:opacity-50"
+                  >
+                    <RotateCw className="h-3 w-3" aria-hidden />
+                    {t('settings.plugins.scan.retry')}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void copyScanDiagnostic()}
+                  className="inline-flex items-center gap-1 rounded-md border border-glass-line px-2 py-1 text-[10px] text-ink-muted transition hover:bg-glass-hover"
+                >
+                  <Clipboard className="h-3 w-3" aria-hidden />
+                  {copiedDiagnostic
+                    ? t('settings.plugins.scan.copied')
+                    : t('settings.plugins.scan.copyDiagnostic')}
+                </button>
+              </div>
+            </div>
+          )}
           {(!state.manifest.ui || (state.manifest.provides && state.manifest.provides.length > 0)) && (
             <p className="mt-1 truncate text-[10px] text-ink-faint" title={state.manifest.provides?.map((service) => `${service.id} v${service.version}`).join('、')}>
               {!state.manifest.ui && t('settings.plugins.serviceOnly')}

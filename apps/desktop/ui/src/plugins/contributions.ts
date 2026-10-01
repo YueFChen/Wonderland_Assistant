@@ -82,6 +82,7 @@ export function openContribution(
 }
 
 function contributionStatus(state: PluginRuntimeState): ContributionStatus {
+  if (state.installation === 'checking') return 'failed'
   if (state.installation === 'invalid') return 'invalid'
   if (state.installation === 'incompatible') return 'incompatible'
   if ((state.serviceDependencyIssues?.length ?? 0) > 0) return 'failed'

@@ -5,10 +5,9 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-#[cfg(debug_assertions)]
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -17,16 +16,16 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use wonderland_kernel::AppContext;
-use wonderland_kernel::logging::warn;
+use wonderland_kernel::logging::{error, info, warn};
 use wonderland_plugin_protocol::{
     HostCompatibility, InstallationState, PROTOCOL_SUPPORTED_VERSIONS, PluginBackend, PluginError,
     PluginFailure, PluginInstallSource, PluginManifest, PluginPlatform, PluginRuntimeState,
-    PluginService, PluginServiceRequirement, PluginServiceResolution, PluginUi, PluginUiCommand,
-    PluginUiCommandEffect, PluginUiContribution, PluginUiContributionKind, ProtocolCompatibility,
-    RuntimeState, UI_BRIDGE_SUPPORTED_VERSIONS,
+    PluginScanDiagnostic, PluginService, PluginServiceRequirement, PluginServiceResolution,
+    PluginUi, PluginUiCommand, PluginUiCommandEffect, PluginUiContribution,
+    PluginUiContributionKind, ProtocolCompatibility, RuntimeState, UI_BRIDGE_SUPPORTED_VERSIONS,
 };
 
 use crate::{plugin_package, plugin_runtime::PluginProcess};
@@ -39,6 +38,11 @@ const CATALOG_MAX_BYTES: usize = 2 * 1024 * 1024;
 const CATALOG_MAX_ITEMS: usize = 500;
 const CATALOG_UPDATE_MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 const PLUGIN_PACKAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
+const PLUGIN_SCAN_RETRY_DELAYS_SECS: [u64; 6] = [1, 2, 4, 8, 12, 20];
+const PLUGIN_SCAN_RETRY_LIMIT: u8 = PLUGIN_SCAN_RETRY_DELAYS_SECS.len() as u8 + 1;
+const PLUGIN_SCAN_RETRY_WINDOW: Duration = Duration::from_secs(60);
+static NEXT_PLUGIN_SCAN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_PLUGIN_INSTALL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -146,6 +150,8 @@ struct PluginManagerInner {
     installed_root: PathBuf,
     app_handle: AppHandle,
     next_service_request_id: AtomicU64,
+    next_scan_retry_id: AtomicU64,
+    auto_start_requested: AtomicBool,
     state: Mutex<PluginManagerState>,
 }
 
@@ -162,6 +168,14 @@ struct PluginRecord {
     contract_sha256: String,
     process: Option<Arc<PluginProcess>>,
     revision: u64,
+    scan_retry: Option<PluginScanRetry>,
+}
+
+struct PluginScanRetry {
+    attempts: u8,
+    started_at: Instant,
+    worker_id: u64,
+    worker_running: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,12 +216,21 @@ impl PluginManager {
         let documents_dir = context.documents_dir.clone();
         let installed_root = app_data_dir.join("installed-plugins");
         fs::create_dir_all(&installed_root).map_err(|error| {
+            error!(phase = "create_install_root", reason = %error, "插件管理器初始化失败");
             plugin_error(
                 "INTERNAL",
                 &format!("Cannot create plugin installation directory: {error}"),
             )
         })?;
         let (preferences, config_error) = load_preferences(&app_data_dir);
+        if let Some(config_error) = &config_error {
+            warn!(phase = "load_preferences", reason = %config_error, "插件设置加载异常，将使用恢复后的设置");
+        }
+        info!(
+            core_version = env!("CARGO_PKG_VERSION"),
+            configured_plugin_count = preferences.active_versions.len(),
+            "插件管理器初始化"
+        );
         let manager = Self {
             inner: Arc::new(PluginManagerInner {
                 app_data_dir,
@@ -215,6 +238,8 @@ impl PluginManager {
                 installed_root,
                 app_handle,
                 next_service_request_id: AtomicU64::new(1),
+                next_scan_retry_id: AtomicU64::new(1),
+                auto_start_requested: AtomicBool::new(false),
                 state: Mutex::new(PluginManagerState {
                     preferences,
                     config_error,
@@ -229,6 +254,9 @@ impl PluginManager {
     /// Starts enabled, compatible plugins independently so one slow or broken plugin does not
     /// block the desktop window from opening.
     pub fn start_enabled(&self) {
+        self.inner
+            .auto_start_requested
+            .store(true, Ordering::Release);
         let ids = self
             .snapshots()
             .into_iter()
@@ -239,15 +267,29 @@ impl PluginManager {
             })
             .map(|state| state.manifest.id)
             .collect::<Vec<_>>();
+        info!(
+            plugin_count = ids.len(),
+            phase = "auto_start",
+            "调度已启用插件启动"
+        );
         for plugin_id in ids {
             let manager = self.clone();
-            let _ = thread::Builder::new()
+            let worker_plugin_id = plugin_id.clone();
+            let spawn = thread::Builder::new()
                 .name(format!("plugin-{plugin_id}-start"))
                 .spawn(move || {
-                    if let Err(error) = manager.inner.start_one(&plugin_id) {
-                        warn!(plugin_id = %plugin_id, code = %error.code, "插件启动失败");
+                    if let Err(error) = manager.inner.start_one(&worker_plugin_id) {
+                        warn!(
+                            plugin_id = %worker_plugin_id,
+                            code = %error.code,
+                            reason = %error.message,
+                            "插件启动失败"
+                        );
                     }
                 });
+            if let Err(error) = spawn {
+                error!(plugin_id = %plugin_id, reason = %error, "无法创建插件启动线程");
+            }
         }
     }
 
@@ -293,6 +335,7 @@ impl PluginManager {
     }
 
     fn refresh(&self) -> Result<(), PluginError> {
+        let scan_id = NEXT_PLUGIN_SCAN_ID.fetch_add(1, Ordering::Relaxed);
         let active_versions = self
             .inner
             .state
@@ -301,8 +344,18 @@ impl PluginManager {
             .preferences
             .active_versions
             .clone();
+        let scan_started = Instant::now();
+        info!(
+            scan_id,
+            active_plugin_count = active_versions.len(),
+            phase = "installed_root",
+            "开始扫描已安装插件"
+        );
         let scanned =
             plugin_package::scan_installed_root(&self.inner.installed_root, &active_versions);
+        let scanned_count = scanned.len();
+        let mut valid_count = 0_usize;
+        let mut invalid_count = 0_usize;
         let mut state = self
             .inner
             .state
@@ -322,111 +375,71 @@ impl PluginManager {
         for item in scanned {
             match item {
                 Ok(plugin) => {
+                    valid_count += 1;
                     let id = plugin.manifest.id.clone();
                     let version = plugin.manifest.version.clone();
-                    let enabled = if let Some(enabled) = state.preferences.enabled_plugins.get(&id)
-                    {
-                        *enabled && state.config_error.is_none()
-                    } else {
-                        preferences_changed = true;
-                        state.config_error.is_none()
-                    };
-                    state
-                        .preferences
-                        .enabled_plugins
-                        .entry(id.clone())
-                        .or_insert(enabled);
-                    state
-                        .preferences
-                        .active_versions
-                        .insert(id.clone(), version);
-                    let requested = plugin.manifest.capabilities.iter().collect::<BTreeSet<_>>();
-                    let grant_key = capability_grant_key(&id);
-                    let (granted, grant_added) =
-                        match state.preferences.granted_capabilities.entry(grant_key) {
-                            std::collections::btree_map::Entry::Vacant(entry) => {
-                                (entry.insert(plugin.manifest.capabilities.clone()), true)
-                            }
-                            std::collections::btree_map::Entry::Occupied(entry) => {
-                                let granted = entry.into_mut();
-                                if activate_legacy_defaults && granted.is_empty() {
-                                    *granted = plugin.manifest.capabilities.clone();
-                                    (granted, true)
-                                } else {
-                                    (granted, false)
-                                }
-                            }
-                        };
-                    preferences_changed |= grant_added;
-                    let original_len = granted.len();
-                    granted.retain(|capability| requested.contains(capability));
-                    preferences_changed |= original_len != granted.len();
-
-                    let installation = if plugin.compatible {
-                        InstallationState::Installed
-                    } else {
-                        InstallationState::Incompatible
-                    };
-                    let mut snapshot = PluginRuntimeState {
-                        manifest: plugin.manifest.clone(),
-                        installation,
-                        enabled: enabled && installation == InstallationState::Installed,
-                        runtime: RuntimeState::Stopped,
-                        last_error: if installation == InstallationState::Incompatible {
-                            Some(failure(
-                                "INCOMPATIBLE_CORE",
-                                "Plugin does not support this Core version, protocol, platform, or architecture.",
-                            ))
-                        } else {
-                            None
-                        },
-                        granted_capabilities: granted.clone(),
-                        installation_source: state
-                            .preferences
-                            .installation_sources
-                            .get(&id)
-                            .cloned(),
-                        service_dependency_issues: Vec::new(),
-                        plugin_data_directory: Some(
-                            self.inner
-                                .app_data_dir
-                                .join("plugin-data")
-                                .join(&id)
-                                .to_string_lossy()
-                                .into_owned(),
-                        ),
-                    };
-                    let previous_record = old.get(&id);
-                    let revision = previous_record
-                        .map(|record| record.revision.wrapping_add(1))
-                        .unwrap_or_default();
-                    let process = previous_record.and_then(|record| {
-                        (record.directory == plugin.directory
-                            && record
-                                .process
-                                .as_ref()
-                                .is_some_and(|process| process.is_alive()))
-                        .then(|| record.process.clone())
-                        .flatten()
-                    });
-                    if process.is_some() {
-                        snapshot.runtime = RuntimeState::Running;
-                    }
-                    next.insert(
-                        id,
-                        PluginRecord {
-                            snapshot,
-                            directory: plugin.directory,
-                            contract: plugin.contract,
-                            contract_sha256: plugin.contract_sha256,
-                            process,
-                            revision,
-                        },
+                    info!(
+                        scan_id,
+                        plugin_id = %id,
+                        version = %version,
+                        compatible = plugin.compatible,
+                        phase = "package_validation",
+                        "插件包扫描成功"
                     );
+                    let previous_record = old.get(&id);
+                    let (record, changed) = scanned_plugin_record(
+                        &self.inner.app_data_dir,
+                        &mut state,
+                        plugin,
+                        previous_record,
+                        activate_legacy_defaults,
+                    );
+                    preferences_changed |= changed;
+                    next.insert(id, record);
                 }
-                Err((id, message)) => {
-                    let id = safe_display_id(&id, next.len());
-                    let snapshot = invalid_snapshot(&id, &message);
+                Err(scan_error) => {
+                    invalid_count += 1;
+                    let id = safe_display_id(&scan_error.plugin_id, next.len());
+                    let message =
+                        sanitize_scan_message(&self.inner.app_data_dir, &scan_error.message);
+                    let diagnostic_retryable =
+                        scan_error.retryable && valid_plugin_id(&scan_error.plugin_id);
+                    let can_retry = diagnostic_retryable;
+                    let installation = if can_retry {
+                        InstallationState::Checking
+                    } else {
+                        InstallationState::Invalid
+                    };
+                    let diagnostic_code = if can_retry {
+                        scan_error.code
+                    } else if scan_error.retryable {
+                        "PLUGIN_SCAN_RETRY_UNAVAILABLE"
+                    } else {
+                        scan_error.code
+                    };
+                    let mut snapshot = invalid_snapshot(&id, &message);
+                    snapshot.installation = installation;
+                    snapshot.last_error = Some(failure(diagnostic_code, &message));
+                    snapshot.scan_diagnostic = Some(PluginScanDiagnostic {
+                        core_version: env!("CARGO_PKG_VERSION").to_owned(),
+                        code: diagnostic_code.to_owned(),
+                        phase: scan_error.phase.to_owned(),
+                        message: message.clone(),
+                        retry_attempt: u8::from(can_retry),
+                        retry_limit: PLUGIN_SCAN_RETRY_LIMIT,
+                        retrying: can_retry,
+                        retryable: diagnostic_retryable,
+                    });
+                    warn!(
+                        scan_id,
+                        plugin_id = %id,
+                        code = diagnostic_code,
+                        phase = scan_error.phase,
+                        retryable = scan_error.retryable,
+                        attempt = u8::from(can_retry),
+                        error = %message,
+                        "插件包扫描失败"
+                    );
                     next.insert(
                         id,
                         PluginRecord {
@@ -436,6 +449,12 @@ impl PluginManager {
                             contract_sha256: String::new(),
                             process: None,
                             revision: 0,
+                            scan_retry: can_retry.then(|| PluginScanRetry {
+                                attempts: 1,
+                                started_at: Instant::now(),
+                                worker_id: 0,
+                                worker_running: false,
+                            }),
                         },
                     );
                 }
@@ -444,10 +463,35 @@ impl PluginManager {
         state.plugins = next;
         update_service_dependency_issues(&mut state.plugins);
         if preferences_changed {
-            persist_preferences(&self.inner.app_data_dir, &state.preferences).map_err(|error| {
-                plugin_error("INTERNAL", &format!("Cannot save plugin state: {error}"))
-            })?;
+            if let Err(error) = persist_preferences(&self.inner.app_data_dir, &state.preferences) {
+                error!(phase = "persist_preferences", reason = %error, "保存插件设置失败");
+                return Err(plugin_error(
+                    "INTERNAL",
+                    &format!("Cannot save plugin state: {error}"),
+                ));
+            }
             state.config_error = None;
+        }
+        let retry_ids = state
+            .plugins
+            .iter()
+            .filter(|(_, record)| record.scan_retry.is_some())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let retry_count = retry_ids.len();
+        drop(state);
+        info!(
+            scan_id,
+            scanned = scanned_count,
+            valid = valid_count,
+            invalid = invalid_count,
+            retrying = retry_count,
+            elapsed_ms = scan_started.elapsed().as_millis() as u64,
+            phase = "installed_root",
+            "已安装插件扫描完成"
+        );
+        for id in retry_ids {
+            self.schedule_plugin_scan_retry(&id, false);
         }
         Ok(())
     }
@@ -484,6 +528,487 @@ impl PluginManager {
         snapshots
     }
 
+    fn schedule_plugin_scan_retry(&self, plugin_id: &str, immediate: bool) {
+        let worker_id = self
+            .inner
+            .next_scan_retry_id
+            .fetch_add(1, Ordering::Relaxed);
+        let should_spawn = {
+            let Ok(mut state) = self.inner.state.lock() else {
+                return;
+            };
+            let Some(record) = state.plugins.get_mut(plugin_id) else {
+                return;
+            };
+            let Some(retry) = record.scan_retry.as_mut() else {
+                return;
+            };
+            if retry.worker_running {
+                return;
+            }
+            retry.worker_running = true;
+            retry.worker_id = worker_id;
+            true
+        };
+        if !should_spawn {
+            return;
+        }
+        info!(
+            plugin_id = %plugin_id,
+            worker_id,
+            first_attempt = immediate,
+            attempt_limit = PLUGIN_SCAN_RETRY_LIMIT,
+            retry_window_seconds = PLUGIN_SCAN_RETRY_WINDOW.as_secs(),
+            "已调度插件包扫描重试"
+        );
+
+        let manager = self.clone();
+        let worker_plugin_id = plugin_id.to_owned();
+        let spawn = thread::Builder::new()
+            .name(format!("plugin-{worker_plugin_id}-scan-retry"))
+            .spawn(move || {
+                manager.run_plugin_scan_retry_worker(&worker_plugin_id, immediate, worker_id)
+            });
+        if let Err(error) = spawn {
+            self.finish_scan_retry_worker_error(plugin_id, worker_id, &error.to_string());
+        }
+    }
+
+    fn run_plugin_scan_retry_worker(&self, plugin_id: &str, immediate: bool, worker_id: u64) {
+        let mut immediate_attempt = immediate;
+        loop {
+            let delay = match self.inner.state.lock() {
+                Ok(state) => {
+                    let Some(record) = state.plugins.get(plugin_id) else {
+                        return;
+                    };
+                    let Some(retry) = record.scan_retry.as_ref() else {
+                        return;
+                    };
+                    if !retry.worker_running || retry.worker_id != worker_id {
+                        return;
+                    }
+                    let elapsed = retry.started_at.elapsed();
+                    if retry.attempts >= PLUGIN_SCAN_RETRY_LIMIT
+                        || elapsed >= PLUGIN_SCAN_RETRY_WINDOW
+                    {
+                        None
+                    } else if immediate_attempt || retry.attempts == 0 {
+                        Some(Duration::ZERO)
+                    } else {
+                        Some(Duration::from_secs(
+                            PLUGIN_SCAN_RETRY_DELAYS_SECS[(retry.attempts - 1) as usize],
+                        ))
+                    }
+                }
+                Err(_) => return,
+            };
+            let Some(delay) = delay else {
+                self.finish_scan_retry_exhausted(plugin_id, worker_id);
+                return;
+            };
+
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+
+            let attempt_context = match self.inner.state.lock() {
+                Ok(mut state) => {
+                    let active_version = state.preferences.active_versions.get(plugin_id).cloned();
+                    let Some(record) = state.plugins.get_mut(plugin_id) else {
+                        return;
+                    };
+                    let Some(retry) = record.scan_retry.as_mut() else {
+                        return;
+                    };
+                    if !retry.worker_running || retry.worker_id != worker_id {
+                        return;
+                    }
+                    if retry.started_at.elapsed() >= PLUGIN_SCAN_RETRY_WINDOW
+                        || retry.attempts >= PLUGIN_SCAN_RETRY_LIMIT
+                    {
+                        None
+                    } else {
+                        retry.attempts = retry.attempts.saturating_add(1);
+                        let attempt = retry.attempts;
+                        if let Some(diagnostic) = record.snapshot.scan_diagnostic.as_mut() {
+                            diagnostic.retry_attempt = attempt;
+                            diagnostic.retrying = true;
+                        }
+                        Some((
+                            attempt,
+                            active_version,
+                            retry.started_at.elapsed().as_millis() as u64,
+                        ))
+                    }
+                }
+                Err(_) => return,
+            };
+            let Some((attempt, active_version, retry_elapsed_ms)) = attempt_context else {
+                self.finish_scan_retry_exhausted(plugin_id, worker_id);
+                return;
+            };
+            immediate_attempt = false;
+            self.emit_plugin_states_changed();
+
+            info!(
+                plugin_id = %plugin_id,
+                worker_id,
+                attempt,
+                attempt_limit = PLUGIN_SCAN_RETRY_LIMIT,
+                retry_elapsed_ms,
+                phase = "package_validation",
+                "开始插件包扫描重试"
+            );
+            let scan_started = Instant::now();
+            let result = plugin_package::scan_installed_plugin(
+                &self.inner.installed_root,
+                plugin_id,
+                active_version.as_deref(),
+            );
+            let scan_elapsed_ms = scan_started.elapsed().as_millis() as u64;
+            match result {
+                Ok(plugin) => {
+                    self.accept_scanned_plugin(plugin, attempt, worker_id, scan_elapsed_ms);
+                    return;
+                }
+                Err(scan_error) => {
+                    let keep_retrying = self.record_scan_retry_failure(
+                        scan_error,
+                        attempt,
+                        worker_id,
+                        scan_elapsed_ms,
+                    );
+                    if !keep_retrying {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_scan_retry_failure(
+        &self,
+        scan_error: plugin_package::ScanFailure,
+        attempt: u8,
+        worker_id: u64,
+        scan_elapsed_ms: u64,
+    ) -> bool {
+        let plugin_id = safe_display_id(&scan_error.plugin_id, 0);
+        let message = sanitize_scan_message(&self.inner.app_data_dir, &scan_error.message);
+        let mut keep_retrying = false;
+        let mut applied = false;
+        if let Ok(mut state) = self.inner.state.lock()
+            && let Some(record) = state.plugins.get_mut(&plugin_id)
+            && record
+                .scan_retry
+                .as_ref()
+                .is_some_and(|retry| retry.worker_running && retry.worker_id == worker_id)
+        {
+            applied = true;
+            let exhausted = record.scan_retry.as_ref().is_some_and(|retry| {
+                retry.attempts >= PLUGIN_SCAN_RETRY_LIMIT
+                    || retry.started_at.elapsed() >= PLUGIN_SCAN_RETRY_WINDOW
+            });
+            let attempts = record
+                .scan_retry
+                .as_ref()
+                .map(|retry| retry.attempts)
+                .unwrap_or(attempt);
+            keep_retrying = scan_error.retryable && !exhausted;
+            let code = if exhausted {
+                "PLUGIN_SCAN_RETRY_EXHAUSTED"
+            } else {
+                scan_error.code
+            };
+            let detail = if exhausted {
+                if attempts >= PLUGIN_SCAN_RETRY_LIMIT {
+                    format!(
+                        "Automatic verification stopped after {attempts} attempts. Last error: {message}"
+                    )
+                } else {
+                    format!(
+                        "Automatic verification stopped after 60 seconds and {attempts} attempts. Last error: {message}"
+                    )
+                }
+            } else {
+                message.clone()
+            };
+            let core_version = record
+                .snapshot
+                .scan_diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.core_version.clone())
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+            record.snapshot.installation = if scan_error.retryable {
+                InstallationState::Checking
+            } else {
+                InstallationState::Invalid
+            };
+            record.snapshot.enabled = false;
+            record.snapshot.last_error = Some(failure(code, &detail));
+            record.snapshot.scan_diagnostic = Some(PluginScanDiagnostic {
+                core_version,
+                code: code.to_owned(),
+                phase: scan_error.phase.to_owned(),
+                message: detail.clone(),
+                retry_attempt: attempt,
+                retry_limit: PLUGIN_SCAN_RETRY_LIMIT,
+                retrying: keep_retrying,
+                retryable: scan_error.retryable,
+            });
+            if !keep_retrying {
+                if let Some(retry) = record.scan_retry.as_mut() {
+                    retry.worker_running = false;
+                }
+            }
+        }
+        if !applied {
+            return false;
+        }
+        warn!(
+            plugin_id = %plugin_id,
+            code = scan_error.code,
+            phase = scan_error.phase,
+            retryable = scan_error.retryable,
+            attempt,
+            worker_id,
+            elapsed_ms = scan_elapsed_ms,
+            error = %message,
+            "插件包扫描重试失败"
+        );
+        self.emit_plugin_states_changed();
+        keep_retrying
+    }
+
+    fn finish_scan_retry_exhausted(&self, plugin_id: &str, worker_id: u64) {
+        let mut applied = false;
+        let mut attempts = 0;
+        if let Ok(mut state) = self.inner.state.lock()
+            && let Some(record) = state.plugins.get_mut(plugin_id)
+            && record
+                .scan_retry
+                .as_ref()
+                .is_some_and(|retry| retry.worker_id == worker_id)
+        {
+            applied = true;
+            attempts = record
+                .scan_retry
+                .as_ref()
+                .map(|retry| retry.attempts)
+                .unwrap_or_default();
+            if let Some(retry) = record.scan_retry.as_mut() {
+                retry.worker_running = false;
+            }
+            record.snapshot.installation = InstallationState::Checking;
+            record.snapshot.enabled = false;
+            if let Some(diagnostic) = record.snapshot.scan_diagnostic.as_mut() {
+                diagnostic.code = "PLUGIN_SCAN_RETRY_EXHAUSTED".to_owned();
+                diagnostic.message = if attempts >= PLUGIN_SCAN_RETRY_LIMIT {
+                    format!(
+                        "Automatic verification stopped after {attempts} attempts. Last error: {}",
+                        diagnostic.message
+                    )
+                } else {
+                    format!(
+                        "Automatic verification stopped after 60 seconds and {attempts} attempts. Last error: {}",
+                        diagnostic.message
+                    )
+                };
+                diagnostic.retry_attempt = attempts;
+                diagnostic.retrying = false;
+                diagnostic.retryable = true;
+                record.snapshot.last_error =
+                    Some(failure("PLUGIN_SCAN_RETRY_EXHAUSTED", &diagnostic.message));
+            }
+        }
+        if !applied {
+            return;
+        }
+        warn!(
+            plugin_id = %plugin_id,
+            attempts,
+            attempt_limit = PLUGIN_SCAN_RETRY_LIMIT,
+            worker_id,
+            retry_window_seconds = PLUGIN_SCAN_RETRY_WINDOW.as_secs(),
+            "插件包自动扫描重试已达到上限"
+        );
+        self.emit_plugin_states_changed();
+    }
+
+    fn finish_scan_retry_worker_error(&self, plugin_id: &str, worker_id: u64, error: &str) {
+        let mut applied = false;
+        if let Ok(mut state) = self.inner.state.lock()
+            && let Some(record) = state.plugins.get_mut(plugin_id)
+            && record
+                .scan_retry
+                .as_ref()
+                .is_some_and(|retry| retry.worker_id == worker_id)
+        {
+            applied = true;
+            if let Some(retry) = record.scan_retry.as_mut() {
+                retry.worker_running = false;
+            }
+            record.snapshot.installation = InstallationState::Checking;
+            if let Some(diagnostic) = record.snapshot.scan_diagnostic.as_mut() {
+                diagnostic.code = "PLUGIN_SCAN_RETRY_WORKER_FAILED".to_owned();
+                diagnostic.message = format!("Could not start plugin scan retry worker: {error}");
+                diagnostic.retrying = false;
+                diagnostic.retryable = true;
+                record.snapshot.last_error = Some(failure(
+                    "PLUGIN_SCAN_RETRY_WORKER_FAILED",
+                    &diagnostic.message,
+                ));
+            }
+        }
+        if !applied {
+            return;
+        }
+        warn!(plugin_id = %plugin_id, error = %error, "插件扫描重试线程启动失败");
+        self.emit_plugin_states_changed();
+    }
+
+    fn accept_scanned_plugin(
+        &self,
+        plugin: plugin_package::InspectedPlugin,
+        attempt: u8,
+        worker_id: u64,
+        scan_elapsed_ms: u64,
+    ) {
+        let plugin_id = plugin.manifest.id.clone();
+        let mut should_start = false;
+        if let Ok(mut state) = self.inner.state.lock() {
+            if !state
+                .plugins
+                .get(&plugin_id)
+                .and_then(|record| record.scan_retry.as_ref())
+                .is_some_and(|retry| retry.worker_running && retry.worker_id == worker_id)
+            {
+                return;
+            }
+            let previous_record = state.plugins.remove(&plugin_id);
+            let activate_legacy_defaults = state.preferences.schema_version < 2;
+            let (record, preferences_changed) = scanned_plugin_record(
+                &self.inner.app_data_dir,
+                &mut state,
+                plugin,
+                previous_record.as_ref(),
+                activate_legacy_defaults,
+            );
+            should_start = record.snapshot.enabled
+                && record.snapshot.installation == InstallationState::Installed;
+            let version = record.snapshot.manifest.version.clone();
+            state.plugins.insert(plugin_id.clone(), record);
+            update_service_dependency_issues(&mut state.plugins);
+            if preferences_changed {
+                if let Err(error) =
+                    persist_preferences(&self.inner.app_data_dir, &state.preferences)
+                {
+                    warn!(plugin_id = %plugin_id, error = %error, "插件扫描恢复后无法保存插件设置");
+                }
+            }
+            info!(
+                plugin_id = %plugin_id,
+                version = %version,
+                attempt,
+                worker_id,
+                elapsed_ms = scan_elapsed_ms,
+                "插件包扫描恢复成功"
+            );
+        }
+        self.emit_plugin_states_changed();
+        if should_start && self.inner.auto_start_requested.load(Ordering::Acquire) {
+            let manager = self.clone();
+            let worker_plugin_id = plugin_id.clone();
+            let plugin_id_for_error = plugin_id.clone();
+            let spawn = thread::Builder::new()
+                .name(format!("plugin-{worker_plugin_id}-start-after-scan"))
+                .spawn(move || {
+                    if let Err(error) = manager.inner.start_one(&worker_plugin_id) {
+                        warn!(
+                            plugin_id = %worker_plugin_id,
+                            code = %error.code,
+                            reason = %error.message,
+                            "插件扫描恢复后启动失败"
+                        );
+                    }
+                });
+            if let Err(error) = spawn {
+                error!(plugin_id = %plugin_id_for_error, reason = %error, "无法创建扫描恢复后的插件启动线程");
+            }
+        }
+    }
+
+    fn retry_plugin_scan(&self, plugin_id: &str) -> Result<Vec<PluginRuntimeState>, PluginError> {
+        if !valid_plugin_id(plugin_id) {
+            return Err(plugin_error("INVALID_REQUEST", "Plugin ID is invalid."));
+        }
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| plugin_error("INTERNAL", "Plugin state is unavailable."))?;
+            let record = state
+                .plugins
+                .get_mut(plugin_id)
+                .ok_or_else(|| not_installed(plugin_id))?;
+            if record
+                .scan_retry
+                .as_ref()
+                .is_some_and(|retry| retry.worker_running)
+            {
+                return Err(plugin_error(
+                    "PLUGIN_SCAN_IN_PROGRESS",
+                    "Plugin package verification is already running.",
+                ));
+            }
+            if record.snapshot.scan_diagnostic.is_none() {
+                return Err(plugin_error(
+                    "INVALID_REQUEST",
+                    "This plugin has no package scan failure to retry.",
+                ));
+            }
+            if record
+                .snapshot
+                .scan_diagnostic
+                .as_ref()
+                .is_some_and(|diagnostic| diagnostic.code == "PLUGIN_SCAN_RETRY_UNAVAILABLE")
+            {
+                return Err(plugin_error(
+                    "INVALID_REQUEST",
+                    "The installed plugin root could not be associated with a plugin ID.",
+                ));
+            }
+            record.snapshot.installation = InstallationState::Checking;
+            record.snapshot.enabled = false;
+            if let Some(diagnostic) = record.snapshot.scan_diagnostic.as_mut() {
+                diagnostic.code = "PLUGIN_SCAN_RETRYING".to_owned();
+                diagnostic.message = "Manual plugin package verification started.".to_owned();
+                diagnostic.retry_attempt = 0;
+                diagnostic.retrying = true;
+                diagnostic.retryable = true;
+            }
+            record.snapshot.last_error = Some(failure(
+                "PLUGIN_SCAN_RETRYING",
+                "Manual plugin package verification started.",
+            ));
+            record.scan_retry = Some(PluginScanRetry {
+                attempts: 0,
+                started_at: Instant::now(),
+                worker_id: 0,
+                worker_running: false,
+            });
+        }
+        info!(plugin_id = %plugin_id, source = "manual", "用户请求重新检查插件包");
+        self.schedule_plugin_scan_retry(plugin_id, true);
+        Ok(self.snapshots())
+    }
+
+    fn emit_plugin_states_changed(&self) {
+        let _ = self.inner.app_handle.emit("plugins:changed", ());
+    }
+
     /// Installs a local package directory passed by a development launch script.
     /// This entry point is unavailable in release builds and uses the same package
     /// validation and atomic replacement path as the developer directory picker.
@@ -493,13 +1018,30 @@ impl PluginManager {
         source: PathBuf,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
         if !source.is_dir() {
+            warn!(
+                source_kind = "local",
+                source_type = "development_directory",
+                phase = "resolve_source",
+                "开发插件目录不存在"
+            );
             return Err(plugin_error(
                 "INVALID_REQUEST",
                 "The configured development plugin directory does not exist.",
             ));
         }
-        let manifest = plugin_package::manifest_for_install_source(&source)
-            .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
+        let manifest = match plugin_package::manifest_for_install_source(&source) {
+            Ok(manifest) => manifest,
+            Err(message) => {
+                warn!(
+                    source_kind = "local",
+                    source_type = "development_directory",
+                    phase = "manifest_inspection",
+                    error = %message,
+                    "开发插件目录清单读取失败"
+                );
+                return Err(plugin_error("INVALID_REQUEST", &message));
+            }
+        };
         self.install(source, true, true, Some(&manifest))?;
         self.set_enabled(&manifest.id, true)
     }
@@ -512,13 +1054,35 @@ impl PluginManager {
         approve_source_change: bool,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
         if source.is_dir() && !cfg!(debug_assertions) {
+            warn!(
+                source_kind = "local",
+                source_type = "development_directory",
+                phase = "resolve_source",
+                "发布版 CLI 拒绝安装开发目录"
+            );
             return Err(plugin_error(
                 "INVALID_REQUEST",
                 "Release CLI installs require a validated .wplug archive.",
             ));
         }
-        let manifest = plugin_package::manifest_for_install_source(&source)
-            .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
+        let source_type = if source.is_dir() {
+            "development_directory"
+        } else {
+            "archive"
+        };
+        let manifest = match plugin_package::manifest_for_install_source(&source) {
+            Ok(manifest) => manifest,
+            Err(message) => {
+                warn!(
+                    source_kind = "local",
+                    source_type,
+                    phase = "manifest_inspection",
+                    error = %message,
+                    "本地插件包清单读取失败"
+                );
+                return Err(plugin_error("INVALID_REQUEST", &message));
+            }
+        };
         let approved = approved_capabilities.iter().collect::<BTreeSet<_>>();
         if approved.len() != approved_capabilities.len() {
             return Err(plugin_error(
@@ -537,6 +1101,15 @@ impl PluginManager {
             ));
         }
         let origin = source.canonicalize().map_err(|error| {
+            warn!(
+                plugin_id = %manifest.id,
+                version = %manifest.version,
+                source_kind = "local",
+                source_type,
+                phase = "resolve_source",
+                reason = %error,
+                "无法解析本地插件包路径"
+            );
             plugin_error(
                 "INVALID_REQUEST",
                 &format!("Cannot resolve local package: {error}"),
@@ -544,6 +1117,12 @@ impl PluginManager {
         })?;
         let install_path = plugin_package::install_path(&self.inner.installed_root, &manifest);
         if install_path.exists() && !overwrite {
+            warn!(
+                plugin_id = %manifest.id,
+                version = %manifest.version,
+                phase = "preflight",
+                "插件包已安装且未允许覆盖"
+            );
             return Err(plugin_error(
                 "ALREADY_INSTALLED",
                 "This plugin version is already installed. Pass --overwrite to replace it.",
@@ -569,8 +1148,19 @@ impl PluginManager {
         entry: &PluginCatalogEntry,
         approved_source_change: bool,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
-        let manifest = plugin_package::manifest_for_install_source(&source)
-            .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
+        let manifest = match plugin_package::manifest_for_install_source(&source) {
+            Ok(manifest) => manifest,
+            Err(message) => {
+                warn!(
+                    source_kind = "catalog",
+                    source_type = "archive",
+                    phase = "manifest_inspection",
+                    error = %message,
+                    "目录插件包清单读取失败"
+                );
+                return Err(plugin_error("INVALID_REQUEST", &message));
+            }
+        };
         let manifest_capabilities = manifest
             .capabilities
             .iter()
@@ -611,12 +1201,24 @@ impl PluginManager {
             && manifest.platform.architecture == entry.platform.architecture
             && manifest.platform.abi == entry.platform.abi;
         if !manifest_matches {
+            warn!(
+                plugin_id = %entry.id,
+                version = %entry.version,
+                phase = "catalog_review",
+                "下载的插件包元数据与已审核目录不匹配"
+            );
             return Err(plugin_error(
                 "CATALOG_MISMATCH",
                 "The downloaded package metadata does not match the reviewed catalog entry.",
             ));
         }
         if !plugin_package::manifest_is_compatible(&manifest) {
+            warn!(
+                plugin_id = %manifest.id,
+                version = %manifest.version,
+                phase = "compatibility_check",
+                "目录插件包与当前 Core 不兼容"
+            );
             return Err(plugin_error(
                 "INCOMPATIBLE_CORE",
                 "This plugin version is incompatible with the current Core.",
@@ -644,6 +1246,12 @@ impl PluginManager {
         reviewed_manifest: Option<&PluginManifest>,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
         let origin = source.canonicalize().map_err(|error| {
+            warn!(
+                source_kind = "local",
+                phase = "resolve_source",
+                reason = %error,
+                "无法解析本地插件包路径"
+            );
             plugin_error(
                 "INVALID_REQUEST",
                 &format!("Cannot resolve local package: {error}"),
@@ -672,11 +1280,52 @@ impl PluginManager {
         install_source: PluginInstallSource,
         approved_source_change: bool,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
-        let source_manifest = plugin_package::manifest_for_install_source(&source)
-            .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
+        let install_id = NEXT_PLUGIN_INSTALL_ID.fetch_add(1, Ordering::Relaxed);
+        let source_kind = install_source.kind.clone();
+        let source_type = if source.is_dir() {
+            "development_directory"
+        } else {
+            "archive"
+        };
+        let install_started = Instant::now();
+        let source_manifest = match plugin_package::manifest_for_install_source(&source) {
+            Ok(manifest) => manifest,
+            Err(message) => {
+                warn!(
+                    install_id,
+                    source_kind = %source_kind,
+                    source_type,
+                    phase = "manifest_inspection",
+                    error = %message,
+                    "插件包安装失败"
+                );
+                return Err(plugin_error("INVALID_REQUEST", &message));
+            }
+        };
+        info!(
+            install_id,
+            plugin_id = %source_manifest.id,
+            version = %source_manifest.version,
+            source_kind = %source_kind,
+            source_type,
+            overwrite,
+            phase = "preflight",
+            "开始安装插件包"
+        );
         if let Some(reviewed) = reviewed_manifest {
-            plugin_package::ensure_reviewed_manifest(reviewed, &source_manifest)
-                .map_err(|message| plugin_error("INVALID_REQUEST", &message))?;
+            if let Err(message) =
+                plugin_package::ensure_reviewed_manifest(reviewed, &source_manifest)
+            {
+                warn!(
+                    install_id,
+                    plugin_id = %source_manifest.id,
+                    version = %source_manifest.version,
+                    phase = "manifest_review",
+                    error = %message,
+                    "插件包安装失败"
+                );
+                return Err(plugin_error("INVALID_REQUEST", &message));
+            }
         }
         let replacing_same_version = overwrite
             && plugin_package::install_path(&self.inner.installed_root, &source_manifest).exists();
@@ -712,15 +1361,36 @@ impl PluginManager {
                     .cloned(),
             )
         };
-        let source_changed = check_install_source(
+        let source_changed = match check_install_source(
             previous_version.as_deref(),
             previous_source.as_ref(),
             &install_source,
             approved_source_change,
-        )?;
+        ) {
+            Ok(changed) => changed,
+            Err(error) => {
+                warn!(
+                    install_id,
+                    plugin_id = %source_manifest.id,
+                    version = %source_manifest.version,
+                    code = %error.code,
+                    phase = "source_review",
+                    reason = %error.message,
+                    "插件包安装未通过来源检查"
+                );
+                return Err(error);
+            }
+        };
         let replacing_active_version = replacing_same_version
             && previous_version.as_deref() == Some(source_manifest.version.as_str());
         if replacing_active_version && !plugin_package::manifest_is_compatible(&source_manifest) {
+            warn!(
+                install_id,
+                plugin_id = %source_manifest.id,
+                version = %source_manifest.version,
+                phase = "compatibility_check",
+                "拒绝用不兼容版本替换当前插件"
+            );
             return Err(plugin_error(
                 "INCOMPATIBLE_CORE",
                 "The selected package cannot replace the active plugin because it is incompatible with this Core.",
@@ -733,6 +1403,7 @@ impl PluginManager {
         };
         let inspected_result = if source.is_dir() {
             plugin_package::install_development_directory(
+                install_id,
                 &source,
                 &self.inner.installed_root,
                 overwrite,
@@ -740,6 +1411,7 @@ impl PluginManager {
             )
         } else {
             plugin_package::install_archive(
+                install_id,
                 &source,
                 &self.inner.installed_root,
                 overwrite,
@@ -749,16 +1421,51 @@ impl PluginManager {
         let inspected = match inspected_result {
             Ok(inspected) => inspected,
             Err(message) => {
+                warn!(
+                    install_id,
+                    plugin_id = %source_manifest.id,
+                    version = %source_manifest.version,
+                    source_kind = %source_kind,
+                    source_type,
+                    overwrite,
+                    phase = "extract_validate_commit",
+                    elapsed_ms = install_started.elapsed().as_millis() as u64,
+                    error = %message,
+                    "插件包安装失败"
+                );
                 if was_running {
-                    let _ = self.inner.start_one(&source_manifest.id);
+                    if let Err(restore_error) = self.inner.start_one(&source_manifest.id) {
+                        error!(
+                            install_id,
+                            plugin_id = %source_manifest.id,
+                            code = %restore_error.code,
+                            reason = %restore_error.message,
+                            "安装失败后恢复原插件启动失败"
+                        );
+                    }
                 }
                 return Err(plugin_error("INVALID_REQUEST", &message));
             }
         };
         let plugin_id = inspected.manifest.id.clone();
         let version = inspected.manifest.version.clone();
+        info!(
+            install_id,
+            plugin_id = %plugin_id,
+            version = %version,
+            compatible = inspected.compatible,
+            phase = "package_validation",
+            "插件包解包与校验完成"
+        );
         let grant_key = capability_grant_key(&plugin_id);
         if !inspected.compatible && previous_version.is_some() {
+            warn!(
+                install_id,
+                plugin_id = %plugin_id,
+                version = %version,
+                phase = "compatibility_check",
+                "插件包已安装但与当前 Core 不兼容，未切换活动版本"
+            );
             return Err(plugin_error(
                 "INCOMPATIBLE_CORE",
                 "Plugin package was installed but not activated because it is incompatible with this Core.",
@@ -773,7 +1480,7 @@ impl PluginManager {
             state
                 .preferences
                 .active_versions
-                .insert(plugin_id.clone(), version);
+                .insert(plugin_id.clone(), version.clone());
             state
                 .preferences
                 .installation_sources
@@ -792,15 +1499,34 @@ impl PluginManager {
                     source_changed || previous_version.is_none(),
                 ),
             );
-            persist_preferences(&self.inner.app_data_dir, &state.preferences).map_err(|error| {
-                plugin_error(
+            if let Err(error) = persist_preferences(&self.inner.app_data_dir, &state.preferences) {
+                error!(
+                    install_id,
+                    plugin_id = %plugin_id,
+                    version = %version,
+                    phase = "persist_preferences",
+                    reason = %error,
+                    "插件包已安装但插件设置保存失败"
+                );
+                return Err(plugin_error(
                     "INTERNAL",
                     &format!("Plugin installed but preferences could not be saved: {error}"),
-                )
-            })?;
+                ));
+            }
             state.config_error = None;
         }
-        self.refresh()?;
+        if let Err(error) = self.refresh() {
+            error!(
+                install_id,
+                plugin_id = %plugin_id,
+                version = %version,
+                code = %error.code,
+                reason = %error.message,
+                phase = "post_install_refresh",
+                "插件包安装后刷新插件列表失败"
+            );
+            return Err(error);
+        }
         let should_start = self.snapshots().iter().any(|snapshot| {
             snapshot.manifest.id == plugin_id
                 && snapshot.installation == InstallationState::Installed
@@ -844,6 +1570,15 @@ impl PluginManager {
                 self.inner.start_one(&plugin_id)
             })();
             if let Err(rollback_error) = rollback {
+                error!(
+                    install_id,
+                    plugin_id = %plugin_id,
+                    version = %version,
+                    start_error = %error.message,
+                    rollback_error = %rollback_error.message,
+                    phase = "rollback",
+                    "新插件启动失败且回滚失败"
+                );
                 return Err(plugin_error(
                     "PLUGIN_START_FAILED",
                     &format!(
@@ -853,8 +1588,28 @@ impl PluginManager {
                 ));
             }
             // Keep the installed package available for inspection and recovery.
+            warn!(
+                install_id,
+                plugin_id = %plugin_id,
+                version = %version,
+                reason = %error.message,
+                phase = "rollback",
+                "新插件启动失败，已恢复旧版本"
+            );
             return Err(error);
         }
+        info!(
+            install_id,
+            plugin_id = %plugin_id,
+            version = %version,
+            source_kind = %source_kind,
+            overwrite,
+            compatible = inspected.compatible,
+            start_requested = should_start,
+            elapsed_ms = install_started.elapsed().as_millis() as u64,
+            phase = "complete",
+            "插件包安装完成"
+        );
         Ok(self.snapshots())
     }
 
@@ -897,6 +1652,13 @@ impl PluginManager {
                     record.snapshot.runtime = RuntimeState::Failed;
                     record.snapshot.last_error = Some(failure(&error.code, &error.message));
                 }
+                error!(
+                    plugin_id = %plugin_id,
+                    code = %error.code,
+                    reason = %error.message,
+                    phase = "stop_for_reinstall",
+                    "重新安装前停止插件失败"
+                );
                 return Err(error);
             }
             if let Ok(mut state) = self.inner.state.lock()
@@ -950,9 +1712,20 @@ impl PluginManager {
             next_preferences
                 .enabled_plugins
                 .insert(plugin_id.to_owned(), enabled);
-            persist_preferences(&self.inner.app_data_dir, &next_preferences).map_err(|error| {
-                plugin_error("INTERNAL", &format!("Cannot save plugin state: {error}"))
-            })?;
+            if let Err(error) = persist_preferences(&self.inner.app_data_dir, &next_preferences) {
+                error!(
+                    plugin_id = %plugin_id,
+                    enabled,
+                    phase = "persist_preferences",
+                    reason = %error,
+                    "保存插件启用状态失败"
+                );
+                return Err(plugin_error(
+                    "INTERNAL",
+                    &format!("Cannot save plugin state: {error}"),
+                ));
+            }
+            info!(plugin_id = %plugin_id, enabled, "更新插件启用状态");
             state.preferences = next_preferences;
             state.config_error = None;
             let record = state
@@ -978,6 +1751,13 @@ impl PluginManager {
                     record.snapshot.runtime = RuntimeState::Failed;
                     record.snapshot.last_error = Some(failure(&error.code, &error.message));
                 }
+                error!(
+                    plugin_id = %plugin_id,
+                    code = %error.code,
+                    reason = %error.message,
+                    phase = "stop_backend",
+                    "修改启用状态时停止插件失败"
+                );
                 return Err(error);
             }
             if let Ok(mut state) = self.inner.state.lock()
@@ -1115,6 +1895,8 @@ impl PluginManager {
         plugin_id: &str,
         remove_plugin_data: bool,
     ) -> Result<Vec<PluginRuntimeState>, PluginError> {
+        let uninstall_started = Instant::now();
+        info!(plugin_id = %plugin_id, remove_plugin_data, phase = "uninstall", "开始卸载插件");
         let process = {
             let mut state = self
                 .inner
@@ -1144,6 +1926,12 @@ impl PluginManager {
                 .insert(capability_grant_key(plugin_id), Vec::new());
             if let Err(error) = persist_preferences(&self.inner.app_data_dir, &state.preferences) {
                 state.preferences = previous_preferences;
+                error!(
+                    plugin_id = %plugin_id,
+                    phase = "prepare_uninstall",
+                    reason = %error,
+                    "无法安全准备插件卸载"
+                );
                 return Err(plugin_error(
                     "INTERNAL",
                     &format!("Cannot prepare plugin removal safely: {error}"),
@@ -1170,6 +1958,13 @@ impl PluginManager {
                     record.snapshot.runtime = RuntimeState::Failed;
                     record.snapshot.last_error = Some(failure(&error.code, &error.message));
                 }
+                error!(
+                    plugin_id = %plugin_id,
+                    code = %error.code,
+                    reason = %error.message,
+                    phase = "stop_backend",
+                    "卸载前停止插件失败"
+                );
                 return Err(plugin_error(
                     &error.code,
                     &format!(
@@ -1199,6 +1994,13 @@ impl PluginManager {
                 record.snapshot.runtime = RuntimeState::Stopped;
                 record.snapshot.last_error = Some(failure(&error.code, &error.message));
             }
+            error!(
+                plugin_id = %plugin_id,
+                code = %error.code,
+                reason = %error.message,
+                phase = "remove_package",
+                "卸载插件包失败"
+            );
             return Err(error);
         }
 
@@ -1231,7 +2033,23 @@ impl PluginManager {
         // `snapshots()` takes the same mutex; release this guard first to avoid
         // deadlocking after the package has already been removed.
         drop(state);
-        data_removal?;
+        if let Err(error) = data_removal {
+            error!(
+                plugin_id = %plugin_id,
+                code = %error.code,
+                reason = %error.message,
+                phase = "remove_private_data",
+                "插件包已卸载，但清理插件数据失败"
+            );
+            return Err(error);
+        }
+        info!(
+            plugin_id = %plugin_id,
+            remove_plugin_data,
+            elapsed_ms = uninstall_started.elapsed().as_millis() as u64,
+            phase = "uninstall",
+            "插件卸载完成"
+        );
         Ok(self.snapshots())
     }
 
@@ -1707,6 +2525,7 @@ impl PluginManager {
 
 impl PluginManagerInner {
     fn start_one(&self, plugin_id: &str) -> Result<(), PluginError> {
+        let start_started = Instant::now();
         let (snapshot, directory, contract, contract_sha256, previous_process, start_revision) = {
             let mut state = self
                 .state
@@ -1760,6 +2579,12 @@ impl PluginManagerInner {
                 start_revision,
             )
         };
+        info!(
+            plugin_id = %plugin_id,
+            version = %snapshot.manifest.version,
+            phase = "backend_start",
+            "开始启动插件后端"
+        );
         if let Some(process) = previous_process {
             if let Err(error) = process.stop() {
                 if let Ok(mut state) = self.state.lock()
@@ -1769,6 +2594,13 @@ impl PluginManagerInner {
                     record.snapshot.runtime = RuntimeState::Failed;
                     record.snapshot.last_error = Some(failure(&error.code, &error.message));
                 }
+                error!(
+                    plugin_id = %plugin_id,
+                    code = %error.code,
+                    reason = %error.message,
+                    phase = "stop_previous_process",
+                    "重启前停止旧插件进程失败"
+                );
                 return Err(error);
             }
             drop(process);
@@ -1826,12 +2658,18 @@ impl PluginManagerInner {
             if let Ok(process) = process {
                 let _ = process.stop();
             }
+            warn!(
+                plugin_id = %plugin_id,
+                version = %snapshot.manifest.version,
+                phase = "state_validation",
+                "插件启动期间状态已变化，已丢弃过期启动结果"
+            );
             return Err(plugin_error(
                 "PLUGIN_BUSY",
                 "Plugin state changed while the backend was starting; the stale process was stopped.",
             ));
         }
-        match process {
+        let result = match process {
             Ok(process) => {
                 record.snapshot.runtime = RuntimeState::Running;
                 record.snapshot.last_error = None;
@@ -1843,7 +2681,27 @@ impl PluginManagerInner {
                 record.snapshot.last_error = Some(failure(&error.code, &error.message));
                 Err(error)
             }
+        };
+        drop(state);
+        match &result {
+            Ok(()) => info!(
+                plugin_id = %plugin_id,
+                version = %snapshot.manifest.version,
+                elapsed_ms = start_started.elapsed().as_millis() as u64,
+                phase = "backend_start",
+                "插件后端启动成功"
+            ),
+            Err(error) => warn!(
+                plugin_id = %plugin_id,
+                version = %snapshot.manifest.version,
+                code = %error.code,
+                reason = %error.message,
+                elapsed_ms = start_started.elapsed().as_millis() as u64,
+                phase = "backend_start",
+                "插件后端启动失败"
+            ),
         }
+        result
     }
 }
 
@@ -2430,6 +3288,16 @@ pub fn plugins_list(
 ) -> Result<Vec<PluginRuntimeState>, PluginError> {
     ensure_main(&window)?;
     Ok(manager.snapshots())
+}
+
+#[tauri::command]
+pub fn plugins_retry_scan(
+    window: WebviewWindow,
+    manager: State<'_, PluginManager>,
+    plugin_id: String,
+) -> Result<Vec<PluginRuntimeState>, PluginError> {
+    ensure_main(&window)?;
+    manager.retry_plugin_scan(&plugin_id)
 }
 
 /// Reads the public plugin registry and each plugin's signed update manifest.
@@ -3476,6 +4344,117 @@ fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     fs::rename(source, destination)
 }
 
+fn scanned_plugin_record(
+    app_data_dir: &Path,
+    state: &mut PluginManagerState,
+    plugin: plugin_package::InspectedPlugin,
+    previous_record: Option<&PluginRecord>,
+    activate_legacy_defaults: bool,
+) -> (PluginRecord, bool) {
+    let id = plugin.manifest.id.clone();
+    let config_is_valid = state.config_error.is_none();
+    let mut preferences_changed = false;
+    let enabled = if let Some(enabled) = state.preferences.enabled_plugins.get(&id) {
+        *enabled && config_is_valid
+    } else {
+        preferences_changed = true;
+        config_is_valid
+    };
+    state
+        .preferences
+        .enabled_plugins
+        .entry(id.clone())
+        .or_insert(enabled);
+    state
+        .preferences
+        .active_versions
+        .insert(id.clone(), plugin.manifest.version.clone());
+
+    let requested = plugin.manifest.capabilities.iter().collect::<BTreeSet<_>>();
+    let grant_key = capability_grant_key(&id);
+    let (granted, grant_added) = match state.preferences.granted_capabilities.entry(grant_key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            (entry.insert(plugin.manifest.capabilities.clone()), true)
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => {
+            let granted = entry.into_mut();
+            if activate_legacy_defaults && granted.is_empty() {
+                *granted = plugin.manifest.capabilities.clone();
+                (granted, true)
+            } else {
+                (granted, false)
+            }
+        }
+    };
+    preferences_changed |= grant_added;
+    let original_len = granted.len();
+    granted.retain(|capability| requested.contains(capability));
+    preferences_changed |= original_len != granted.len();
+
+    let installation = if plugin.compatible {
+        InstallationState::Installed
+    } else {
+        InstallationState::Incompatible
+    };
+    let mut snapshot = PluginRuntimeState {
+        manifest: plugin.manifest.clone(),
+        installation,
+        scan_diagnostic: None,
+        enabled: enabled && installation == InstallationState::Installed,
+        runtime: RuntimeState::Stopped,
+        last_error: if installation == InstallationState::Incompatible {
+            Some(failure(
+                "INCOMPATIBLE_CORE",
+                "Plugin does not support this Core version, protocol, platform, or architecture.",
+            ))
+        } else {
+            None
+        },
+        granted_capabilities: granted.clone(),
+        installation_source: state.preferences.installation_sources.get(&id).cloned(),
+        service_dependency_issues: Vec::new(),
+        plugin_data_directory: Some(
+            app_data_dir
+                .join("plugin-data")
+                .join(&id)
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    };
+    let revision = previous_record
+        .map(|record| record.revision.wrapping_add(1))
+        .unwrap_or_default();
+    let process = previous_record.and_then(|record| {
+        (record.directory == plugin.directory
+            && record
+                .process
+                .as_ref()
+                .is_some_and(|process| process.is_alive()))
+        .then(|| record.process.clone())
+        .flatten()
+    });
+    if process.is_some() {
+        snapshot.runtime = RuntimeState::Running;
+    }
+    (
+        PluginRecord {
+            snapshot,
+            directory: plugin.directory,
+            contract: plugin.contract,
+            contract_sha256: plugin.contract_sha256,
+            process,
+            revision,
+            scan_retry: None,
+        },
+        preferences_changed,
+    )
+}
+
+fn sanitize_scan_message(app_data_dir: &Path, message: &str) -> String {
+    let app_data_dir = app_data_dir.to_string_lossy();
+    message.replace(app_data_dir.as_ref(), "<app-data>")
+}
+
 fn invalid_snapshot(id: &str, message: &str) -> PluginRuntimeState {
     let id = if valid_plugin_id(id) {
         id.to_owned()
@@ -3537,6 +4516,7 @@ fn invalid_snapshot(id: &str, message: &str) -> PluginRuntimeState {
             requires: Vec::new(),
         },
         installation: InstallationState::Invalid,
+        scan_diagnostic: None,
         enabled: false,
         runtime: RuntimeState::Stopped,
         last_error: Some(failure("INVALID_PACKAGE", message)),
