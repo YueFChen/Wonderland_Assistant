@@ -118,6 +118,15 @@ impl RemoteBroker {
             .ok_or_else(|| error("UNAUTHORIZED", "下载已过期或不属于当前设备。"))
     }
 
+    pub(crate) fn plugin(&self, owner: &str, id: &str) -> Option<String> {
+        let mut actions = self.actions.lock().unwrap();
+        Self::prune(&mut actions);
+        actions
+            .get(id)
+            .filter(|a| a.owner == owner)
+            .map(|a| a.plugin.clone())
+    }
+
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.actions.lock().unwrap().clear();

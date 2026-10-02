@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { X } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { listen } from '../core/transport'
+import { listen, isWebClient } from '../core/transport'
 import { UI_BRIDGE_PROTOCOL as BRIDGE_PROTOCOL, UI_BRIDGE_VERSION, createRequestId } from '@wonderland/plugin-ui-sdk'
 import { validatePluginUiBridgeMessage } from '../plugins/pluginUiBridgeValidation'
 import {
@@ -727,7 +727,7 @@ function surfaceUrl(source: string, surface: 'activity' | 'view', contributionId
   const base = hashIndex < 0 ? source : source.slice(0, hashIndex)
   const hash = hashIndex < 0 ? '' : source.slice(hashIndex)
   const separator = base.includes('?') ? '&' : '?'
-  return `${base}${separator}wonderlandSurface=${surface}&wonderlandContribution=${encodeURIComponent(contributionId)}${hash}`
+  return `${base}${separator}wonderlandSurface=${surface}&wonderlandContribution=${encodeURIComponent(contributionId)}${isWebClient ? '&wonderlandClient=web' : ''}${hash}`
 }
 
 function toErrorValue(cause: unknown) {

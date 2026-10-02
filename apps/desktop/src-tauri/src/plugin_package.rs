@@ -828,6 +828,9 @@ fn list_package_files(directory: &Path) -> Result<BTreeSet<String>, String> {
 }
 
 fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
+    if manifest.remote_access == Some(true) && !manifest.supports_remote_access() {
+        return Err("Remote access requires backend.supportsServiceContext to be true.".into());
+    }
     if manifest.manifest_version != 2 {
         return Err("Unsupported plugin manifest version.".to_owned());
     }
@@ -1474,6 +1477,26 @@ fn validate_hex_hash(value: &str) -> bool {
 mod tests {
     use super::*;
     use wonderland_plugin_protocol::{PluginUiCommand, PluginUiCommandEffect};
+
+    #[test]
+    fn remote_access_is_explicit_and_requires_context_support() {
+        let mut manifest: PluginManifest = serde_json::from_str(include_str!(
+            "../tests/fixtures/comment_collector_manifest.json"
+        ))
+        .unwrap();
+        assert!(!manifest.supports_remote_access());
+        validate_manifest(&manifest).unwrap();
+        manifest.backend.supports_service_context = Some(true);
+        assert!(!manifest.supports_remote_access());
+        manifest.remote_access = Some(false);
+        assert!(!manifest.supports_remote_access());
+        manifest.remote_access = Some(true);
+        assert!(manifest.supports_remote_access());
+        validate_manifest(&manifest).unwrap();
+        manifest.backend.supports_service_context = None;
+        assert!(!manifest.supports_remote_access());
+        assert!(validate_manifest(&manifest).is_err());
+    }
 
     #[test]
     fn public_network_scope_is_optional_but_declared_hosts_are_exact() {

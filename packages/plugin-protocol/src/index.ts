@@ -7,6 +7,10 @@ export type PluginManifest = { manifestVersion: number, id: string, name: string
  */
 icon?: string | null, hostCompatibility: HostCompatibility, platform: PluginPlatform, ui?: PluginUi | null, backend: PluginBackend, contract: string, capabilities: Array<string>,
 /**
+ * Explicit opt-in to remote workspaces; absent or false means local only.
+ */
+remoteAccess?: boolean | null,
+/**
  * Exact HTTPS hosts available through core.network.public.
  */
 networkPublicHosts?: Array<string>, provides?: Array<PluginService>, requires?: Array<PluginServiceRequirement>, };

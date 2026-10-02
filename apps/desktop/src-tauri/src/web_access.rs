@@ -270,6 +270,12 @@ impl WebAccessService {
         }
         let manager = app.state::<PluginManager>().inner().clone();
         for id in &options.plugin_ids {
+            ensure_remote_plugin(&manager, id).map_err(|(_, error)| {
+                error.0["message"]
+                    .as_str()
+                    .unwrap_or("插件不支持远程访问")
+                    .to_owned()
+            })?;
             manager.plugin_ui_launch_info(id).map_err(|e| e.message)?;
         }
         if app.asset_resolver().get("mobile.html".into()).is_none() {
@@ -462,7 +468,9 @@ async fn remote_status(State(state): State<WebState>) -> Json<Value> {
 
 async fn plugins(State(state): State<WebState>) -> Json<Value> {
     let mut snapshots = state.manager.snapshots();
-    snapshots.retain(|s| state.access.plugin_ids.contains(&s.manifest.id));
+    snapshots.retain(|s| {
+        state.access.plugin_ids.contains(&s.manifest.id) && s.manifest.supports_remote_access()
+    });
     for snapshot in &mut snapshots {
         snapshot.plugin_data_directory = None;
         snapshot.scan_diagnostic = None;
@@ -482,6 +490,45 @@ fn allowed(access: &Access, id: &str) -> Result<(), (StatusCode, Json<Value>)> {
     }
 }
 
+fn ensure_remote_plugin(
+    manager: &PluginManager,
+    id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if manager
+        .snapshots()
+        .iter()
+        .any(|s| s.manifest.id == id && s.manifest.supports_remote_access())
+    {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(
+                json!({"code":"REMOTE_UNSUPPORTED", "message":"此插件未声明远程访问支持，不能共享。"}),
+            ),
+        ))
+    }
+}
+
+fn allowed_plugin(state: &WebState, id: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    allowed(&state.access, id)?;
+    ensure_remote_plugin(&state.manager, id)
+}
+
+fn allowed_interaction(
+    state: &WebState,
+    owner: &str,
+    id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let plugin = state.access.interactions.plugin(owner, id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message":"交互已过期或不属于当前设备。"})),
+        )
+    })?;
+    allowed_plugin(state, &plugin)
+}
+
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 fn client_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<Value>)> {
@@ -499,7 +546,13 @@ fn client_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<Value>)> {
 }
 
 async fn interactions(State(state): State<WebState>, headers: HeaderMap) -> ApiResult {
-    Ok(Json(state.access.interactions.list(&client_id(&headers)?)))
+    let mut actions = state.access.interactions.list(&client_id(&headers)?);
+    actions.as_array_mut().unwrap().retain(|a| {
+        a["pluginId"]
+            .as_str()
+            .is_some_and(|id| allowed_plugin(&state, id).is_ok())
+    });
+    Ok(Json(actions))
 }
 
 async fn interaction_reply(
@@ -508,6 +561,7 @@ async fn interaction_reply(
     Path(id): Path<String>,
     Json(value): Json<Value>,
 ) -> ApiResult {
+    allowed_interaction(&state, &client_id(&headers)?, &id)?;
     state
         .access
         .interactions
@@ -521,6 +575,7 @@ async fn interaction_content(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
+    allowed_interaction(&state, &client_id(&headers)?, &id)?;
     let bytes = state
         .access
         .interactions
@@ -540,7 +595,7 @@ fn plugin_error(error: PluginError) -> (StatusCode, Json<Value>) {
 }
 
 async fn launch(State(state): State<WebState>, Path(id): Path<String>) -> ApiResult {
-    allowed(&state.access, &id)?;
+    allowed_plugin(&state, &id)?;
     let mut launch = state
         .manager
         .plugin_ui_launch_info(&id)
@@ -580,7 +635,7 @@ async fn call(
     headers: HeaderMap,
     Json(input): Json<PluginCall>,
 ) -> ApiResult {
-    allowed(&state.access, &input.plugin_id)?;
+    allowed_plugin(&state, &input.plugin_id)?;
     if !valid_request_id(&input.request_id) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -633,7 +688,7 @@ struct PluginCancel {
 }
 
 async fn cancel(State(state): State<WebState>, Json(input): Json<PluginCancel>) -> ApiResult {
-    allowed(&state.access, &input.plugin_id)?;
+    allowed_plugin(&state, &input.plugin_id)?;
     if !valid_request_id(&input.request_id) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -652,14 +707,18 @@ struct EventQuery {
     after: Option<u64>,
 }
 async fn events(State(state): State<WebState>, Query(query): Query<EventQuery>) -> Json<Value> {
-    Json(
-        state
-            .access
-            .events
-            .lock()
-            .map(|buffer| buffer.since(query.after))
-            .unwrap_or_else(|_| json!({"events":[],"cursor":0,"missed":true})),
-    )
+    let mut batch = state
+        .access
+        .events
+        .lock()
+        .map(|buffer| buffer.since(query.after))
+        .unwrap_or_else(|_| json!({"events":[],"cursor":0,"missed":true}));
+    batch["events"].as_array_mut().unwrap().retain(|event| {
+        event["pluginId"]
+            .as_str()
+            .is_some_and(|id| allowed_plugin(&state, id).is_ok())
+    });
+    Json(batch)
 }
 
 async fn plugin_asset(
@@ -671,7 +730,7 @@ async fn plugin_asset(
         || !path
             .split('/')
             .next()
-            .is_some_and(|id| state.access.plugin_ids.contains(id))
+            .is_some_and(|id| allowed_plugin(&state, id).is_ok())
     {
         return StatusCode::NOT_FOUND.into_response();
     }

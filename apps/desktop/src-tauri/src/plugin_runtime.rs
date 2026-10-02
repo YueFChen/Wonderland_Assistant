@@ -53,6 +53,7 @@ pub(crate) struct PluginProcess {
     picked_files: Mutex<HashMap<String, PickedFile>>,
     invocation_contexts: Mutex<HashMap<String, Option<Arc<RemoteContext>>>>,
     supports_service_context: bool,
+    supports_remote_access: bool,
     remote_services: Arc<tokio::sync::Semaphore>,
 }
 
@@ -265,6 +266,7 @@ impl PluginProcess {
                 .join("Exports"),
             picked_files: Mutex::new(HashMap::new()),
             invocation_contexts: Mutex::new(HashMap::new()),
+            supports_remote_access: state.manifest.supports_remote_access(),
             remote_services: Arc::new(tokio::sync::Semaphore::new(16)),
             supports_service_context: state
                 .manifest
@@ -358,10 +360,10 @@ impl PluginProcess {
         if !self.alive.load(Ordering::Acquire) {
             return Err(plugin_error("PLUGIN_CRASHED", "Plugin process has exited."));
         }
-        if remote.is_some() && !self.supports_service_context {
+        if remote.is_some() && !self.supports_remote_access {
             return Err(plugin_error(
-                "REMOTE_CONTEXT_REQUIRED",
-                "此插件尚未声明远程请求上下文支持，请更新插件。宿主机本地操作不受影响。",
+                "REMOTE_UNSUPPORTED",
+                "此插件未声明远程访问支持，不能从远程工作区调用。",
             ));
         }
         if request_id.is_empty() || request_id.len() > 128 {

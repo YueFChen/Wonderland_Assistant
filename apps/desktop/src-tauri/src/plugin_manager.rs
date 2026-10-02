@@ -4561,6 +4561,7 @@ fn invalid_snapshot(id: &str, message: &str) -> PluginRuntimeState {
             },
             contract: "contract.json".to_owned(),
             capabilities: Vec::new(),
+            remote_access: None,
             network_public_hosts: Vec::new(),
             provides: Vec::new(),
             requires: Vec::new(),

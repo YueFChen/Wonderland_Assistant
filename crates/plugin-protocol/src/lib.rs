@@ -52,6 +52,9 @@ pub struct PluginManifest {
     pub backend: PluginBackend,
     pub contract: String,
     pub capabilities: Vec<String>,
+    /// Explicit opt-in to remote workspaces; absent or false means local only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_access: Option<bool>,
     /// Exact HTTPS hosts available through core.network.public.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub network_public_hosts: Vec<String>,
@@ -59,6 +62,12 @@ pub struct PluginManifest {
     pub provides: Vec<PluginService>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<PluginServiceRequirement>,
+}
+
+impl PluginManifest {
+    pub fn supports_remote_access(&self) -> bool {
+        self.remote_access == Some(true) && self.backend.supports_service_context == Some(true)
+    }
 }
 
 /// A versioned service contract offered to other plugins through a future Core broker.

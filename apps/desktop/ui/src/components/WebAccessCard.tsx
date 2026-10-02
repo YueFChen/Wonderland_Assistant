@@ -4,6 +4,7 @@ import { Copy, Globe2, ShieldCheck } from 'lucide-react'
 import { usePlugins } from '../plugins/api'
 import { t } from '../i18n'
 import { WebConnectionPanel } from './WebConnectionPanel'
+import { isRemotelyShareable } from '../plugins/remoteAccess'
 
 interface WebOptions { mode: 'loopback' | 'lan'; port: number; publicUrl: string; pluginIds: string[] }
 interface WebStatus { running: boolean; options: WebOptions | null; localUrl: string | null; accessToken: string | null; lanAddresses: { interfaceName: string; ip: string; url: string }[]; addressError: string | null }
@@ -42,7 +43,7 @@ export function WebAccessCard() {
     try {
       const next = status?.options
         ? await invoke<WebStatus>('web_access_stop')
-        : await invoke<WebStatus>('web_access_start', { options })
+        : await invoke<WebStatus>('web_access_start', { options: { ...options, pluginIds: options.pluginIds.filter((id) => states?.some((item) => item.manifest.id === id && isRemotelyShareable(item))) } })
       setStatus(next)
     } catch (cause) { setError(String(cause)) }
     finally { changing.current = false; setBusy(false) }
@@ -63,8 +64,8 @@ export function WebAccessCard() {
       <label className="text-xs text-ink-muted">{t('webAccess.port')}<input className={fieldClass} type="number" min="1" max="65535" value={options.port} onChange={(e) => setOptions({ ...options, port: Number(e.target.value) })} /></label>
       <label className="text-xs text-ink-muted sm:col-span-2">{t('webAccess.publicUrl')}<input className={fieldClass} maxLength={1024} placeholder="https://core.example.com" value={options.publicUrl} onChange={(e) => setOptions({ ...options, publicUrl: e.target.value.trim() })} /></label>
       <div className="sm:col-span-2"><p className="mb-2 text-xs font-semibold text-ink">{t('webAccess.plugins')}</p><p className="mb-3 text-xs leading-relaxed text-ink-muted">{t('webAccess.pluginHint')}</p>
-        <div className="flex flex-wrap gap-3">{states?.filter((item) => item.enabled && item.runtime === 'running' && item.manifest.ui).map((item) => <label key={item.manifest.id} className="flex items-center gap-2 rounded-lg border border-glass-line px-3 py-2 text-sm text-ink"><input type="checkbox" checked={options.pluginIds.includes(item.manifest.id)} onChange={(e) => setOptions({ ...options, pluginIds: e.target.checked ? [...options.pluginIds, item.manifest.id] : options.pluginIds.filter((id) => id !== item.manifest.id) })} />{item.manifest.name}</label>)}</div>
-        {states && !states.some((item) => item.enabled && item.runtime === 'running' && item.manifest.ui) && <p className="text-xs text-ink-faint">{t('webAccess.noPlugins')}</p>}
+        <div className="flex flex-wrap gap-3">{states?.filter((item) => isRemotelyShareable(item)).map((item) => <label key={item.manifest.id} className="flex items-center gap-2 rounded-lg border border-glass-line px-3 py-2 text-sm text-ink"><input type="checkbox" checked={options.pluginIds.includes(item.manifest.id)} onChange={(e) => setOptions({ ...options, pluginIds: e.target.checked ? [...options.pluginIds, item.manifest.id] : options.pluginIds.filter((id) => id !== item.manifest.id) })} />{item.manifest.name}</label>)}</div>
+        {states && !states.some((item) => isRemotelyShareable(item)) && <p className="text-xs text-ink-faint">{t('webAccess.noPlugins')}</p>}
       </div>
     </fieldset>
     {running && <div className="mt-5 space-y-3 rounded-xl border border-glass-line bg-glass-subtle p-4 text-xs">
