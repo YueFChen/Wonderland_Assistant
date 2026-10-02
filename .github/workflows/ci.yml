@@ -68,6 +68,7 @@ jobs:
           $msiInstallers | Select-Object -ExpandProperty FullName
           $nsisInstallers | Select-Object -ExpandProperty FullName
       - name: Install package and verify shipped wla CLI
+        timeout-minutes: 5
         shell: pwsh
         run: |
           $installers = @(Get-ChildItem -Path 'target/release/bundle/nsis' -Filter '*.exe' -File)
@@ -94,6 +95,7 @@ jobs:
           if ($failure.ok -or $failure.error.code -ne 'INVALID_REQUEST') { throw 'Installed CLI returned an invalid error contract.' }
 
       - name: Install MSI and verify bundled CLI
+        timeout-minutes: 5
         shell: pwsh
         run: |
           $msiInstallers = @(Get-ChildItem -Path 'target/release/bundle/msi' -Filter '*.msi' -File)
@@ -104,10 +106,13 @@ jobs:
           $installRoot = Join-Path $env:TEMP "WonderlandAssistant-MsiCheck-$env:GITHUB_RUN_ID"
           $profile = Join-Path $env:TEMP "WonderlandAssistant-MsiCliCheck-$env:GITHUB_RUN_ID"
           $appVersion = (Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $installLog = Join-Path $env:RUNNER_TEMP 'wonderland-msi-install.log'
+          $uninstallLog = Join-Path $env:RUNNER_TEMP 'wonderland-msi-uninstall.log'
           $installed = $false
           try {
             $msiPath = $msiInstallers[0].FullName
-            $installArguments = @('/i', "`"$msiPath`"", '/qn', '/norestart', "INSTALLDIR=`"$installRoot`"")
+            Write-Host 'Installing MSI package'
+            $installArguments = @('/i', "`"$msiPath`"", '/qn', '/norestart', '/L*v', "`"$installLog`"", "INSTALLDIR=`"$installRoot`"")
             $installerProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $installArguments -Wait -PassThru -WindowStyle Hidden
             if ($installerProcess.ExitCode -ne 0) { throw "MSI installer returned $($installerProcess.ExitCode)." }
             $installed = $true
@@ -117,8 +122,10 @@ jobs:
             if (-not (Test-Path -LiteralPath $cli -PathType Leaf)) { throw "MSI-installed wla sidecar missing at '$cli'." }
             $desktopApp = Join-Path $installRoot 'wonderland-desktop.exe'
             if (-not (Test-Path -LiteralPath $desktopApp -PathType Leaf)) { throw "MSI-installed desktop app missing at '$desktopApp'." }
+            Write-Host 'Checking MSI-installed CLI version'
             $reportedVersion = (& $cli --version).Trim()
             if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne "wla $appVersion") { throw "MSI CLI version mismatch: '$reportedVersion'." }
+            Write-Host 'Checking MSI-installed CLI status'
             $statusOutput = & $cli --data-dir $profile core status
             if ($LASTEXITCODE -ne 0) { throw 'MSI-installed CLI core status command failed.' }
             $status = ($statusOutput -join "`n") | ConvertFrom-Json
@@ -126,12 +133,21 @@ jobs:
           }
           finally {
             if ($installed) {
-              $uninstallArguments = @('/x', "`"$($msiInstallers[0].FullName)`"", '/qn', '/norestart')
+              Write-Host 'Uninstalling MSI package'
+              $uninstallArguments = @('/x', "`"$($msiInstallers[0].FullName)`"", '/qn', '/norestart', '/L*v', "`"$uninstallLog`"")
               $uninstallerProcess = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $uninstallArguments -Wait -PassThru -WindowStyle Hidden
               if ($uninstallerProcess.ExitCode -ne 0) { throw "MSI uninstaller returned $($uninstallerProcess.ExitCode)." }
               if (Test-Path -LiteralPath (Join-Path $installRoot 'wla.exe')) { throw 'MSI uninstaller left the CLI installed.' }
             }
           }
+
+      - name: Upload MSI diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msi-install-diagnostics
+          path: ${{ runner.temp }}/wonderland-msi-*.log
+          if-no-files-found: ignore
 
   supply-chain:
     name: Supply chain（cargo-deny）
