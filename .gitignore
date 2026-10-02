@@ -24,6 +24,7 @@ logs/
 tmp/
 docs/*
 !docs/CORE-CLI-COMMAND-INVENTORY.md
+!docs/WEB-ACCESS.md
 # Local Cargo cache
 .cargo-home/
 .DS_Store

@@ -13,6 +13,7 @@ mod state;
 mod theme;
 mod tray;
 mod user_data;
+mod web_access;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -182,7 +183,9 @@ pub fn run_cli() {
             .get(1)
             .is_some_and(|argument| argument == "command")
             && arguments.get(2).is_some_and(|argument| argument == "list")))
-        || arguments.first().is_some_and(|argument| argument == "app")
+        || arguments
+            .first()
+            .is_some_and(|argument| argument == "app" || argument == "web")
     {
         let code = cli_ipc::print_error(cli_ipc::CliError::new(
             "DESKTOP_NOT_RUNNING",
@@ -242,6 +245,7 @@ fn cli_help_text() -> String {
            ui command list <plugin>/<contribution>\n\
            ui command run <plugin>/<contribution> <command-id> --input-json <json> [--yes]\n\
            core status\n\
+           web status | start --config-json <json> --yes | stop --yes\n\
            logs <dir|list|tail> [--lines <count>]\n\
            plugins list\n\
            plugins permissions list <plugin-id>\n\
@@ -417,6 +421,7 @@ fn run_application(cli: Option<CliInvocation>, desktop_data_dir: Option<PathBuf>
             }
 
             app.manage(plugin_manager.clone());
+            app.manage(web_access::WebAccessService::default());
             if !cli_mode {
                 tray::initialize(app)?;
                 if let Some(main_window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
@@ -476,6 +481,9 @@ fn run_application(cli: Option<CliInvocation>, desktop_data_dir: Option<PathBuf>
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            web_access::web_access_status,
+            web_access::web_access_start,
+            web_access::web_access_stop,
             plugin_manager::plugins_list,
             plugin_manager::plugins_retry_scan,
             plugin_manager::plugins_catalog_list,

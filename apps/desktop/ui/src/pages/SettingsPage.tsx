@@ -27,6 +27,7 @@ import { t, type MessageKey } from '../i18n'
 import { AccountManagementSection } from './AccountSection'
 import { CoreUpdateCard } from '../components/CoreUpdateCard'
 import { NetworkProxyCard } from '../components/NetworkProxyCard'
+import { WebAccessCard } from '../components/WebAccessCard'
 import { ToggleSwitch } from '../components/ToggleSwitch'
 
 /** 主题档位。自定义档的控件保持深色，与后端 `ThemeMode` 的语义一致。 */
@@ -94,6 +95,7 @@ export function SettingsPage() {
 
         <SettingsGroup id="settings-network" title={t('settings.section.network')}>
           <NetworkProxyCard />
+          <WebAccessCard />
         </SettingsGroup>
 
         <SettingsGroup id="settings-appearance" title={t('settings.section.appearance')}>

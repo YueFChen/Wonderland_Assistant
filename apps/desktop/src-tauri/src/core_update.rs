@@ -14,13 +14,20 @@ const PROGRESS_EVENT: &str = "core-update-progress";
 
 #[derive(Default)]
 pub struct CoreUpdateState {
-    updates: Mutex<HashMap<String, Update>>,
+    cache: Mutex<UpdateCache>,
+}
+
+#[derive(Default)]
+struct UpdateCache {
+    updates: HashMap<String, Update>,
+    generation: u64,
 }
 
 impl CoreUpdateState {
     pub fn clear(&self) {
-        if let Ok(mut updates) = self.updates.lock() {
-            updates.clear();
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.generation = cache.generation.wrapping_add(1);
+            cache.updates.clear();
         }
     }
 }
@@ -49,6 +56,11 @@ pub async fn core_update_check(
     updates: State<'_, CoreUpdateState>,
 ) -> Result<Option<CoreUpdateAvailable>, KernelError> {
     ensure_main_window(&window)?;
+    let generation = updates
+        .cache
+        .lock()
+        .map_err(|_| KernelError::Transport("更新状态暂不可用".to_owned()))?
+        .generation;
     let proxy = wonderland_net::proxy::current_proxy()
         .map_err(|_| KernelError::Transport("代理设置暂不可用".to_owned()))?
         .configuration;
@@ -62,8 +74,18 @@ pub async fn core_update_check(
         KernelError::Transport("更新检查失败；请检查 Core 网络代理设置后重试".to_owned())
     })?;
 
+    let mut cache = updates
+        .cache
+        .lock()
+        .map_err(|_| KernelError::Transport("更新状态暂不可用".to_owned()))?;
+    if cache.generation != generation {
+        return Err(KernelError::Transport(
+            "代理设置已更改，请重新检查更新".to_owned(),
+        ));
+    }
+    cache.generation = cache.generation.wrapping_add(1);
     let Some(update) = update else {
-        updates.clear();
+        cache.updates.clear();
         return Ok(None);
     };
     let update_id = new_update_id()?;
@@ -76,11 +98,9 @@ pub async fn core_update_check(
             .as_deref()
             .map(|body| body.chars().take(20_000).collect()),
     };
-    updates
-        .updates
-        .lock()
-        .map_err(|_| KernelError::Transport("更新状态暂不可用".to_owned()))?
-        .insert(update_id, update);
+    // Periodic checks retain only the latest install session, not an unbounded history.
+    cache.updates.clear();
+    cache.updates.insert(update_id, update);
     Ok(Some(response))
 }
 
@@ -95,16 +115,21 @@ pub async fn core_update_install(
     if update_id.len() != 32 || !update_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(KernelError::InvalidInput);
     }
-    let update = updates
-        .updates
-        .lock()
-        .map_err(|_| KernelError::Transport("更新状态暂不可用".to_owned()))?
-        .remove(&update_id)
-        .ok_or(KernelError::InvalidInput)?;
+    let (update, generation) = {
+        let mut cache = updates
+            .cache
+            .lock()
+            .map_err(|_| KernelError::Transport("更新状态暂不可用".to_owned()))?;
+        let update = cache
+            .updates
+            .remove(&update_id)
+            .ok_or(KernelError::InvalidInput)?;
+        (update, cache.generation)
+    };
 
     let progress_app = app.clone();
     let mut downloaded = 0u64;
-    update
+    let result = update
         .download_and_install(
             move |chunk_size, total_bytes| {
                 downloaded = downloaded.saturating_add(chunk_size as u64);
@@ -131,7 +156,17 @@ pub async fn core_update_install(
         .await
         .map_err(|_| {
             KernelError::Transport("更新下载、签名校验或安装失败；请检查网络后重试".to_owned())
-        })
+        });
+    // Allow retry after failure while preserving the single-use install handle.
+    // A proxy change or a newer update check must not restore an obsolete session.
+    if result.is_err()
+        && let Ok(mut cache) = updates.cache.lock()
+        && cache.generation == generation
+        && cache.updates.is_empty()
+    {
+        cache.updates.insert(update_id, update);
+    }
+    result
 }
 
 fn new_update_id() -> Result<String, KernelError> {

@@ -5,6 +5,7 @@ import { relaunch } from '@tauri-apps/plugin-process'
 import { Download, X } from 'lucide-react'
 
 import { t } from '../i18n'
+import { createUpdateCheckGate, UPDATE_CHECK_INTERVAL_MS, UPDATE_WAKE_COOLDOWN_MS } from '../core/updateChecks'
 import { networkApi, type CoreUpdateAvailable, type CoreUpdateProgress } from '../network/api'
 import { useNotifications } from './Notifications'
 
@@ -14,6 +15,7 @@ const HOME_NOTICE_PREFIX = 'core-update:'
 interface CoreUpdateContextValue {
   version: string
   update: CoreUpdateAvailable | null
+  hasUpdate: boolean
   checking: boolean
   installing: boolean
   progress: number | null
@@ -35,19 +37,23 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
   const [progress, setProgress] = useState<number | null>(null)
   const [message, setMessage] = useState('')
   const [promptOpen, setPromptOpen] = useState(false)
+  const [hasUpdate, setHasUpdate] = useState(false)
   const startupCheckStarted = useRef(false)
-  const checkLock = useRef(false)
+  const gate = useRef(createUpdateCheckGate())
+  const announcedVersions = useRef(new Set<string>())
+  const generation = useRef(0)
 
-  const checkForUpdate = useCallback(async (showPrompt = false) => {
-    if (!isTauri() || checkLock.current) return null
-    checkLock.current = true
+  const checkForUpdate = useCallback(async (showPrompt = false, minIntervalMs = 0) => {
+    if (!isTauri() || !gate.current.beginCheck(minIntervalMs)) return null
+    const requestGeneration = generation.current
     setChecking(true)
-    setMessage('')
     try {
       const next = await networkApi.updateCheck()
+      if (requestGeneration !== generation.current) return null
       setUpdate(next)
-      clearHomeNotifications(HOME_NOTICE_PREFIX)
       if (!next) {
+        setHasUpdate(false)
+        clearHomeNotifications(HOME_NOTICE_PREFIX)
         setPromptOpen(false)
         setMessage(t('settings.update.current'))
         return null
@@ -55,35 +61,43 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
 
       const noticeId = `${HOME_NOTICE_PREFIX}${next.version}`
       if (readIgnoredVersions().includes(next.version)) {
-        dismissHomeNotification(noticeId)
+        setHasUpdate(false)
+        clearHomeNotifications(HOME_NOTICE_PREFIX)
         setPromptOpen(false)
         setMessage(t('settings.update.ignored', { version: next.version }))
         return next
       }
 
+      setHasUpdate(true)
       setMessage(t('settings.update.available', { version: next.version }))
-      publishHomeNotification({
-        id: noticeId,
-        title: t('settings.update.available', { version: next.version }),
-        message: next.body?.trim().slice(0, 260) || t('home.updateNotice', { version: next.version }),
-        href: '/workspace/settings',
-      })
+      // Closing a notice is respected for the rest of this application session.
+      if (!announcedVersions.current.has(next.version)) {
+        announcedVersions.current.add(next.version)
+        clearHomeNotifications(HOME_NOTICE_PREFIX)
+        publishHomeNotification({
+          id: noticeId,
+          title: t('settings.update.available', { version: next.version }),
+          message: next.body?.trim().slice(0, 260) || t('home.updateNotice', { version: next.version }),
+          href: '/workspace/settings',
+        })
+      }
       if (showPrompt) setPromptOpen(true)
       return next
     } catch (cause) {
-      setUpdate(null)
+      if (requestGeneration !== generation.current) return null
+      // A transient check failure must not discard a previously discovered update.
       const failure = t('settings.update.checkFailed', { reason: errorText(cause) })
       setMessage(failure)
       if (showPrompt) notify(failure, { tone: 'warning', durationMs: 6000 })
       return null
     } finally {
       setChecking(false)
-      checkLock.current = false
+      gate.current.endCheck()
     }
-  }, [clearHomeNotifications, dismissHomeNotification, notify, publishHomeNotification])
+  }, [clearHomeNotifications, notify, publishHomeNotification])
 
   const installUpdate = useCallback(async () => {
-    if (!update || installing) return
+    if (!update || !gate.current.beginInstall()) return
     setInstalling(true)
     setProgress(null)
     setMessage(t('settings.update.downloading'))
@@ -98,8 +112,9 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
       notify(failure, { tone: 'error', durationMs: 7000 })
       setInstalling(false)
       setProgress(null)
+      gate.current.endInstall()
     }
-  }, [installing, notify, update])
+  }, [notify, update])
 
   const ignoreCurrentVersion = useCallback(() => {
     if (!update) return
@@ -112,6 +127,7 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
       return
     }
     dismissHomeNotification(`${HOME_NOTICE_PREFIX}${update.version}`)
+    setHasUpdate(false)
     setPromptOpen(false)
     setMessage(t('settings.update.ignored', { version: update.version }))
   }, [dismissHomeNotification, notify, update])
@@ -134,7 +150,10 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
       }
     }).then((dispose) => { if (live) stopProgress = dispose; else dispose() })
     void networkApi.onUpdateInvalidated(() => {
+      if (!live) return
+      generation.current += 1
       setUpdate(null)
+      setHasUpdate(false)
       setPromptOpen(false)
       clearHomeNotifications(HOME_NOTICE_PREFIX)
       const notice = t('settings.update.proxyChanged')
@@ -153,9 +172,30 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
     }
   }, [checkForUpdate, clearHomeNotifications, notify])
 
+  useEffect(() => {
+    if (!isTauri()) return
+    const check = (minIntervalMs: number) => {
+      if (navigator.onLine) void checkForUpdate(false, minIntervalMs)
+    }
+    const wake = () => check(UPDATE_WAKE_COOLDOWN_MS)
+    const onVisible = () => { if (document.visibilityState === 'visible') wake() }
+    // A short tick keeps manual checks from shifting the next check by another hour.
+    const timer = window.setInterval(() => check(UPDATE_CHECK_INTERVAL_MS), 60_000)
+    window.addEventListener('focus', wake)
+    window.addEventListener('online', wake)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('focus', wake)
+      window.removeEventListener('online', wake)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [checkForUpdate])
+
   const context = useMemo(() => ({
     version,
     update,
+    hasUpdate,
     checking,
     installing,
     progress,
@@ -164,7 +204,7 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
     installUpdate,
     ignoreCurrentVersion,
     dismissPrompt: () => setPromptOpen(false),
-  }), [version, update, checking, installing, progress, message, checkForUpdate, installUpdate, ignoreCurrentVersion])
+  }), [version, update, hasUpdate, checking, installing, progress, message, checkForUpdate, installUpdate, ignoreCurrentVersion])
 
   return (
     <CoreUpdateContext.Provider value={context}>

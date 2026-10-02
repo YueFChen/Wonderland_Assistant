@@ -7,6 +7,7 @@ import { creatorBadge, currentAccount, displayName, firstRole } from '../account
 import { useAccount } from '../account/useAccount'
 import { UserAvatar } from '../account/UserAvatar'
 import { CommandPalette } from '../components/CommandPalette'
+import { useCoreUpdate } from '../components/CoreUpdateProvider'
 import { PluginSurface } from '../pages/PluginPage'
 import { buildContributionRegistry, findContribution, openContribution } from '../plugins/contributions'
 import { PluginIcon } from '../plugins/icons'
@@ -29,6 +30,10 @@ export function WorkspaceLayout() {
   const { states } = usePlugins()
   const { layout, toggleCollapsed } = useWorkspaceLayout()
   const { resolved } = useTheme()
+  const { hasUpdate, update } = useCoreUpdate()
+  const settingsLabel = hasUpdate && update
+    ? `${t('settings.title')} · ${t('settings.update.available', { version: update.version })}`
+    : t('settings.title')
   const [paletteOpen, setPaletteOpen] = useState(false)
   const registry = useMemo(() => buildContributionRegistry(states), [states])
   const ordered = useMemo(() => orderContributions(registry, layout.orderIds), [registry, layout.orderIds])
@@ -162,8 +167,11 @@ export function WorkspaceLayout() {
           </nav>
 
           <div className="workspace-rail-footer">
-            <NavLink to="/workspace/settings" className="workspace-rail-link" aria-label={layout.collapsed ? t('settings.title') : undefined} title={layout.collapsed ? t('settings.title') : undefined}>
-              <Settings aria-hidden />
+            <NavLink to="/workspace/settings" className="workspace-rail-link" aria-label={settingsLabel} title={settingsLabel}>
+              <span className="relative inline-flex shrink-0">
+                <Settings aria-hidden />
+                {hasUpdate && <span aria-hidden className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-red-500" />}
+              </span>
               {!layout.collapsed && <span>{t('settings.title')}</span>}
             </NavLink>
           </div>

@@ -8,6 +8,7 @@ import { PluginIcon } from '../plugins/icons'
 import { usePlugins } from '../plugins/api'
 import { useWorkspaceLayout } from '../plugins/workspaceLayout'
 import { useNotifications } from '../components/Notifications'
+import { useCoreUpdate } from '../components/CoreUpdateProvider'
 import './HomePage.css'
 
 /** Home is the branded entry point for the Wonderland plugin workspace. */
@@ -16,6 +17,7 @@ export function HomePage() {
   const { states } = usePlugins()
   const { layout } = useWorkspaceLayout()
   const { homeNotifications, dismissHomeNotification } = useNotifications()
+  const { hasUpdate, update } = useCoreUpdate()
   const registry = buildContributionRegistry(states)
   const recent = [...layout.openContributionIds]
     .reverse()
@@ -131,12 +133,13 @@ export function HomePage() {
               <ArrowRight className="mt-1 h-4 w-4 shrink-0 text-ink-faint transition group-hover:translate-x-0.5 group-hover:text-brand-400" aria-hidden />
             </Link>
             <Link to="/workspace/settings" className="glass-card group flex min-h-32 items-start gap-4 rounded-2xl border border-glass-line p-5 transition hover:-translate-y-0.5 hover:border-brand-500/30 hover:bg-glass-hover">
-              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-brand-600/10 text-brand-400">
+              <span className="relative grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-brand-600/10 text-brand-400">
                 <Settings2 className="h-5 w-5" aria-hidden />
+                {hasUpdate && <span aria-hidden className="absolute right-0 top-0 h-2.5 w-2.5 rounded-full bg-red-500" />}
               </span>
               <span className="min-w-0 flex-1">
                 <span className="block text-sm font-semibold text-ink">{t('home.settingsTitle')}</span>
-                <span className="mt-1.5 block text-xs leading-5 text-ink-muted">{t('home.settingsDescription')}</span>
+                <span className="mt-1.5 block text-xs leading-5 text-ink-muted">{hasUpdate && update ? t('settings.update.available', { version: update.version }) : t('home.settingsDescription')}</span>
               </span>
               <ArrowRight className="mt-1 h-4 w-4 shrink-0 text-ink-faint transition group-hover:translate-x-0.5 group-hover:text-brand-400" aria-hidden />
             </Link>

@@ -124,7 +124,7 @@ pub struct PluginCatalogSnapshot {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginUiLaunchInfo {
-    url: String,
+    pub(crate) url: String,
     bridge_versions: Vec<String>,
 }
 
@@ -496,7 +496,7 @@ impl PluginManager {
         Ok(())
     }
 
-    fn snapshots(&self) -> Vec<PluginRuntimeState> {
+    pub(crate) fn snapshots(&self) -> Vec<PluginRuntimeState> {
         let Ok(mut state) = self.inner.state.lock() else {
             return Vec::new();
         };
@@ -2048,7 +2048,7 @@ impl PluginManager {
         Ok(self.snapshots())
     }
 
-    fn call(
+    pub(crate) fn call(
         &self,
         plugin_id: &str,
         request_id: &str,
@@ -2332,7 +2332,7 @@ impl PluginManager {
         ))
     }
 
-    fn cancel(&self, plugin_id: &str, request_id: &str) -> Result<(), PluginError> {
+    pub(crate) fn cancel(&self, plugin_id: &str, request_id: &str) -> Result<(), PluginError> {
         let state = self
             .inner
             .state
@@ -2349,7 +2349,10 @@ impl PluginManager {
             .cancel(request_id)
     }
 
-    fn plugin_ui_launch_info(&self, plugin_id: &str) -> Result<PluginUiLaunchInfo, PluginError> {
+    pub(crate) fn plugin_ui_launch_info(
+        &self,
+        plugin_id: &str,
+    ) -> Result<PluginUiLaunchInfo, PluginError> {
         let state = self
             .inner
             .state

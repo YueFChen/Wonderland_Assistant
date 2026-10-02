@@ -13,6 +13,9 @@ export default defineConfig({
     strictPort: true,
   },
   build: {
+    rolldownOptions: {
+      input: { desktop: 'index.html', mobile: 'mobile.html' },
+    },
     outDir: 'dist',
     emptyOutDir: true,
   },

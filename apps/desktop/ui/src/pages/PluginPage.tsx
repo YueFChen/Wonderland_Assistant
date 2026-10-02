@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { X } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { listen } from '@tauri-apps/api/event'
+import { listen } from '../core/transport'
 import { UI_BRIDGE_PROTOCOL as BRIDGE_PROTOCOL, UI_BRIDGE_VERSION } from '@wonderland/plugin-ui-sdk'
 import { validatePluginUiBridgeMessage } from '../plugins/pluginUiBridgeValidation'
 import {
@@ -598,13 +598,14 @@ export function PluginSurface({
   }, [followsTheme, ready, resolvedTheme, sendToPlugin])
 
   useEffect(() => {
+    let live = true
     let unlisten: (() => void) | undefined
     void listen<PluginEventPayload>('plugin:event', ({ payload }) => {
       if (payload.pluginId === state.manifest.id && subscribedTopics.current.has(payload.topic)) {
         sendToPlugin({ type: 'event', event: payload })
       }
-    }).then((stop) => { unlisten = stop })
-    return () => unlisten?.()
+    }).then((stop) => { if (live) unlisten = stop; else stop() })
+    return () => { live = false; unlisten?.() }
   }, [sendToPlugin, state.manifest.id])
 
   useEffect(() => {

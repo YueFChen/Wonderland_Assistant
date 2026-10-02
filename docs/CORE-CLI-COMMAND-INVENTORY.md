@@ -24,9 +24,14 @@
 | `... plugins permissions set <插件 ID> --grant <能力>... --yes` | 替换授权集合；未列出的授权撤销 | 管理变更转发到当前 Core |
 | `... plugins test-backend-exit <插件 ID> --yes` | Debug 构建专用后端故障注入 | Debug 专用，不出现在 Release 帮助中 |
 | `wla core status` | Core 版本、数据目录、插件计数与运行计数 | 桌面运行时读同一 Core；独立运行时报告 `desktopRunning: false` |
+| `wla web status` | 返回网页服务状态与当前临时访问密钥；输出包含凭据，勿提交到日志或仓库 | 必须有桌面 Core 正在运行 |
+| `wla web start --config-json <JSON> --yes` | 根据监听范围、端口、公网入口及插件白名单开启 Web 服务 | 立即生效，设置页同步状态 |
+| `wla web stop --yes` | 关闭监听，撤销密钥及插件资源授权 | 立即生效 |
 | `wla logs dir|list|tail [--lines <1-500>]` | 日志目录、文件清单或最近日志行 | 只读 |
 
 `--data-dir` 是全局选项，可放在子命令之前，指定独立的 Core 数据目录。未指定时使用桌面 Core 默认数据目录。默认 profile 有桌面 Core 正在运行时，CLI 通过随机令牌认证的本机 loopback IPC 转发管理操作；两者共用同一个 PluginManager，避免启动重复插件进程或覆盖状态。不同的显式数据目录不会转发给默认 profile。
+
+网页服务的 JSON 配置、代理和手机使用方法见 [WEB-ACCESS.md](WEB-ACCESS.md)。`web` 命令只经本地 IPC 管理，不提供对应远程管理 API。
 
 ## 应用与窗口
 

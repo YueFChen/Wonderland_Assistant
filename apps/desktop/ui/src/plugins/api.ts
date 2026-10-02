@@ -1,5 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from '../core/transport'
 import { useEffect, useState } from 'react'
 import type { PluginRuntimeState, PluginService, PluginServiceRequirement } from '@wonderland/plugin-protocol'
 

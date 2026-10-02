@@ -4,6 +4,7 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 
 import { PluginIcon } from '../plugins/icons'
 import { buildContributionRegistry, openContribution } from '../plugins/contributions'
+import { primaryPluginEntries } from '../plugins/pluginEntries'
 import { orderContributions, useWorkspaceLayout } from '../plugins/workspaceLayout'
 import { pluginApi, usePlugins } from '../plugins/api'
 import { PluginManagement } from './PluginManagement'
@@ -68,7 +69,7 @@ export function WorkspacePage() {
   } | null>(null)
   const registry = buildContributionRegistry(states)
   const activities = orderContributions(
-    registry.filter((item) => item.kind === 'activity'),
+    primaryPluginEntries(registry),
     layout.activityOrderIds,
   )
   const previewActivities = previewOrderIds
