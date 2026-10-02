@@ -24,6 +24,7 @@ use wonderland_plugin_protocol::{
 };
 
 use crate::plugin_manager::PluginManager;
+use crate::remote_interaction::RemoteContext;
 
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,6 +51,9 @@ pub(crate) struct PluginProcess {
     data_dir: PathBuf,
     export_dir: PathBuf,
     picked_files: Mutex<HashMap<String, PickedFile>>,
+    invocation_contexts: Mutex<HashMap<String, Option<Arc<RemoteContext>>>>,
+    supports_service_context: bool,
+    remote_services: Arc<tokio::sync::Semaphore>,
 }
 
 struct PickedFile {
@@ -59,6 +63,125 @@ struct PickedFile {
     max_bytes: u64,
     size: u64,
     expires_at: Instant,
+}
+
+struct InvocationGuard<'a> {
+    process: &'a PluginProcess,
+    id: &'a str,
+}
+
+fn dispatch_remote_service(
+    limit: Arc<tokio::sync::Semaphore>,
+    work: impl FnOnce() + Send + 'static,
+) -> Result<(), PluginError> {
+    let permit = limit
+        .try_acquire_owned()
+        .map_err(|_| plugin_error("RESOURCE_LIMIT", "Too many remote host service requests."))?;
+    thread::Builder::new()
+        .name("remote-host-service".into())
+        .spawn(move || {
+            let _permit = permit;
+            work();
+        })
+        .map_err(|_| plugin_error("RESOURCE_LIMIT", "Cannot start remote host service worker."))?;
+    Ok(())
+}
+
+fn resolve_invocation_context(
+    contexts: &HashMap<String, Option<Arc<RemoteContext>>>,
+    id: Option<&str>,
+    method: &str,
+) -> Result<Option<Arc<RemoteContext>>, PluginError> {
+    if let Some(id) = id {
+        return contexts
+            .get(id)
+            .cloned()
+            .ok_or_else(|| plugin_error("CANCELLED", "请求上下文已失效。"));
+    }
+    if contexts.values().any(Option::is_some)
+        && (method.starts_with("core.files.")
+            || method == "core.browser.open_official"
+            || method == "core.services.invoke")
+    {
+        return Err(plugin_error(
+            "REMOTE_CONTEXT_REQUIRED",
+            "插件未传递请求上下文，无法安全判断交互设备。请更新插件。",
+        ));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod invocation_context_tests {
+    use super::*;
+    #[test]
+    fn remote_waits_leave_dispatch_available_and_have_bounded_workers() {
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        dispatch_remote_service(limit.clone(), move || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+        })
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            dispatch_remote_service(limit.clone(), || {})
+                .unwrap_err()
+                .code,
+            "RESOURCE_LIMIT"
+        );
+        finish_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while limit.available_permits() == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        dispatch_remote_service(limit, || {}).unwrap();
+    }
+    #[test]
+    fn local_and_remote_concurrent_calls_are_routed_independently() {
+        let remote = Arc::new(RemoteContext::new(
+            Arc::new(crate::remote_interaction::RemoteBroker::default()),
+            "browser".into(),
+            "plugin".into(),
+        ));
+        let contexts =
+            HashMap::from([("local".into(), None), ("web".into(), Some(remote.clone()))]);
+        assert!(
+            resolve_invocation_context(&contexts, Some("local"), "core.files.pick")
+                .unwrap()
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(
+            &resolve_invocation_context(&contexts, Some("web"), "core.files.pick")
+                .unwrap()
+                .unwrap(),
+            &remote
+        ));
+        assert!(
+            resolve_invocation_context(&contexts, Some("expired"), "core.files.export").is_err()
+        );
+        assert!(resolve_invocation_context(&contexts, None, "core.files.pick").is_err());
+        assert!(
+            resolve_invocation_context(&HashMap::new(), None, "core.files.pick")
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+impl Drop for InvocationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(Some(context)) = self
+            .process
+            .invocation_contexts
+            .lock()
+            .unwrap()
+            .remove(self.id)
+        {
+            context.cancel();
+        }
+    }
 }
 
 impl PluginProcess {
@@ -141,6 +264,13 @@ impl PluginProcess {
                 .join(&plugin_id)
                 .join("Exports"),
             picked_files: Mutex::new(HashMap::new()),
+            invocation_contexts: Mutex::new(HashMap::new()),
+            remote_services: Arc::new(tokio::sync::Semaphore::new(16)),
+            supports_service_context: state
+                .manifest
+                .backend
+                .supports_service_context
+                .unwrap_or(false),
         });
 
         let weak = Arc::downgrade(&process);
@@ -223,9 +353,16 @@ impl PluginProcess {
         method: &str,
         params: Value,
         timeout_ms: u64,
+        remote: Option<Arc<RemoteContext>>,
     ) -> Result<Value, PluginError> {
         if !self.alive.load(Ordering::Acquire) {
             return Err(plugin_error("PLUGIN_CRASHED", "Plugin process has exited."));
+        }
+        if remote.is_some() && !self.supports_service_context {
+            return Err(plugin_error(
+                "REMOTE_CONTEXT_REQUIRED",
+                "此插件尚未声明远程请求上下文支持，请更新插件。宿主机本地操作不受影响。",
+            ));
         }
         if request_id.is_empty() || request_id.len() > 128 {
             return Err(plugin_error(
@@ -265,7 +402,19 @@ impl PluginProcess {
             }
             pending.insert(request_id.to_owned(), tx);
         }
-        let frame = json!({
+        let _invocation_guard = if self.supports_service_context {
+            self.invocation_contexts
+                .lock()
+                .unwrap()
+                .insert(request_id.into(), remote);
+            Some(InvocationGuard {
+                process: self,
+                id: request_id,
+            })
+        } else {
+            None
+        };
+        let mut frame = json!({
             "protocol": PROTOCOL_ID,
             "version": PROTOCOL_VERSION,
             "type": "request",
@@ -273,6 +422,9 @@ impl PluginProcess {
             "method": method,
             "params": params,
         });
+        if _invocation_guard.is_some() {
+            frame["serviceContext"] = json!(request_id);
+        }
         if let Err(error) = self.write_frame(&frame) {
             self.remove_pending(request_id);
             return Err(error);
@@ -295,6 +447,9 @@ impl PluginProcess {
     }
 
     pub(crate) fn cancel(&self, request_id: &str) -> Result<(), PluginError> {
+        if let Some(Some(context)) = self.invocation_contexts.lock().unwrap().get(request_id) {
+            context.cancel();
+        }
         let active = self
             .pending
             .lock()
@@ -624,6 +779,10 @@ fn read_stdout(
                             &request.version,
                             &request.message_type,
                         ) && valid_request_id(&request.id)
+                            && request
+                                .service_context
+                                .as_deref()
+                                .is_none_or(valid_request_id)
                             && valid_method(&request.method) =>
                     {
                         request
@@ -635,23 +794,34 @@ fn read_stdout(
                         );
                     }
                 };
-                let reply = match process.host_service(&app, &request.method, &request.params) {
-                    Ok(result) => json!({
-                        "protocol": PROTOCOL_ID,
-                        "version": PROTOCOL_VERSION,
-                        "type": "result",
-                        "id": request.id,
-                        "result": result,
-                    }),
-                    Err(error) => json!({
-                        "protocol": PROTOCOL_ID,
-                        "version": PROTOCOL_VERSION,
-                        "type": "error",
-                        "id": request.id,
-                        "error": error,
-                    }),
-                };
-                if let Err(error) = process.write_frame(&reply) {
+                let remote = request.service_context.as_ref().is_some_and(|id| {
+                    process
+                        .invocation_contexts
+                        .lock()
+                        .unwrap()
+                        .get(id)
+                        .is_some_and(Option::is_some)
+                });
+                if remote {
+                    // A browser file picker must not block this plugin's stdout reader.
+                    // Native host calls retain their existing synchronous path.
+                    let worker = process.clone();
+                    let app = app.clone();
+                    let service_id = request.id.clone();
+                    if let Err(error) =
+                        dispatch_remote_service(process.remote_services.clone(), move || {
+                            if let Err(error) = worker.reply_to_host_service(&app, &request) {
+                                worker.fail_pending(error);
+                            }
+                        })
+                        && let Err(error) = process.write_frame(&json!({
+                            "protocol": PROTOCOL_ID, "version": PROTOCOL_VERSION,
+                            "type": "error", "id": service_id, "error": error,
+                        }))
+                    {
+                        break error;
+                    }
+                } else if let Err(error) = process.reply_to_host_service(&app, &request) {
                     break error;
                 }
             }
@@ -684,11 +854,33 @@ fn read_stdout(
 }
 
 impl PluginProcess {
+    fn reply_to_host_service(
+        &self,
+        app: &AppHandle,
+        request: &PluginRequest,
+    ) -> Result<(), PluginError> {
+        let reply = match self.host_service(
+            app,
+            &request.method,
+            &request.params,
+            request.service_context.as_deref(),
+        ) {
+            Ok(result) => {
+                json!({"protocol":PROTOCOL_ID,"version":PROTOCOL_VERSION,"type":"result","id":request.id,"result":result})
+            }
+            Err(error) => {
+                json!({"protocol":PROTOCOL_ID,"version":PROTOCOL_VERSION,"type":"error","id":request.id,"error":error})
+            }
+        };
+        self.write_frame(&reply)
+    }
+
     fn host_service(
         &self,
         app: &AppHandle,
         method: &str,
         params: &Value,
+        service_context: Option<&str>,
     ) -> Result<Value, PluginError> {
         let required_capability = match method {
             "core.account.snapshot" => "account.read",
@@ -724,6 +916,16 @@ impl PluginProcess {
             ));
         }
 
+        let remote = resolve_invocation_context(
+            &self.invocation_contexts.lock().unwrap(),
+            service_context,
+            method,
+        )?;
+        if let Some(context) = &remote
+            && (method.starts_with("core.files.") || method == "core.browser.open_official")
+        {
+            return context.service(method, params);
+        }
         match method {
             "core.account.snapshot" => account_snapshot(app),
             "core.account.authed_get" => account_authed_get(app, params),
@@ -771,7 +973,22 @@ impl PluginProcess {
                         "Plugin service broker is unavailable.",
                     )
                 })?;
-                manager.invoke_service(&self.plugin_id, service_id, service_method, service_params)
+                if remote.is_some() {
+                    manager.invoke_service_with_context(
+                        &self.plugin_id,
+                        service_id,
+                        service_method,
+                        service_params,
+                        remote,
+                    )
+                } else {
+                    manager.invoke_service(
+                        &self.plugin_id,
+                        service_id,
+                        service_method,
+                        service_params,
+                    )
+                }
             }
             _ => unreachable!(),
         }
@@ -1264,6 +1481,17 @@ fn account_snapshot(app: &AppHandle) -> Result<Value, PluginError> {
 /// Browser access is intentionally a set of named destinations. Plugins cannot ask the host to
 /// open arbitrary URLs or pass through query strings and fragments.
 fn open_official(params: &Value) -> Result<Value, PluginError> {
+    let url = official_url(params)?;
+    crate::reveal::open_url(&url).map_err(|error| {
+        plugin_error(
+            "INTERNAL",
+            &format!("Cannot open official browser destination: {error}"),
+        )
+    })?;
+    Ok(json!({ "ok": true }))
+}
+
+pub(crate) fn official_url(params: &Value) -> Result<String, PluginError> {
     let url = match params.get("target").and_then(Value::as_str) {
         Some("document") => {
             let path_id = params
@@ -1290,13 +1518,7 @@ fn open_official(params: &Value) -> Result<Value, PluginError> {
             ));
         }
     };
-    crate::reveal::open_url(&url).map_err(|error| {
-        plugin_error(
-            "INTERNAL",
-            &format!("Cannot open official browser destination: {error}"),
-        )
-    })?;
-    Ok(json!({ "ok": true }))
+    Ok(url)
 }
 
 fn account_authed_get(app: &AppHandle, params: &Value) -> Result<Value, PluginError> {
@@ -1670,7 +1892,7 @@ fn file_handle_token() -> Result<String, PluginError> {
     Ok(hex::encode(bytes))
 }
 
-fn file_mime_type(extension: &str) -> &'static str {
+pub(crate) fn file_mime_type(extension: &str) -> &'static str {
     match extension {
         "json" => "application/json",
         "csv" => "text/csv",
@@ -1683,7 +1905,7 @@ fn file_mime_type(extension: &str) -> &'static str {
     }
 }
 
-fn safe_export_name(name: &str) -> bool {
+pub(crate) fn safe_export_name(name: &str) -> bool {
     name.len() <= 180
         && matches!(
             Path::new(name)
@@ -1745,6 +1967,8 @@ fn sanitize_plugin_error(error: &mut PluginError) {
         "TIMEOUT",
         "CANCELLED",
         "RESOURCE_LIMIT",
+        "REMOTE_UNSUPPORTED",
+        "REMOTE_CONTEXT_REQUIRED",
         "INTERNAL",
     ];
     if !KNOWN.contains(&error.code.as_str()) && !error.code.starts_with("PLUGIN_") {

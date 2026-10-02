@@ -21,6 +21,7 @@ use tokio::sync::{Semaphore, oneshot};
 use wonderland_plugin_protocol::PluginError;
 
 use crate::plugin_manager::PluginManager;
+use crate::remote_interaction::{RemoteBroker, RemoteContext};
 
 const MAX_EVENTS: usize = 256;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
@@ -145,6 +146,7 @@ struct Access {
     plugin_ids: BTreeSet<String>,
     events: Mutex<EventBuffer>,
     calls: Arc<Semaphore>,
+    interactions: Arc<RemoteBroker>,
 }
 
 #[derive(Default)]
@@ -192,7 +194,7 @@ struct WebState {
     access: Arc<Access>,
 }
 
-fn random_key() -> Result<String, String> {
+pub(crate) fn random_key() -> Result<String, String> {
     let mut bytes = [0; 32];
     SystemRandom::new()
         .fill(&mut bytes)
@@ -283,6 +285,7 @@ impl WebAccessService {
             plugin_ids: options.plugin_ids.clone(),
             events: Mutex::new(EventBuffer::default()),
             calls: Arc::new(Semaphore::new(16)),
+            interactions: Arc::new(RemoteBroker::default()),
         });
         let event_access = access.clone();
         let event_listener = app.listen("plugin:event", move |event| {
@@ -347,6 +350,7 @@ impl WebAccessService {
         let mut guard = self.running.lock().await;
         if let Some(mut running) = guard.take() {
             running.access.active.store(false, Ordering::Release);
+            running.access.interactions.close();
             app.unlisten(running.event_listener);
             let _ = running.shutdown.send(());
             if tokio::time::timeout(Duration::from_secs(2), &mut running.task)
@@ -399,6 +403,12 @@ fn router(state: WebState) -> Router {
         .route("/call", post(call))
         .route("/cancel", post(cancel))
         .route("/events", get(events))
+        .route("/interactions", get(interactions))
+        .route(
+            "/interactions/{id}/reply",
+            post(interaction_reply).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        .route("/interactions/{id}/content", get(interaction_content))
         .layer(middleware::from_fn_with_state(
             state.access.clone(),
             authenticate,
@@ -473,6 +483,58 @@ fn allowed(access: &Access, id: &str) -> Result<(), (StatusCode, Json<Value>)> {
 }
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
+
+fn client_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<Value>)> {
+    headers
+        .get("x-wonderland-client")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message":"请刷新页面后重新连接，以启用远程设备交互。"})),
+            )
+        })
+}
+
+async fn interactions(State(state): State<WebState>, headers: HeaderMap) -> ApiResult {
+    Ok(Json(state.access.interactions.list(&client_id(&headers)?)))
+}
+
+async fn interaction_reply(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(value): Json<Value>,
+) -> ApiResult {
+    state
+        .access
+        .interactions
+        .reply(&client_id(&headers)?, &id, value)
+        .map_err(plugin_error)?;
+    Ok(Json(Value::Null))
+}
+
+async fn interaction_content(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let bytes = state
+        .access
+        .interactions
+        .download(&client_id(&headers)?, &id)
+        .map_err(plugin_error)?;
+    Ok((
+        [
+            ("content-type", "application/octet-stream"),
+            ("content-disposition", "attachment"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
 fn plugin_error(error: PluginError) -> (StatusCode, Json<Value>) {
     (StatusCode::BAD_REQUEST, Json(json!(error)))
 }
@@ -513,7 +575,11 @@ fn valid_request_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
-async fn call(State(state): State<WebState>, Json(input): Json<PluginCall>) -> ApiResult {
+async fn call(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(input): Json<PluginCall>,
+) -> ApiResult {
     allowed(&state.access, &input.plugin_id)?;
     if !valid_request_id(&input.request_id) {
         return Err((
@@ -532,13 +598,20 @@ async fn call(State(state): State<WebState>, Json(input): Json<PluginCall>) -> A
                 Json(json!({"message":"Too many active calls"})),
             )
         })?;
+    let owner = client_id(&headers)?;
+    let context = Arc::new(RemoteContext::new(
+        state.access.interactions.clone(),
+        owner,
+        input.plugin_id.clone(),
+    ));
     let value = tauri::async_runtime::spawn_blocking(move || {
         let _permit = permit;
-        state.manager.call(
+        state.manager.call_with_context(
             &input.plugin_id,
             &format!("web-{}", input.request_id),
             &input.method,
             input.params,
+            Some(context),
         )
     })
     .await
@@ -685,6 +758,7 @@ mod tests {
             plugin_ids: BTreeSet::from(["shared".into()]),
             events: Mutex::new(EventBuffer::default()),
             calls: Arc::new(Semaphore::new(1)),
+            interactions: Arc::new(RemoteBroker::default()),
         }
     }
 

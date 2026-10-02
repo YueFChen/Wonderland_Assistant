@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { afterEach, test } from 'node:test'
-import { connectWeb, disconnectWeb, invoke, webRequest } from '../src/core/transport.ts'
+import { connectWeb, disconnectWeb, invoke, webRequest, webDownload } from '../src/core/transport.ts'
 
 Object.defineProperty(globalThis, 'window', { value: new EventTarget(), configurable: true })
 const originalFetch = globalThis.fetch
@@ -22,7 +22,11 @@ test('sends the key only as a bearer header and omits browser cookies', async ()
   await connectWeb(' temporary-key ')
   await invoke('plugin_call', { pluginId: 'example', requestId: 'id-1', method: 'load', params: {} })
   assert.equal(calls[1].url, '/api/call')
-  assert.deepEqual(calls[1].options.headers, { Authorization: 'Bearer temporary-key', 'Content-Type': 'application/json' })
+  const headers = calls[1].options.headers as Record<string, string>
+  assert.equal(headers.Authorization, 'Bearer temporary-key')
+  assert.equal(headers['Content-Type'], 'application/json')
+  assert.match(headers['X-Wonderland-Client'], /^[a-f0-9]{64}$/)
+  assert.equal(headers['X-Wonderland-Client'], (calls[0].options.headers as Record<string, string>)['X-Wonderland-Client'])
   assert.equal(calls[1].options.credentials, 'omit')
   assert.equal(calls[1].options.cache, 'no-store')
   assert.equal(JSON.parse(String(calls[1].options.body)).method, 'load')
@@ -81,4 +85,21 @@ test('late successful data is discarded after the browser disconnects', async ()
   disconnectWeb()
   finish(Response.json([{ private: 'stale data' }]))
   await assert.rejects(pending, /连接已被替换/)
+})
+
+test('device identity is ephemeral and downloads from an old connection are discarded', async () => {
+  const identities: string[] = []
+  globalThis.fetch = async (_url, options) => {
+    identities.push((options!.headers as Record<string, string>)['X-Wonderland-Client'])
+    return Response.json({ version: 'test', cursor: 0 })
+  }
+  await connectWeb('same-key')
+  await connectWeb('same-key')
+  assert.notEqual(identities[0], identities[1])
+  let finish!: (response: Response) => void
+  globalThis.fetch = () => new Promise((resolve) => { finish = resolve })
+  const download = webDownload('interactions/test/content')
+  disconnectWeb()
+  finish(new Response('private file bytes'))
+  await assert.rejects(download, /连接已被替换/)
 })

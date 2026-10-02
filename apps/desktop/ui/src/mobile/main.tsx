@@ -5,6 +5,7 @@ import { MobileApp } from './MobileApp'
 import { consumeConnectionLink } from '../core/connectionLink'
 import { connectWeb } from '../core/transport'
 import '../styles/index.css'
+import '../layouts/workspace.css'
 import './mobile.css'
 
 const token = consumeConnectionLink(window.location.href, (url) => history.replaceState(null, '', url))

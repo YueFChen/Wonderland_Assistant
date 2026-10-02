@@ -1,5 +1,6 @@
 import { invoke, listen } from '../core/transport'
 import { useEffect, useState } from 'react'
+import { createRequestId } from '@wonderland/plugin-ui-sdk'
 import type { PluginRuntimeState, PluginService, PluginServiceRequirement } from '@wonderland/plugin-protocol'
 
 import type { MessageKey } from '../i18n'
@@ -82,7 +83,7 @@ export const pluginApi = {
   setCapabilities: (pluginId: string, capabilities: string[]) =>
     invoke<PluginRuntimeState[]>('plugins_set_capabilities', { pluginId, capabilities }),
   uiUrl: (pluginId: string) => invoke<PluginUiLaunchInfo>('plugins_ui_url', { pluginId }),
-  callWithId: <T>(pluginId: string, method: string, params: unknown = {}, requestId: string = crypto.randomUUID()) => {
+  callWithId: <T>(pluginId: string, method: string, params: unknown = {}, requestId: string = createRequestId()) => {
     return {
       requestId,
       promise: invoke<T>('plugin_call', { pluginId, requestId, method, params }),

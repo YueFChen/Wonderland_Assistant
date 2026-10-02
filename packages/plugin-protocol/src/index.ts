@@ -30,7 +30,11 @@ icon?: string | null, defaultOrder: number, location?: string | null, commands?:
 export type PluginUiContributionKind = "activity" | "view";
 export type PluginUiCommand = { id: string, title: string, inputSchema: unknown, effect: PluginUiCommandEffect, };
 export type PluginUiCommandEffect = "read_only" | "mutating";
-export type PluginBackend = { entry: string, transport: string, };
+export type PluginBackend = { entry: string, transport: string,
+/**
+ * Backend echoes Core-issued serviceContext on nested host calls.
+ */
+supportsServiceContext?: boolean | null, };
 export type InstallationState = "missing" | "installed" | "checking" | "invalid" | "incompatible";
 export type RuntimeState = "stopped" | "starting" | "running" | "stopping" | "failed";
 export type PluginFailure = { code: string, message: string,
@@ -48,7 +52,11 @@ pluginDataDirectory?: string | null, };
 export type PluginError = { code: string, message: string, details: unknown, };
 export type HostHello = { protocol: string, version: string, type: string, role: string, pluginId: string, coreVersion: string, grantedCapabilities: Array<string>, };
 export type PluginHello = { protocol: string, version: string, type: string, role: string, pluginId: string, pluginVersion: string, contractSha256: string, };
-export type PluginRequest = { protocol: string, version: string, type: string, id: string, method: string, params: unknown, };
+export type PluginRequest = { protocol: string, version: string, type: string, id: string, method: string, params: unknown,
+/**
+ * Opaque Core-issued invocation context, echoed by SDK host-service calls.
+ */
+serviceContext?: string | null, };
 export type PluginResult = { protocol: string, version: string, type: string, id: string, result: unknown, };
 export type PluginErrorMessage = { protocol: string, version: string, type: string, id: string, error: PluginError, };
 export type PluginEvent = { protocol: string, version: string, type: string, topic: string, payload: unknown, requestId: string | null, };

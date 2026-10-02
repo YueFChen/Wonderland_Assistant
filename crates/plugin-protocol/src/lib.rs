@@ -202,6 +202,9 @@ pub enum PluginUiContributionKind {
 pub struct PluginBackend {
     pub entry: String,
     pub transport: String,
+    /// Backend echoes Core-issued serviceContext on nested host calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_service_context: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +348,9 @@ pub struct PluginRequest {
     pub method: String,
     #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
     pub params: Value,
+    /// Opaque Core-issued invocation context, echoed by SDK host-service calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_context: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

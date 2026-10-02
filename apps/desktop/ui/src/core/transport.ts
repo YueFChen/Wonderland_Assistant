@@ -3,16 +3,17 @@ import { listen as nativeListen } from '@tauri-apps/api/event'
 
 export const isWebClient = !isTauri()
 let accessToken = ''
+let clientId = ''
 let cursor: number | undefined
 let generation = 0
 let timer: ReturnType<typeof setTimeout> | undefined
 const listeners = new Map<string, Set<(event: { payload: unknown }) => void>>()
 
-export async function webRequest<T>(path: string, body?: unknown): Promise<T> {
+async function webFetch(path: string, body?: unknown): Promise<Response> {
   const requestGeneration = generation
   const response = await fetch(`/api/${path}`, {
     method: body === undefined ? 'GET' : 'POST',
-    headers: { Authorization: `Bearer ${accessToken}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+    headers: { Authorization: `Bearer ${accessToken}`, 'X-Wonderland-Client': clientId, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
     body: body === undefined ? undefined : JSON.stringify(body),
     credentials: 'omit',
     cache: 'no-store',
@@ -26,14 +27,29 @@ export async function webRequest<T>(path: string, body?: unknown): Promise<T> {
     const error = await response.json().catch(() => ({ message: `请求失败 (${response.status})` }))
     throw Object.assign(new Error(error.message ?? `请求失败 (${response.status})`), error)
   }
-  const data = await response.json() as T
   if (requestGeneration !== generation) throw new Error('连接已被替换，请使用当前连接。')
+  return response
+}
+
+export async function webRequest<T>(path: string, body?: unknown): Promise<T> {
+  const current = generation
+  const data = await (await webFetch(path, body)).json() as T
+  if (current !== generation) throw new Error('连接已被替换，请使用当前连接。')
+  return data
+}
+
+export async function webDownload(path: string): Promise<Blob> {
+  const current = generation
+  const data = await (await webFetch(path)).blob()
+  if (current !== generation) throw new Error('连接已被替换，请使用当前连接。')
   return data
 }
 
 export async function connectWeb(token: string): Promise<{ version: string }> {
   disconnectWeb()
   accessToken = token.trim()
+  // getRandomValues is also available on trusted-LAN HTTP pages.
+  clientId = Array.from(crypto.getRandomValues(new Uint8Array(32)), (value) => value.toString(16).padStart(2, '0')).join('')
   const connectionGeneration = generation
   try {
     const status = await webRequest<{ version: string; cursor: number }>('status')
@@ -48,6 +64,7 @@ export async function connectWeb(token: string): Promise<{ version: string }> {
 
 export function disconnectWeb() {
   accessToken = ''
+  clientId = ''
   cursor = undefined
   generation++
   clearTimeout(timer)

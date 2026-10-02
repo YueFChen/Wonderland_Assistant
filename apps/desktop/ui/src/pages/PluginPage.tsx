@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent a
 import { X } from 'lucide-react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { listen } from '../core/transport'
-import { UI_BRIDGE_PROTOCOL as BRIDGE_PROTOCOL, UI_BRIDGE_VERSION } from '@wonderland/plugin-ui-sdk'
+import { UI_BRIDGE_PROTOCOL as BRIDGE_PROTOCOL, UI_BRIDGE_VERSION, createRequestId } from '@wonderland/plugin-ui-sdk'
 import { validatePluginUiBridgeMessage } from '../plugins/pluginUiBridgeValidation'
 import {
   completePluginUiCommand,
@@ -337,7 +337,7 @@ export function PluginSurface({
 }) {
   const { state } = contribution
   const frame = useRef<HTMLIFrameElement>(null)
-  const nonce = useRef(crypto.randomUUID())
+  const nonce = useRef(createRequestId())
   const activeCalls = useRef<number[]>([])
   const pendingCalls = useRef(new Set<string>())
   const pendingCliCommands = useRef(new Map<string, CliPluginUiCommand>())
@@ -636,7 +636,7 @@ export function PluginSurface({
     setBridgeError('')
     negotiatedBridgeVersion.current = null
     // A fresh nonce binds each iframe load to its own handshake session.
-    nonce.current = crypto.randomUUID()
+    nonce.current = createRequestId()
     subscribedTopics.current.clear()
     if (handshakeTimer.current !== null) window.clearTimeout(handshakeTimer.current)
     handshakeTimer.current = null

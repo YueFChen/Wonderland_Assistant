@@ -1,4 +1,6 @@
 import { UI_BRIDGE_PROTOCOL, UI_BRIDGE_VERSION } from '@wonderland/plugin-protocol'
+import { createRequestId } from './requestId'
+export { createRequestId } from './requestId'
 
 export { UI_BRIDGE_PROTOCOL, UI_BRIDGE_VERSION }
 
@@ -242,7 +244,7 @@ export function createPluginHostClient(pluginId: string): PluginHostClient {
     async call<T>(method: string, params: unknown = {}) {
       return this.callWithId<T>(method, params).promise
     },
-    callWithId<T>(method: string, params: unknown = {}, requestId = crypto.randomUUID()) {
+    callWithId<T>(method: string, params: unknown = {}, requestId = createRequestId()) {
       const promise = (async () => {
         await ready
         const result = new Promise<T>((resolve, reject) => {

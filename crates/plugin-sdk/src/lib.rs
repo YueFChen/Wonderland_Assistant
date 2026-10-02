@@ -53,6 +53,7 @@ pub struct HostClient {
     writer: Arc<Mutex<BufWriter<std::io::Stdout>>>,
     pending: PendingCalls,
     next_id: Arc<AtomicU64>,
+    service_context: Option<String>,
 }
 
 type PendingCalls = Arc<Mutex<HashMap<String, mpsc::SyncSender<Result<Value, PluginError>>>>>;
@@ -63,6 +64,7 @@ impl HostClient {
             writer,
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
+            service_context: None,
         }
     }
 
@@ -83,7 +85,11 @@ impl HostClient {
             .lock()
             .map_err(|_| PluginError::new("INTERNAL", "Plugin service table is unavailable."))?
             .insert(id.clone(), sender);
-        let request = json!({"protocol": PROTOCOL, "version": VERSION, "type": "request", "id": id, "method": method, "params": params});
+        let mut request = json!({"protocol": PROTOCOL, "version": VERSION, "type": "request", "id": id, "method": method, "params": params});
+        // Older Core versions do not send a context: preserve their exact wire contract.
+        if let Some(context) = &self.service_context {
+            request["serviceContext"] = json!(context);
+        }
         if let Err(error) = write_frame(&self.writer, &request) {
             self.pending.lock().ok().and_then(|mut p| p.remove(&id));
             return Err(PluginError::new(
@@ -261,7 +267,11 @@ where
                     .to_owned();
                 let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
                 let request_id = Some(id.clone());
-                let host = host.clone();
+                let mut host = host.clone();
+                host.service_context = frame
+                    .get("serviceContext")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let dispatch = dispatch.clone();
                 let writer = writer.clone();
                 thread::spawn(move || {

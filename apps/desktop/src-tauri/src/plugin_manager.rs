@@ -2055,6 +2055,17 @@ impl PluginManager {
         method: &str,
         params: Value,
     ) -> Result<Value, PluginError> {
+        self.call_with_context(plugin_id, request_id, method, params, None)
+    }
+
+    pub(crate) fn call_with_context(
+        &self,
+        plugin_id: &str,
+        request_id: &str,
+        method: &str,
+        params: Value,
+        remote: Option<Arc<crate::remote_interaction::RemoteContext>>,
+    ) -> Result<Value, PluginError> {
         let (process, contract, enabled) = {
             let state = self
                 .inner
@@ -2112,7 +2123,7 @@ impl PluginManager {
         let process = process
             .filter(|process| process.is_alive())
             .ok_or_else(|| plugin_error("NOT_RUNNING", "Plugin backend is not running."))?;
-        let result = process.call(request_id, method, params, timeout_ms)?;
+        let result = process.call(request_id, method, params, timeout_ms, remote)?;
         let result_schema = method_contract
             .get("result")
             .ok_or_else(|| plugin_error("INTERNAL", "Plugin contract is invalid."))?;
@@ -2140,6 +2151,17 @@ impl PluginManager {
         service_id: &str,
         method: &str,
         params: Value,
+    ) -> Result<Value, PluginError> {
+        self.invoke_service_with_context(consumer_id, service_id, method, params, None)
+    }
+
+    pub(crate) fn invoke_service_with_context(
+        &self,
+        consumer_id: &str,
+        service_id: &str,
+        method: &str,
+        params: Value,
+        remote: Option<Arc<crate::remote_interaction::RemoteContext>>,
     ) -> Result<Value, PluginError> {
         if !valid_service_id(service_id) || !valid_service_method(method) {
             return Err(plugin_error(
@@ -2187,7 +2209,13 @@ impl PluginManager {
                 .fetch_add(1, Ordering::Relaxed)
         );
         let result = process
-            .call(&request_id, method, params, timeout_ms)
+            .call(
+                &request_id,
+                method,
+                params,
+                timeout_ms,
+                remote.map(|context| context.for_plugin(&resolution.provider_id)),
+            )
             .map_err(service_provider_error)?;
         let result_schema = method_contract
             .get("result")
@@ -4529,6 +4557,7 @@ fn invalid_snapshot(id: &str, message: &str) -> PluginRuntimeState {
             backend: PluginBackend {
                 entry: "backend/invalid.exe".to_owned(),
                 transport: "stdio-ndjson-v1".to_owned(),
+                supports_service_context: None,
             },
             contract: "contract.json".to_owned(),
             capabilities: Vec::new(),

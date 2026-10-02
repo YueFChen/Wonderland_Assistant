@@ -8,6 +8,7 @@ mod plugin_manager;
 mod plugin_package;
 mod plugin_runtime;
 mod plugin_schema;
+mod remote_interaction;
 mod reveal;
 mod state;
 mod theme;

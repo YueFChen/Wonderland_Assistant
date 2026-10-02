@@ -3,7 +3,7 @@
 .mobile-app button, .mobile-app input { font: inherit; }
 .mobile-app button { cursor: pointer; touch-action: manipulation; }
 .mobile-app button:disabled { opacity: .55; cursor: wait; }
-.mobile-app button:focus-visible, .mobile-app a:focus-visible, .mobile-app input:focus-visible { outline: 2px solid var(--app-accent); outline-offset: 3px; }
+.mobile-app button:focus-visible, .mobile-app a:focus-visible, .mobile-app input:focus-visible, .mobile-app select:focus-visible { outline: 2px solid var(--app-accent); outline-offset: 3px; }
 .mobile-header { height: calc(76px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) 22px 0; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--app-glass-line); }
 .mobile-brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: inherit; font-size: 17px; font-weight: 700; }
 .mobile-brand img { width: 38px; height: 38px; border-radius: 13px; }
@@ -53,3 +53,79 @@
 .mobile-banner button { margin-left: 12px; text-decoration: underline; }
 @media (min-width: 700px) { .mobile-tools { grid-template-columns: repeat(3, minmax(0, 1fr)); } .mobile-header { padding-left: 32px; padding-right: 32px; } .mobile-tool-bar > span { display: block; color: var(--app-ink-faint); font-size: 12px; } }
 @media (max-width: 350px) { .mobile-tools { grid-template-columns: 1fr; } .mobile-connect { padding: 18px; } }
+
+/* One surface tree across breakpoints: resizing never remounts plugin frames. */
+.remote-desktop-only, .remote-rail { display: none; }
+.remote-header-actions { display: flex; align-items: center; gap: 20px; }
+.remote-interactions { position: fixed; z-index: 50; right: 16px; bottom: calc(80px + env(safe-area-inset-bottom)); width: min(420px, calc(100vw - 32px)); max-height: 65dvh; display: flex; flex-direction: column; border-radius: 14px; background: var(--app-page); box-shadow: 0 10px 40px #0003; }
+.remote-interactions-heading { display: flex; align-items: center; gap: 10px; text-align: left; padding: 16px; flex-shrink: 0; }
+.remote-interactions-body { overflow-y: auto; padding: 0 16px 16px; font-size: 13px; }
+.remote-interactions-body > p { color: var(--app-ink-muted); line-height: 1.7; }
+.remote-interaction { margin-top: 12px; padding: 14px; border: 1px solid var(--app-glass-line); border-radius: 10px; overflow-wrap: anywhere; }
+.remote-interaction header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.remote-interaction header button { padding: 8px; }
+.remote-interaction label, .remote-interaction small { display: block; }
+.remote-interaction small { color: var(--app-ink-muted); margin: 5px 0; }
+.remote-interaction input { display: block; width: 100%; margin-top: 10px; }
+.remote-file-action { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 8px; color: var(--app-accent-ink); background: var(--app-accent-soft); text-decoration: none; }
+.remote-content { min-width: 0; }
+.remote-card-icon { width: 23px; height: 23px; }
+.remote-plugin-icon { width: 18px; height: 18px; flex-shrink: 0; }
+.mobile-app[data-connected='true'] { height: 100dvh; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.mobile-app[data-connected='true'] .mobile-header { flex-shrink: 0; }
+.remote-workspace { min-height: 0; flex: 1; display: flex; padding-bottom: calc(66px + env(safe-area-inset-bottom)); }
+.remote-content { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.remote-content > .mobile-banner { flex-shrink: 0; }
+.remote-content > .mobile-workspace { width: 100%; overflow-y: auto; padding-bottom: 30px; }
+.remote-content > .mobile-tool { height: auto; min-height: 0; flex: 1; }
+.remote-content .mobile-tool-bar, .remote-content .mobile-view-selector { flex-shrink: 0; }
+
+@media (min-width: 1024px) {
+  .remote-mobile-only, .mobile-nav { display: none; }
+  .remote-desktop-only { display: flex; }
+  .mobile-header { height: 64px; padding: 0 28px; background: var(--app-glass); }
+  .mobile-brand { font-size: 15px; }
+  .mobile-brand img { width: 32px; height: 32px; border-radius: 10px; }
+  .mobile-icon { width: 36px; height: 36px; border-radius: 9px; }
+  .remote-session { align-items: center; gap: 8px; font-size: 11px; color: var(--app-ink-faint); }
+  .remote-login-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(380px, 1fr); min-height: calc(100dvh - 64px); max-width: 1440px; margin: 0 auto; }
+  .remote-login-brand { flex-direction: column; justify-content: center; align-items: flex-start; padding: 64px clamp(40px, 5vw, 88px); border-right: 1px dashed var(--app-glass-line); }
+  .remote-login-brand > img { width: 104px; height: 104px; border-radius: 26px; margin-bottom: 38px; border: 1px solid var(--app-glass-line); }
+  .remote-login-brand h1 { max-width: 470px; font-size: clamp(32px, 3vw, 46px); line-height: 1.3; margin: 18px 0 22px; text-wrap: balance; }
+  .remote-login-features { display: flex; flex-wrap: wrap; gap: 20px; margin-top: 42px; font-size: 12px; color: var(--app-ink-muted); }
+  .remote-login-features span { display: flex; align-items: center; gap: 8px; }
+  .mobile-login { align-self: center; width: 100%; max-width: 490px; padding: 48px 36px; }
+  .mobile-connect { margin: 0; border-radius: 16px; padding: 28px; }
+  .mobile-connect input { font-size: 14px; }
+  .remote-workspace { padding-bottom: 0; }
+  .remote-rail { display: flex; width: 248px; min-width: 248px; }
+  .remote-rail button { font-size: 13px; }
+  .remote-host { min-width: 0; flex: 1; padding: 4px; }
+  .remote-host > span { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 650; }
+  .remote-host small { display: block; font-size: 11px; color: var(--app-ink-faint); margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .remote-rail .workspace-rail-action { width: 100%; }
+  .remote-connection { display: flex; align-items: center; gap: 7px; color: var(--app-ink-muted); font-size: 11px; padding: 8px 12px; }
+  .remote-connection > span { width: 6px; height: 6px; border-radius: 50%; background: var(--app-warning, #e2aa54); }
+  .remote-connection > span[data-connected='true'] { background: var(--app-success); }
+  .remote-connection small { margin-left: auto; color: var(--app-ink-faint); }
+  .remote-content > .mobile-workspace { max-width: 1400px; padding: 42px clamp(28px, 3vw, 56px); }
+  .remote-workspace-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+  .remote-workspace-heading h1 { font-size: 30px; margin: 12px 0 8px; }
+  .remote-tool-count { flex-shrink: 0; font-size: 12px; color: var(--app-ink-muted); border: 1px solid var(--app-glass-line); border-radius: 8px; padding: 8px 12px; }
+  .mobile-search { max-width: 480px; margin: 28px 0 24px; border-radius: 9px; }
+  .mobile-search input { min-height: 40px; font-size: 13px; }
+  .mobile-tools { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 18px; }
+  .mobile-tool-card { border-radius: 14px; padding: 24px; min-height: 190px; transition: background .15s, border-color .15s; }
+  .mobile-tool-card:hover { background: var(--app-glass-hover); border-color: var(--app-accent-line); }
+  .mobile-tool-card span { font-size: 12px; line-height: 1.8; }
+  .mobile-tool-glyph { border-radius: 11px; }
+  .mobile-tool-card small { margin-top: auto; padding-top: 18px; }
+  .mobile-tool-bar { min-height: 58px; padding: 10px 24px; border-bottom: 1px solid var(--app-glass-line); }
+  .mobile-tool-bar h1 { font-size: 14px; }
+  .remote-page-tabs { flex-shrink: 0; min-height: 44px; gap: 6px; padding: 6px 24px; overflow-x: auto; border-bottom: 1px solid var(--app-glass-line); background: var(--app-glass); }
+  .remote-page-tabs button { flex-shrink: 0; border: 1px solid transparent; border-radius: 7px; padding: 6px 14px; color: var(--app-ink-muted); background: transparent; font-size: 12px; }
+  .remote-page-tabs button:hover { background: var(--app-glass-hover); color: var(--app-ink); }
+  .remote-page-tabs button[aria-current] { color: var(--app-accent-ink); background: var(--app-accent-soft); border-color: var(--app-accent-line); }
+}
+
+@media (prefers-reduced-motion: reduce) { .mobile-tool-card, .remote-rail, .remote-rail .workspace-rail-link { transition: none; } }
