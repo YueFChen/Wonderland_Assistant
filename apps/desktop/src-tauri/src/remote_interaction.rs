@@ -270,8 +270,8 @@ impl RemoteContext {
                 "REMOTE_UNSUPPORTED",
                 "远程设备无法打开宿主机数据目录，请在宿主机本地操作。",
             )),
-            "core.browser.open_official" => {
-                let url = crate::plugin_runtime::official_url(params)?;
+            "core.browser.open" | "core.browser.open_official" => {
+                let url = crate::plugin_runtime::browser_url(params)?;
                 self.action("open_url", json!({"url":url}), None, None)?;
                 Ok(json!({"ok":true}))
             }

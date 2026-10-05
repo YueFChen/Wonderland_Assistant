@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
@@ -29,7 +30,6 @@ use crate::remote_interaction::RemoteContext;
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
-const MAX_REQUESTS_PER_SESSION: usize = 65_536;
 const MAX_PICKED_FILE_CHUNK_BYTES: u64 = 1024 * 1024;
 const MAX_PICKED_FILE_INLINE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_EXPORTED_FILE_BYTES: usize = 20 * 1024 * 1024;
@@ -41,13 +41,13 @@ const MAX_PLUGIN_STDERR_LINE_BYTES: usize = 8 * 1024;
 pub(crate) struct PluginProcess {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
-    pending: Mutex<HashMap<String, Sender<Result<Value, PluginError>>>>,
-    seen_request_ids: Mutex<HashSet<String>>,
+    pending: Mutex<PendingRequests>,
     hello_waiter: Mutex<Option<SyncSender<Result<PluginHello, String>>>>,
     alive: AtomicBool,
     plugin_id: String,
     granted_capabilities: HashSet<String>,
-    network_public_hosts: Vec<String>,
+    http: wonderland_net::HttpClient,
+    model: Mutex<Option<CachedModelClient>>,
     data_dir: PathBuf,
     export_dir: PathBuf,
     picked_files: Mutex<HashMap<String, PickedFile>>,
@@ -55,6 +55,76 @@ pub(crate) struct PluginProcess {
     supports_service_context: bool,
     supports_remote_access: bool,
     remote_services: Arc<tokio::sync::Semaphore>,
+}
+
+struct CachedModelClient {
+    endpoint: wonderland_net::ModelEndpoint,
+    proxy_revision: u64,
+    client: wonderland_net::ModelClient,
+}
+
+/// Only active calls need storage. Wire IDs never reuse a caller's ID, so a late reply
+/// cannot complete a later call even when its caller reuses the same public ID.
+#[derive(Default)]
+struct PendingRequests {
+    sequence: u64,
+    calls: HashMap<String, PendingRequest>,
+}
+
+struct PendingRequest {
+    caller_id: String,
+    sender: Sender<Result<Value, PluginError>>,
+}
+
+impl PendingRequests {
+    fn insert(
+        &mut self,
+        caller_id: &str,
+        sender: Sender<Result<Value, PluginError>>,
+    ) -> Result<String, PluginError> {
+        if self.wire_id(caller_id).is_some() {
+            return Err(plugin_error(
+                "INVALID_REQUEST",
+                "Request ID is already active.",
+            ));
+        }
+        if self.calls.len() >= 128 {
+            return Err(plugin_error(
+                "RESOURCE_LIMIT",
+                "Plugin has too many concurrent requests.",
+            ));
+        }
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| internal_error("Plugin request sequence is exhausted."))?;
+        let wire_id = format!("core-{}", self.sequence);
+        self.calls.insert(
+            wire_id.clone(),
+            PendingRequest {
+                caller_id: caller_id.into(),
+                sender,
+            },
+        );
+        Ok(wire_id)
+    }
+
+    fn wire_id(&self, caller_id: &str) -> Option<String> {
+        self.calls
+            .iter()
+            .find(|(_, call)| call.caller_id == caller_id)
+            .map(|(wire_id, _)| wire_id.clone())
+    }
+
+    fn caller_id(&self, wire_id: &str) -> Option<String> {
+        self.calls.get(wire_id).map(|call| call.caller_id.clone())
+    }
+
+    fn deliver(&mut self, wire_id: &str, result: Result<Value, PluginError>) {
+        if let Some(call) = self.calls.remove(wire_id) {
+            let _ = call.sender.send(result);
+        }
+    }
 }
 
 struct PickedFile {
@@ -101,7 +171,7 @@ fn resolve_invocation_context(
     }
     if contexts.values().any(Option::is_some)
         && (method.starts_with("core.files.")
-            || method == "core.browser.open_official"
+            || matches!(method, "core.browser.open" | "core.browser.open_official")
             || method == "core.services.invoke")
     {
         return Err(plugin_error(
@@ -196,7 +266,13 @@ impl PluginProcess {
         contract_sha256: &str,
     ) -> Result<Arc<Self>, PluginError> {
         let plugin_id = state.manifest.id.clone();
-        let granted_capabilities = state.granted_capabilities.clone();
+        let mut granted_capabilities = state.granted_capabilities.clone();
+        for &capability in wonderland_plugin_protocol::IMPLICIT_CAPABILITIES {
+            if !granted_capabilities.iter().any(|value| value == capability) {
+                granted_capabilities.push(capability.into());
+            }
+        }
+        let http = wonderland_net::HttpClient::unrestricted();
         let mut command = Command::new(executable);
         command
             .current_dir(
@@ -252,13 +328,13 @@ impl PluginProcess {
         let process = Arc::new(Self {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
-            pending: Mutex::new(HashMap::new()),
-            seen_request_ids: Mutex::new(HashSet::new()),
+            pending: Mutex::new(PendingRequests::default()),
             hello_waiter: Mutex::new(Some(hello_tx)),
             alive: AtomicBool::new(true),
             plugin_id: plugin_id.clone(),
             granted_capabilities: granted_capabilities.iter().cloned().collect(),
-            network_public_hosts: state.manifest.network_public_hosts.clone(),
+            http,
+            model: Mutex::new(None),
             data_dir,
             export_dir: documents_dir
                 .join("Wonderland Assistant")
@@ -372,46 +448,20 @@ impl PluginProcess {
                 "Request ID must contain 1 to 128 characters.",
             ));
         }
-        {
-            let mut seen = self
-                .seen_request_ids
-                .lock()
-                .map_err(|_| internal_error("Plugin request ID table is unavailable."))?;
-            if seen.len() >= MAX_REQUESTS_PER_SESSION {
-                return Err(plugin_error(
-                    "RESOURCE_LIMIT",
-                    "Plugin session reached its request limit and must be restarted.",
-                ));
-            }
-            if !seen.insert(request_id.to_owned()) {
-                return Err(plugin_error(
-                    "INVALID_REQUEST",
-                    "Request IDs cannot be reused during a plugin session.",
-                ));
-            }
-        }
         let (tx, rx) = mpsc::channel();
-        {
-            let mut pending = self
-                .pending
-                .lock()
-                .map_err(|_| internal_error("Plugin request table is unavailable."))?;
-            if pending.len() >= 128 {
-                return Err(plugin_error(
-                    "RESOURCE_LIMIT",
-                    "Plugin has too many concurrent requests.",
-                ));
-            }
-            pending.insert(request_id.to_owned(), tx);
-        }
+        let wire_id = self
+            .pending
+            .lock()
+            .map_err(|_| internal_error("Plugin request table is unavailable."))?
+            .insert(request_id, tx)?;
         let _invocation_guard = if self.supports_service_context {
             self.invocation_contexts
                 .lock()
                 .unwrap()
-                .insert(request_id.into(), remote);
+                .insert(wire_id.clone(), remote);
             Some(InvocationGuard {
                 process: self,
-                id: request_id,
+                id: &wire_id,
             })
         } else {
             None
@@ -420,22 +470,22 @@ impl PluginProcess {
             "protocol": PROTOCOL_ID,
             "version": PROTOCOL_VERSION,
             "type": "request",
-            "id": request_id,
+            "id": wire_id,
             "method": method,
             "params": params,
         });
         if _invocation_guard.is_some() {
-            frame["serviceContext"] = json!(request_id);
+            frame["serviceContext"] = json!(wire_id);
         }
         if let Err(error) = self.write_frame(&frame) {
-            self.remove_pending(request_id);
+            self.remove_pending(&wire_id);
             return Err(error);
         }
         match rx.recv_timeout(Duration::from_millis(timeout_ms.clamp(1, MAX_TIMEOUT_MS))) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = self.cancel(request_id);
-                self.remove_pending(request_id);
+                let _ = self.cancel_wire(&wire_id);
+                self.remove_pending(&wire_id);
                 Err(plugin_error(
                     "TIMEOUT",
                     "Plugin call exceeded its contract timeout.",
@@ -449,6 +499,18 @@ impl PluginProcess {
     }
 
     pub(crate) fn cancel(&self, request_id: &str) -> Result<(), PluginError> {
+        let wire_id = self
+            .pending
+            .lock()
+            .map_err(|_| internal_error("Plugin request table is unavailable."))?
+            .wire_id(request_id)
+            .ok_or_else(|| {
+                plugin_error("CANCELLED", "No active plugin call has this request ID.")
+            })?;
+        self.cancel_wire(&wire_id)
+    }
+
+    fn cancel_wire(&self, request_id: &str) -> Result<(), PluginError> {
         if let Some(Some(context)) = self.invocation_contexts.lock().unwrap().get(request_id) {
             context.cancel();
         }
@@ -456,6 +518,7 @@ impl PluginProcess {
             .pending
             .lock()
             .map_err(|_| internal_error("Plugin request table is unavailable."))?
+            .calls
             .contains_key(request_id);
         if !active {
             return Err(plugin_error(
@@ -538,7 +601,7 @@ impl PluginProcess {
 
     fn remove_pending(&self, request_id: &str) {
         if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(request_id);
+            pending.calls.remove(request_id);
         }
     }
 
@@ -546,10 +609,10 @@ impl PluginProcess {
         let pending = self
             .pending
             .lock()
-            .map(|mut pending| std::mem::take(&mut *pending))
+            .map(|mut pending| std::mem::take(&mut pending.calls))
             .unwrap_or_default();
-        for (_, sender) in pending {
-            let _ = sender.send(Err(error.clone()));
+        for (_, call) in pending {
+            let _ = call.sender.send(Err(error.clone()));
         }
     }
 }
@@ -763,12 +826,24 @@ fn read_stdout(
                         "Plugin event requestId must be a string or null.",
                     );
                 }
+                let request_id = match event.request_id.as_deref() {
+                    Some(id) => match process
+                        .pending
+                        .lock()
+                        .ok()
+                        .and_then(|pending| pending.caller_id(id))
+                    {
+                        Some(id) => Some(id),
+                        None => continue, // Expired calls cannot publish events into a newer call.
+                    },
+                    None => None,
+                };
                 let _ = app.emit(
                     "plugin:event",
                     json!({
                         "pluginId": process.plugin_id,
                         "topic": topic,
-                        "requestId": event.request_id,
+                        "requestId": request_id,
                         "payload": payload,
                     }),
                 );
@@ -896,7 +971,7 @@ impl PluginProcess {
             "core.files.pick" | "core.files.read" => "files.pick",
             "core.files.export" | "core.files.export_dir" => "files.export",
             "core.files.reveal_own" => "files.reveal_own",
-            "core.browser.open_official" => "browser.open_official",
+            "core.browser.open" | "core.browser.open_official" => "browser.open",
             "core.services.resolve" | "core.services.invoke" => "services.call",
             _ => {
                 return Err(plugin_error(
@@ -905,7 +980,11 @@ impl PluginProcess {
                 ));
             }
         };
-        if !self.granted_capabilities.contains(required_capability) {
+        if wonderland_plugin_protocol::requires_capability_approval(required_capability)
+            && !self.granted_capabilities.contains(required_capability)
+            && !(required_capability == "browser.open"
+                && self.granted_capabilities.contains("browser.open_official"))
+        {
             return Err(plugin_error(
                 "UNAUTHORIZED",
                 "The requested Core service capability has not been granted.",
@@ -924,14 +1003,15 @@ impl PluginProcess {
             method,
         )?;
         if let Some(context) = &remote
-            && (method.starts_with("core.files.") || method == "core.browser.open_official")
+            && (method.starts_with("core.files.")
+                || matches!(method, "core.browser.open" | "core.browser.open_official"))
         {
             return context.service(method, params);
         }
         match method {
             "core.account.snapshot" => account_snapshot(app),
             "core.account.authed_get" => account_authed_get(app, params),
-            "core.network.public" => network_public(params, &self.network_public_hosts),
+            "core.network.public" => network_public(params, &self.http),
             "core.network.model" => self.network_model(params),
             "core.secrets.plugin.get" => self.secret_get(params),
             "core.secrets.plugin.set" => self.secret_set(params),
@@ -942,7 +1022,7 @@ impl PluginProcess {
             "core.files.export" => self.export_file(params),
             "core.files.export_dir" => self.export_dir(),
             "core.files.reveal_own" => self.reveal_own(params),
-            "core.browser.open_official" => open_official(params),
+            "core.browser.open" | "core.browser.open_official" => open_browser(params),
             "core.services.resolve" => {
                 let service_id = params
                     .get("serviceId")
@@ -1394,10 +1474,6 @@ impl PluginProcess {
             .and_then(Value::as_str)
             .filter(|value| value.len() <= 2048)
             .ok_or_else(|| plugin_error("INVALID_INPUT", "Model endpoint is invalid."))?;
-        let allow_loopback = params
-            .get("allowLoopback")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         let timeout_seconds = params
             .get("timeoutSeconds")
             .and_then(Value::as_u64)
@@ -1429,12 +1505,33 @@ impl PluginProcess {
         })?)
         .map_err(|_| plugin_error("INTERNAL", "The selected model API key is invalid."))?;
         let endpoint = wonderland_net::ModelEndpoint {
-            base_url: base_url.to_owned(),
             timeout: Duration::from_secs(timeout_seconds),
-            allow_loopback,
             ..wonderland_net::ModelEndpoint::new(base_url)
         };
-        let client = wonderland_net::ModelClient::new(endpoint).map_err(model_service_error)?;
+        let revision = wonderland_net::proxy::current_proxy()
+            .map_err(|_| internal_error("Proxy configuration is unavailable."))?
+            .revision;
+        let client = {
+            let mut cached = self
+                .model
+                .lock()
+                .map_err(|_| internal_error("Model HTTP client is unavailable."))?;
+            if let Some(previous) = cached.as_ref()
+                && previous.endpoint == endpoint
+                && previous.proxy_revision == revision
+            {
+                previous.client.clone()
+            } else {
+                let client = wonderland_net::ModelClient::new(endpoint.clone())
+                    .map_err(model_service_error)?;
+                *cached = Some(CachedModelClient {
+                    endpoint,
+                    proxy_revision: revision,
+                    client: client.clone(),
+                });
+                client
+            }
+        };
         let bytes = tauri::async_runtime::block_on(client.post_json(path, &api_key, body))
             .map_err(model_service_error)?;
         Ok(json!({ "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
@@ -1462,10 +1559,8 @@ impl PluginProcess {
     }
 
     fn deliver(&self, request_id: &str, result: Result<Value, PluginError>) {
-        if let Ok(mut pending) = self.pending.lock()
-            && let Some(sender) = pending.remove(request_id)
-        {
-            let _ = sender.send(result);
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.deliver(request_id, result);
         }
     }
 }
@@ -1480,20 +1575,34 @@ fn account_snapshot(app: &AppHandle) -> Result<Value, PluginError> {
         .map_err(|_| plugin_error("INTERNAL", "Cannot serialize the Core account snapshot."))
 }
 
-/// Browser access is intentionally a set of named destinations. Plugins cannot ask the host to
-/// open arbitrary URLs or pass through query strings and fragments.
-fn open_official(params: &Value) -> Result<Value, PluginError> {
-    let url = official_url(params)?;
+fn open_browser(params: &Value) -> Result<Value, PluginError> {
+    let url = browser_url(params)?;
     crate::reveal::open_url(&url).map_err(|error| {
         plugin_error(
             "INTERNAL",
-            &format!("Cannot open official browser destination: {error}"),
+            &format!("Cannot open browser destination: {error}"),
         )
     })?;
     Ok(json!({ "ok": true }))
 }
 
-pub(crate) fn official_url(params: &Value) -> Result<String, PluginError> {
+pub(crate) fn browser_url(params: &Value) -> Result<String, PluginError> {
+    if let Some(raw) = params.get("url") {
+        let url = raw
+            .as_str()
+            .and_then(|raw| tauri::Url::parse(raw).ok())
+            .filter(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            })
+            .ok_or_else(|| {
+                plugin_error("INVALID_INPUT", "Browser URL must be an HTTP(S) address.")
+            })?;
+        return Ok(url.into());
+    }
+    // Compatibility adapter for existing plugins. New callers supply their own URL.
     let url = match params.get("target").and_then(Value::as_str) {
         Some("document") => {
             let path_id = params
@@ -1516,7 +1625,7 @@ pub(crate) fn official_url(params: &Value) -> Result<String, PluginError> {
         _ => {
             return Err(plugin_error(
                 "INVALID_INPUT",
-                "Official browser destination is invalid.",
+                "Browser URL is missing or legacy destination is invalid.",
             ));
         }
     };
@@ -1590,132 +1699,57 @@ fn account_authed_get(app: &AppHandle, params: &Value) -> Result<Value, PluginEr
     Ok(json!({ "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
 }
 
-fn network_public(params: &Value, allowed_hosts: &[String]) -> Result<Value, PluginError> {
-    let method = params
-        .get("method")
-        .and_then(Value::as_str)
-        .filter(|method| matches!(*method, "GET" | "POST"))
-        .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network method is invalid."))?;
-    let url = params
-        .get("url")
-        .and_then(Value::as_str)
-        .filter(|url| {
-            url.len() <= 2048
-                && (url.starts_with("https://")
-                    || allowed_hosts.is_empty() && url.starts_with("http://"))
-        })
-        .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network URL is invalid."))?;
-    let headers = params
-        .get("headers")
-        .and_then(Value::as_array)
-        .filter(|headers| headers.len() <= 16)
-        .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network headers are invalid."))?
-        .iter()
-        .map(|item| {
-            let pair = item
-                .as_array()
-                .filter(|pair| pair.len() == 2)
-                .ok_or_else(|| {
-                    plugin_error("INVALID_INPUT", "Public network headers are invalid.")
-                })?;
-            let name = pair[0].as_str().ok_or_else(|| {
-                plugin_error("INVALID_INPUT", "Public network headers are invalid.")
-            })?;
-            let value = pair[1].as_str().ok_or_else(|| {
-                plugin_error("INVALID_INPUT", "Public network headers are invalid.")
-            })?;
-            let normalized = name.to_ascii_lowercase();
-            if !matches!(
-                normalized.as_str(),
-                "user-agent"
-                    | "origin"
-                    | "referer"
-                    | "x-rpc-client_type"
-                    | "x-rpc-language"
-                    | "accept"
-            ) || value.len() > 1024
-                || value.chars().any(char::is_control)
-            {
-                return Err(plugin_error(
-                    "INVALID_INPUT",
-                    "Public network header is not allowed.",
-                ));
-            }
-            Ok((normalized, value.to_owned()))
-        })
-        .collect::<Result<Vec<_>, PluginError>>()?;
-    let query = params
-        .get("query")
-        .and_then(Value::as_array)
-        .filter(|items| items.len() <= 32)
-        .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network query is invalid."))?
-        .iter()
-        .map(|item| {
-            let pair = item
-                .as_array()
-                .filter(|pair| pair.len() == 2)
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network query is invalid."))?;
-            let key = pair[0]
-                .as_str()
-                .filter(|value| value.len() <= 100)
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network query is invalid."))?;
-            let value = pair[1]
-                .as_str()
-                .filter(|value| value.len() <= 512)
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network query is invalid."))?;
-            Ok((key.to_owned(), value.to_owned()))
-        })
-        .collect::<Result<Vec<_>, PluginError>>()?;
-    let bytes = match method {
-        "GET" => tauri::async_runtime::block_on(
-            wonderland_net::HttpClient::with_allowed_hosts(allowed_hosts.to_vec())
-                .map_err(|_| plugin_error("INTERNAL", "Public network client is unavailable."))?
-                .get_bytes(
-                    url,
-                    &headers
-                        .iter()
-                        .map(|(name, value)| (name.as_str(), value.as_str()))
-                        .collect::<Vec<_>>(),
-                    &query,
-                ),
-        ),
-        "POST" => {
-            if !query.is_empty() {
-                return Err(plugin_error(
-                    "INVALID_INPUT",
-                    "POST query parameters must be part of the URL.",
-                ));
-            }
-            let body = params
-                .get("body")
-                .and_then(Value::as_str)
-                .filter(|body| body.len() <= 1_048_576)
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "Public network body is invalid."))?;
-            tauri::async_runtime::block_on(
-                wonderland_net::HttpClient::with_allowed_hosts(allowed_hosts.to_vec())
-                    .map_err(|_| plugin_error("INTERNAL", "Public network client is unavailable."))?
-                    .post_json(
-                        url,
-                        &headers
-                            .iter()
-                            .map(|(name, value)| (name.as_str(), value.as_str()))
-                            .collect::<Vec<_>>(),
-                        body,
-                    ),
-            )
-        }
-        _ => unreachable!(),
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkRequest {
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    query: Vec<(String, String)>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+fn network_public(
+    params: &Value,
+    client: &wonderland_net::HttpClient,
+) -> Result<Value, PluginError> {
+    let request: NetworkRequest = serde_json::from_value(params.clone())
+        .map_err(|_| plugin_error("INVALID_INPUT", "HTTP request parameters are invalid."))?;
+    if request
+        .body
+        .as_ref()
+        .is_some_and(|body| body.len() > 1_048_576)
+    {
+        return Err(plugin_error(
+            "RESOURCE_LIMIT",
+            "HTTP request body is too large.",
+        ));
     }
+    let headers = request
+        .headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let bytes = tauri::async_runtime::block_on(client.request_bytes(
+        &request.method,
+        &request.url,
+        &headers,
+        &request.query,
+        request.body.as_deref(),
+    ))
     .map_err(|error| {
         plugin_error(
             match error {
                 wonderland_kernel::KernelError::Timeout => "TIMEOUT",
                 wonderland_kernel::KernelError::ResourceLimit => "RESOURCE_LIMIT",
-                wonderland_kernel::KernelError::InvalidInput => "UNAUTHORIZED",
+                wonderland_kernel::KernelError::InvalidInput => "INVALID_INPUT",
                 wonderland_kernel::KernelError::Http(_) => "PLUGIN_NETWORK_HTTP_ERROR",
                 _ => "PLUGIN_NETWORK_REQUEST_FAILED",
             },
-            "Public network request failed.",
+            "HTTP request failed.",
         )
     })?;
     Ok(json!({ "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
@@ -2036,5 +2070,60 @@ mod process_stop_tests {
                 .expect("child status is readable")
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod network_and_request_tests {
+    use super::*;
+
+    #[test]
+    fn completed_call_ids_can_be_reused_without_delivering_stale_replies_or_events() {
+        let mut pending = PendingRequests::default();
+        let (first_tx, first_rx) = mpsc::channel();
+        let first = pending.insert("caller", first_tx).unwrap();
+        let (duplicate_tx, _) = mpsc::channel();
+        assert_eq!(
+            pending.insert("caller", duplicate_tx).unwrap_err().code,
+            "INVALID_REQUEST"
+        );
+        assert_eq!(pending.caller_id(&first).as_deref(), Some("caller"));
+        pending.deliver(&first, Ok(json!("first")));
+        assert_eq!(first_rx.recv().unwrap().unwrap(), json!("first"));
+        let (second_tx, second_rx) = mpsc::channel();
+        let second = pending.insert("caller", second_tx).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(pending.wire_id("caller"), Some(second.clone()));
+        assert!(pending.caller_id(&first).is_none());
+        pending.deliver(&first, Ok(json!("late")));
+        assert_eq!(second_rx.try_recv().unwrap_err(), mpsc::TryRecvError::Empty);
+        pending.deliver(&second, Ok(json!("second")));
+        assert_eq!(second_rx.recv().unwrap().unwrap(), json!("second"));
+    }
+
+    #[test]
+    fn plugin_sessions_outlive_the_old_65536_request_limit_with_bounded_storage() {
+        let mut pending = PendingRequests::default();
+        for _ in 0..65_537 {
+            let (sender, receiver) = mpsc::channel();
+            let id = pending.insert("caller", sender).unwrap();
+            pending.deliver(&id, Ok(Value::Null));
+            assert!(receiver.recv().unwrap().is_ok());
+        }
+        assert!(pending.calls.is_empty());
+    }
+
+    #[test]
+    fn browser_urls_accept_lan_ports_queries_and_fragments_and_keep_legacy_calls() {
+        let url = "http://192.168.1.20:8080/tools?q=example#section";
+        assert_eq!(browser_url(&json!({"url": url})).unwrap(), url);
+        assert!(browser_url(&json!({"target":"onnx"})).is_ok());
+        for url in [
+            "file:///C:/test",
+            "javascript:alert(1)",
+            "https://user:password@example.com",
+        ] {
+            assert!(browser_url(&json!({"url":url})).is_err());
+        }
     }
 }

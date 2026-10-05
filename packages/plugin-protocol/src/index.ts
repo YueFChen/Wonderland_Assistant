@@ -1,6 +1,7 @@
 // Generated from Rust by crates/plugin-protocol/examples/generate_bindings.rs. Do not edit.
 export const UI_BRIDGE_PROTOCOL = "wonderland-plugin-ui" as const
 export const UI_BRIDGE_VERSION = "1.1.0" as const
+export const IMPLICIT_CAPABILITIES = ["network.public","network.model"] as const
 export type PluginManifest = { manifestVersion: number, id: string, name: string, version: string, description?: string | null,
 /**
  * A legacy built-in icon key or a local package asset such as `asset:ui/icons/logo.svg`.
@@ -11,7 +12,7 @@ icon?: string | null, hostCompatibility: HostCompatibility, platform: PluginPlat
  */
 remoteAccess?: boolean | null,
 /**
- * Exact HTTPS hosts available through core.network.public.
+ * Legacy metadata, retained for old packages and signed manifests; does not restrict networking.
  */
 networkPublicHosts?: Array<string>, provides?: Array<PluginService>, requires?: Array<PluginServiceRequirement>, };
 export type PluginService = { id: string, version: string, methods: Array<string>, };

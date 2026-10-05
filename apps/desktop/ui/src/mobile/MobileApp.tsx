@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
-import { ArrowLeft, ArrowUpRight, CheckCircle2, LayoutGrid, LogOut, Monitor, Moon, PanelLeftClose, PanelLeftOpen, Search, ShieldCheck, Smartphone, Sun, Wifi } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { ArrowLeft, ArrowUpRight, CheckCircle2, LayoutGrid, LogOut, Monitor, Moon, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Search, ShieldCheck, Smartphone, Sun, Wifi } from 'lucide-react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { connectWeb, disconnectWeb } from '../core/transport'
 import { usePlugins } from '../plugins/api'
@@ -11,9 +11,9 @@ import { t } from '../i18n'
 import brand from '../assets/brand-avatar.png'
 import { RemoteInteractions } from './RemoteInteractions'
 
-export function MobileApp({ initialConnection = null }: { initialConnection?: Promise<{ version: string }> | null }) {
+export function MobileApp({ initialConnection = null, initialToken = '' }: { initialConnection?: Promise<{ version: string }> | null; initialToken?: string }) {
   const [version, setVersion] = useState('')
-  const [token, setToken] = useState('')
+  const [token, setToken] = useState(initialToken)
   const [busy, setBusy] = useState(Boolean(initialConnection))
   const [error, setError] = useState('')
   const [dark, setDark] = useState(() => matchMedia('(prefers-color-scheme: dark)').matches)
@@ -21,13 +21,16 @@ export function MobileApp({ initialConnection = null }: { initialConnection?: Pr
   useEffect(() => {
     if (!initialConnection) return
     let live = true
-    void initialConnection.then((status) => { if (live) setVersion(status.version) })
+    void initialConnection.then((status) => { if (live) { setVersion(status.version); setToken('') } })
       .catch((cause) => { if (live) setError(cause instanceof Error ? cause.message : String(cause)) })
       .finally(() => { if (live) setBusy(false) })
     return () => { live = false }
   }, [initialConnection])
   useEffect(() => {
-    const stop = () => setVersion('')
+    const stop = (event: Event) => {
+      setVersion('')
+      setError((event as CustomEvent<string | undefined>).detail ?? '')
+    }
     window.addEventListener('wonderland:web-disconnected', stop)
     return () => window.removeEventListener('wonderland:web-disconnected', stop)
   }, [])
@@ -43,14 +46,14 @@ export function MobileApp({ initialConnection = null }: { initialConnection?: Pr
     finally { setBusy(false) }
   }
   return <div className="mobile-app" data-connected={Boolean(version)}>
-    <header className="mobile-header">
+    <header className={`mobile-header${version ? ' remote-desktop-only' : ''}`}>
       <a href="#/" className="mobile-brand"><img src={brand} alt="" /><span>Wonderland<small>{t('webClient.subtitle')}</small></span></a>
       <div className="remote-header-actions">
         {version && <span className="remote-desktop-only remote-session"><Monitor size={15} aria-hidden /> CORE {version}</span>}
         <button className="mobile-icon" onClick={() => setDark(!dark)} aria-label={t(dark ? 'mobile.light' : 'mobile.dark')}>{dark ? <Sun size={20} /> : <Moon size={20} />}</button>
       </div>
     </header>
-    {version ? <Workspace version={version} dark={dark} /> : <div className="remote-login-layout">
+    {version ? <Workspace version={version} dark={dark} onToggleTheme={() => setDark(!dark)} /> : <div className="remote-login-layout">
       <aside className="remote-login-brand remote-desktop-only" aria-label="Wonderland Assistant">
         <img src={brand} alt="" />
         <p className="mobile-kicker">WONDERLAND ASSISTANT</p>
@@ -68,8 +71,8 @@ export function MobileApp({ initialConnection = null }: { initialConnection?: Pr
         <div className="mobile-connect-title"><Wifi size={22} /><h2>{t('mobile.connect')}</h2></div>
         <p>{t('mobile.connectHint')}</p>
         <label htmlFor="access-key">{t('webAccess.key')}</label>
-        <input id="access-key" type="password" autoComplete="off" spellCheck={false} value={token} onChange={(e) => setToken(e.target.value)} placeholder={t('mobile.keyPlaceholder')} required />
-        <button className="mobile-primary" disabled={busy || !token.trim()}>{t(busy ? 'mobile.connecting' : 'mobile.enter')}<ArrowUpRight size={18} /></button>
+        <input id="access-key" type="password" autoComplete="off" maxLength={1024} spellCheck={false} value={token} onChange={(e) => setToken(e.target.value)} placeholder={t('mobile.keyPlaceholder')} />
+        <button className="mobile-primary" disabled={busy}>{t(busy ? 'mobile.connecting' : 'mobile.enter')}<ArrowUpRight size={18} /></button>
         {error && <p role="alert" className="mobile-error">{error}</p>}
       </form>
       <p className="mobile-security"><ShieldCheck size={18} />{t('mobile.keyPrivacy')}</p>
@@ -77,7 +80,7 @@ export function MobileApp({ initialConnection = null }: { initialConnection?: Pr
   </div>
 }
 
-function Workspace({ version, dark }: { version: string; dark: boolean }) {
+function Workspace({ version, dark, onToggleTheme }: { version: string; dark: boolean; onToggleTheme: () => void }) {
   const { states, error } = usePlugins()
   const [search, setSearch] = useState('')
   const [connection, setConnection] = useState('connected')
@@ -87,6 +90,7 @@ function Workspace({ version, dark }: { version: string; dark: boolean }) {
   const location = useLocation()
   const registry = useMemo(() => buildContributionRegistry(states), [states])
   const active = registry.find((item) => location.pathname === `/tool/${encodeURIComponent(item.pluginId)}/${encodeURIComponent(item.contributionId)}`)
+  const contributions = registry.filter((item) => item.pluginId === active?.pluginId)
   const allEntries = primaryPluginEntries(registry)
   const entries = allEntries.filter((item) => `${item.title} ${item.state.manifest.name}`.toLowerCase().includes(search.toLowerCase()))
   useEffect(() => {
@@ -127,13 +131,20 @@ function Workspace({ version, dark }: { version: string; dark: boolean }) {
       </div>
     </aside>
     <div className="remote-content">
+    <header className="mobile-workspace-bar remote-mobile-only">
+      {active && <button className="mobile-icon" onClick={() => navigate('/')} aria-label={t('mobile.back')}><ArrowLeft size={20} /></button>}
+      {active && contributions.length > 1
+        ? <select className="mobile-page-select" aria-label={t('mobile.pluginPage')} title={active.title} value={active.id} onChange={(event) => open(event.target.value)}>{contributions.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select>
+        : <h1 title={active?.title}>{active?.title ?? t('mobile.workspace')}</h1>}
+      <MobileWorkspaceMenu version={version} connection={connection} dark={dark} onToggleTheme={onToggleTheme} />
+    </header>
     {connection === 'reconnecting' && <p role="status" className="mobile-banner">{t('mobile.reconnecting')}</p>}
     {missed && <p role="alert" className="mobile-banner">{t('mobile.eventsMissed')}<button onClick={() => { setMissed(false); navigate('/') }}>{t('mobile.back')}</button></p>}
     {active ? <main className="mobile-tool">
-      <div className="mobile-tool-bar"><button className="mobile-icon" onClick={() => navigate('/')} aria-label={t('mobile.back')}><ArrowLeft size={20} /></button><h1>{active.title}</h1><span>{active.state.manifest.name}</span></div>
-      <RemotePluginWorkspace key={active.pluginId} active={active} contributions={registry.filter((item) => item.pluginId === active.pluginId)} dark={dark} onOpen={open} />
+      <div className="mobile-tool-bar remote-desktop-only"><button className="mobile-icon" onClick={() => navigate('/')} aria-label={t('mobile.back')}><ArrowLeft size={20} /></button><h1>{active.title}</h1><span>{active.state.manifest.name}</span></div>
+      <RemotePluginWorkspace key={active.pluginId} active={active} contributions={contributions} dark={dark} onOpen={open} />
     </main> : <main className="mobile-workspace">
-      <div className="mobile-kicker"><CheckCircle2 size={15} /> CORE {version} · {t('mobile.connected')}</div>
+      <div className="mobile-kicker remote-desktop-only"><CheckCircle2 size={15} /> CORE {version} · {t(connection === 'reconnecting' ? 'webClient.reconnecting' : 'mobile.connected')}</div>
       <div className="remote-workspace-heading"><div><h1>{t('mobile.workspace')}</h1><p className="mobile-intro">{t('mobile.workspaceHint')}</p></div><span className="remote-desktop-only remote-tool-count">{t('webClient.toolCount', { count: allEntries.length })}</span></div>
       <label className="mobile-search"><Search size={19} /><input aria-label={t('mobile.search')} placeholder={t('mobile.search')} value={search} onChange={(e) => setSearch(e.target.value)} /></label>
       {error && <p role="alert" className="mobile-error">{t(error)}</p>}
@@ -147,7 +158,36 @@ function Workspace({ version, dark }: { version: string; dark: boolean }) {
       <p className="mobile-note remote-desktop-only">{t('webClient.pluginHint')}</p>
     </main>}
     </div>
-    <nav className="mobile-nav" aria-label={t('mobile.navigation')}><button onClick={() => navigate('/')} aria-current={!active ? 'page' : undefined}><LayoutGrid size={20} />{t('mobile.workspace')}</button><button onClick={disconnectWeb}><LogOut size={20} />{t('mobile.disconnect')}</button></nav>
+  </div>
+}
+
+function MobileWorkspaceMenu({ version, connection, dark, onToggleTheme }: { version: string; connection: string; dark: boolean; onToggleTheme: () => void }) {
+  const [open, setOpen] = useState(false)
+  const container = useRef<HTMLDivElement>(null)
+  const trigger = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const dismiss = (event: PointerEvent) => { if (!container.current?.contains(event.target as Node)) setOpen(false) }
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { setOpen(false); trigger.current?.focus() }
+    }
+    const blur = () => setOpen(false)
+    document.addEventListener('pointerdown', dismiss)
+    document.addEventListener('keydown', escape)
+    window.addEventListener('blur', blur)
+    return () => {
+      document.removeEventListener('pointerdown', dismiss)
+      document.removeEventListener('keydown', escape)
+      window.removeEventListener('blur', blur)
+    }
+  }, [open])
+  return <div className="mobile-workspace-menu" ref={container} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false) }}>
+    <button ref={trigger} className="mobile-icon" aria-label={t('mobile.more')} aria-expanded={open} aria-controls="mobile-workspace-actions" onClick={() => setOpen(!open)}><MoreHorizontal size={22} /></button>
+    {open && <div id="mobile-workspace-actions" className="glass-card mobile-workspace-actions">
+      <div className="mobile-session-info"><span>{t(connection === 'reconnecting' ? 'webClient.reconnecting' : 'mobile.connected')} · CORE {version}</span><small>{window.location.host}</small></div>
+      <button onClick={() => { onToggleTheme(); setOpen(false); trigger.current?.focus() }}>{dark ? <Sun size={18} /> : <Moon size={18} />}{t(dark ? 'mobile.light' : 'mobile.dark')}</button>
+      <button onClick={disconnectWeb}><LogOut size={18} />{t('mobile.disconnect')}</button>
+    </div>}
   </div>
 }
 
@@ -162,10 +202,9 @@ function RemotePluginWorkspace({ active, contributions, dark, onOpen }: {
   // Keep visited surfaces alive so an auxiliary View can publish changes back to its Activity.
   const visibleSurfaces = contributions.filter((item) => opened.includes(item.id) || item.id === active.id)
   return <>
-    {contributions.length > 1 && <>
-      <label className="mobile-view-selector remote-mobile-only">{t('mobile.pluginPage')}<select value={active.id} onChange={(event) => onOpen(event.target.value)}>{contributions.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
+    {contributions.length > 1 &&
       <nav className="remote-page-tabs remote-desktop-only" aria-label={t('mobile.pluginPage')}>{contributions.map((item) => <button key={item.id} onClick={() => onOpen(item.id)} aria-current={item.id === active.id ? 'page' : undefined}>{item.title}</button>)}</nav>
-    </>}
+    }
     <div className="mobile-surface">
       {visibleSurfaces.map((item) => item.status === 'ready'
         ? <PluginSurface key={item.id} contribution={item} active={item.id === active.id} resolvedTheme={dark ? 'dark' : 'light'} surface={item.kind} onOpenView={onOpen} />

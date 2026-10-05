@@ -15,6 +15,10 @@ fn main() {
         "export const UI_BRIDGE_VERSION = {} as const\n",
         serde_json::to_string(UI_BRIDGE_VERSION).unwrap()
     ));
+    output.push_str(&format!(
+        "export const IMPLICIT_CAPABILITIES = {} as const\n",
+        serde_json::to_string(IMPLICIT_CAPABILITIES).unwrap()
+    ));
     macro_rules! emit {
         ($($ty:ty),* $(,)?) => { $(output.push_str("export "); output.push_str(&<$ty>::decl(&cfg)); output.push('\n');)* };
     }

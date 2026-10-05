@@ -13,6 +13,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,6 +35,9 @@ pub struct WebAccessOptions {
     port: u16,
     public_url: String,
     plugin_ids: BTreeSet<String>,
+    /// Empty means no key is required; only the selected plugins are shared.
+    #[serde(default)]
+    access_key: String,
 }
 
 #[derive(Default, Serialize)]
@@ -141,6 +145,7 @@ struct RunningServer {
 
 struct Access {
     token: String,
+    session_id: String,
     asset_key: String,
     active: AtomicBool,
     plugin_ids: BTreeSet<String>,
@@ -211,6 +216,9 @@ fn validate_options(options: &WebAccessOptions) -> Result<IpAddr, String> {
     if options.port == 0 {
         return Err("端口必须介于 1 与 65535 之间".into());
     }
+    if options.access_key.len() > 1024 || options.access_key.chars().any(char::is_control) {
+        return Err("访问密钥不能包含控制字符，且最多为 1024 字节".into());
+    }
     if !options.public_url.is_empty() {
         let url =
             tauri::Url::parse(&options.public_url).map_err(|_| "公网入口必须为 HTTPS 地址")?;
@@ -238,7 +246,8 @@ impl WebAccessService {
                 running: running.access.active.load(Ordering::Acquire),
                 options: Some(running.options.clone()),
                 local_url: Some(format!("http://127.0.0.1:{}/", running.port)),
-                access_token: Some(running.access.token.clone()),
+                access_token: (!running.access.token.is_empty())
+                    .then(|| running.access.token.clone()),
                 lan_addresses: Vec::new(),
                 address_error: None,
             });
@@ -262,7 +271,8 @@ impl WebAccessService {
         status
     }
 
-    async fn start(&self, app: AppHandle, options: WebAccessOptions) -> Result<(), String> {
+    async fn start(&self, app: AppHandle, mut options: WebAccessOptions) -> Result<(), String> {
+        options.access_key = options.access_key.trim().to_owned();
         let address = validate_options(&options)?;
         let mut guard = self.running.lock().await;
         if guard.is_some() {
@@ -285,7 +295,8 @@ impl WebAccessService {
             .await
             .map_err(|e| format!("网页访问端口无法监听：{e}"))?;
         let access = Arc::new(Access {
-            token: random_key()?,
+            token: options.access_key.clone(),
+            session_id: random_key()?,
             asset_key: random_key()?,
             active: AtomicBool::new(true),
             plugin_ids: options.plugin_ids.clone(),
@@ -430,15 +441,28 @@ fn router(state: WebState) -> Router {
 
 fn authorized(headers: &HeaderMap, access: &Access) -> bool {
     access.active.load(Ordering::Acquire)
-        && headers
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|token| token == access.token)
+        && (access.token.is_empty() || supplied_key(headers).is_some_and(|key| key == access.token))
         && headers.get("origin").is_none_or(|value| value != "null")
         && headers
             .get("sec-fetch-site")
             .is_none_or(|value| value != "cross-site")
+}
+
+fn supplied_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(key) = headers.get("x-wonderland-key") {
+        // UTF-8 keys cannot be represented directly in an HTTP header.
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(key.as_bytes())
+            .ok()?;
+        String::from_utf8(bytes).ok()
+    } else {
+        headers
+            .get("authorization")?
+            .to_str()
+            .ok()?
+            .strip_prefix("Bearer ")
+            .map(str::to_owned)
+    }
 }
 
 async fn authenticate(State(access): State<Arc<Access>>, request: Request, next: Next) -> Response {
@@ -462,7 +486,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
 
 async fn remote_status(State(state): State<WebState>) -> Json<Value> {
     Json(
-        json!({ "version": env!("CARGO_PKG_VERSION"), "transport": "web" , "cursor": state.access.events.lock().map(|e| e.sequence).unwrap_or_default() }),
+        json!({ "version": env!("CARGO_PKG_VERSION"), "transport": "web", "sessionId": state.access.session_id, "keyRequired": !state.access.token.is_empty(), "cursor": state.access.events.lock().map(|e| e.sequence).unwrap_or_default() }),
     )
 }
 
@@ -812,6 +836,7 @@ mod tests {
     fn access() -> Access {
         Access {
             token: "secret".into(),
+            session_id: "session".into(),
             asset_key: "asset".into(),
             active: AtomicBool::new(true),
             plugin_ids: BTreeSet::from(["shared".into()]),
@@ -909,6 +934,48 @@ mod tests {
     }
 
     #[test]
+    fn optional_keys_allow_direct_access_and_support_utf8_keys() {
+        let mut access = access();
+        access.token.clear();
+        let mut headers = HeaderMap::new();
+        assert!(authorized(&headers, &access));
+        access.active.store(false, Ordering::Release);
+        assert!(!authorized(&headers, &access));
+        access.active.store(true, Ordering::Release);
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(!authorized(&headers, &access));
+        headers.remove("sec-fetch-site");
+        access.token = "我的 Core #密钥".into();
+        assert!(!authorized(&headers, &access));
+        headers.insert(
+            "x-wonderland-key",
+            base64::engine::general_purpose::STANDARD
+                .encode(access.token.as_bytes())
+                .parse()
+                .unwrap(),
+        );
+        assert!(authorized(&headers, &access));
+        headers.insert("x-wonderland-key", "not-base64!".parse().unwrap());
+        assert!(!authorized(&headers, &access));
+    }
+
+    #[test]
+    fn web_options_accept_an_omitted_empty_or_custom_key() {
+        let mut value = json!({"mode":"lan","port":17890,"publicUrl":"","pluginIds":[]});
+        let options: WebAccessOptions = serde_json::from_value(value.clone()).unwrap();
+        assert!(options.access_key.is_empty());
+        assert!(validate_options(&options).is_ok());
+        for key in ["", "我的 Core #密钥"] {
+            value["accessKey"] = json!(key);
+            assert!(validate_options(&serde_json::from_value(value.clone()).unwrap()).is_ok());
+        }
+        for key in ["bad\nkey".to_owned(), "a".repeat(1025)] {
+            value["accessKey"] = json!(key);
+            assert!(validate_options(&serde_json::from_value(value.clone()).unwrap()).is_err());
+        }
+    }
+
+    #[test]
     fn restricts_static_files_and_remote_plugins() {
         for path in [
             "../Cargo.toml",
@@ -935,6 +1002,7 @@ mod tests {
             port: 17890,
             public_url: "https://core.example.com/".into(),
             plugin_ids: BTreeSet::new(),
+            access_key: String::new(),
         };
         assert_eq!(
             validate_options(&options).unwrap(),

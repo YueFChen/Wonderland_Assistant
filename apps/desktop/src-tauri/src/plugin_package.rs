@@ -1039,28 +1039,6 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
             ));
         }
     }
-    if manifest.network_public_hosts.len() > 32
-        || manifest
-            .network_public_hosts
-            .iter()
-            .collect::<BTreeSet<_>>()
-            .len()
-            != manifest.network_public_hosts.len()
-        || manifest
-            .network_public_hosts
-            .iter()
-            .any(|host| !wonderland_net::valid_public_host(host))
-        || (!manifest
-            .capabilities
-            .iter()
-            .any(|capability| capability == "network.public")
-            && !manifest.network_public_hosts.is_empty())
-    {
-        return Err(
-            "Plugin public network hosts must be unique, valid, and declared with network.public."
-                .to_owned(),
-        );
-    }
     if manifest.provides.len() > 32 || manifest.requires.len() > 32 {
         return Err("Plugin declares too many services.".to_owned());
     }
@@ -1376,6 +1354,7 @@ fn allowed_capabilities() -> BTreeSet<&'static str> {
         "files.pick",
         "files.export",
         "files.reveal_own",
+        "browser.open",
         "browser.open_official",
         "services.call",
     ]
@@ -1499,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn public_network_scope_is_optional_but_declared_hosts_are_exact() {
+    fn legacy_network_hosts_are_metadata_only() {
         let mut manifest: PluginManifest = serde_json::from_str(include_str!(
             "../tests/fixtures/comment_collector_manifest.json"
         ))
@@ -1511,10 +1490,14 @@ mod tests {
         validate_manifest(&manifest).unwrap();
         for invalid in ["*.example.com", "API.example.com", "api.example.com:443"] {
             manifest.network_public_hosts = vec![invalid.to_owned()];
-            assert!(validate_manifest(&manifest).is_err(), "{invalid}");
+            validate_manifest(&manifest).unwrap();
         }
         manifest.network_public_hosts = vec!["api.example.com".to_owned(); 2];
-        assert!(validate_manifest(&manifest).is_err());
+        validate_manifest(&manifest).unwrap();
+        manifest
+            .capabilities
+            .retain(|capability| capability != "network.public");
+        validate_manifest(&manifest).unwrap();
     }
 
     #[test]

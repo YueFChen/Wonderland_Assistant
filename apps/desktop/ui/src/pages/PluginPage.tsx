@@ -686,7 +686,7 @@ export function PluginSurface({
         <p className="text-sm text-[var(--app-danger)]">{t('pluginPage.frameFailed')} {loaderFailure}</p>
         <div className="mt-4 flex flex-wrap gap-2">
           <button type="button" onClick={retry} className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-500">{t('pluginPage.retry')}</button>
-          <Link to="/workspace/settings" className="rounded-lg border border-glass-line px-4 py-2 text-sm text-ink hover:bg-glass-hover">{t('workspace.goToSettings')}</Link>
+          {isWebClient ? <p className="text-xs text-ink-muted">{t('mobile.checkHost')}</p> : <Link to="/workspace/settings" className="rounded-lg border border-glass-line px-4 py-2 text-sm text-ink hover:bg-glass-hover">{t('workspace.goToSettings')}</Link>}
         </div>
       </section>
     )
@@ -700,7 +700,7 @@ export function PluginSurface({
         <div role="alert" className="flex flex-wrap items-center gap-2 border-b border-glass-line px-4 py-2 text-xs text-[var(--app-danger)]">
           <span className="flex-1">{bridgeError}</span>
           <button type="button" onClick={retry} className="rounded-md border border-glass-line px-2.5 py-1 text-ink hover:bg-glass-hover">{t('pluginPage.retry')}</button>
-          <Link to="/workspace/settings" className="rounded-md border border-glass-line px-2.5 py-1 text-ink hover:bg-glass-hover">{t('workspace.goToSettings')}</Link>
+          {isWebClient ? <span className="text-ink-muted">{t('mobile.checkHost')}</span> : <Link to="/workspace/settings" className="rounded-md border border-glass-line px-2.5 py-1 text-ink hover:bg-glass-hover">{t('workspace.goToSettings')}</Link>}
         </div>
       )}
       <iframe

@@ -3161,8 +3161,8 @@ fn run_cli_permissions(manager: &PluginManager, args: &[String]) -> Result<Value
             let plugin = snapshot()?;
             Ok(json!({
                 "pluginId": plugin_id,
-                "requested": plugin.manifest.capabilities,
-                "granted": plugin.granted_capabilities,
+                "requested": plugin.manifest.capabilities.into_iter().filter(|capability| wonderland_plugin_protocol::requires_capability_approval(capability)).collect::<Vec<_>>(),
+                "granted": plugin.granted_capabilities.into_iter().filter(|capability| wonderland_plugin_protocol::requires_capability_approval(capability)).collect::<Vec<_>>(),
             }))
         }
         "set" => {
@@ -3528,10 +3528,18 @@ pub async fn plugins_catalog_install(
     }
     let approved = approved_capabilities
         .iter()
+        .filter(|capability| wonderland_plugin_protocol::requires_capability_approval(capability))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let requested = entry.capabilities.iter().cloned().collect::<BTreeSet<_>>();
-    if approved.len() != approved_capabilities.len() || approved != requested {
+    let requested = entry
+        .capabilities
+        .iter()
+        .filter(|capability| wonderland_plugin_protocol::requires_capability_approval(capability))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if approved_capabilities.iter().collect::<BTreeSet<_>>().len() != approved_capabilities.len()
+        || approved != requested
+    {
         return Err(plugin_error(
             "CAPABILITY_APPROVAL_REQUIRED",
             "Confirm every capability requested by the catalog entry before installing.",
@@ -3898,22 +3906,6 @@ fn validate_catalog_entry(entry: &PluginCatalogEntry) -> Result<(), PluginError>
         || entry.size_bytes == 0
         || entry.size_bytes > PLUGIN_PACKAGE_MAX_BYTES
         || capabilities.len() != entry.capabilities.len()
-        || entry.network_public_hosts.len() > 32
-        || entry
-            .network_public_hosts
-            .iter()
-            .collect::<BTreeSet<_>>()
-            .len()
-            != entry.network_public_hosts.len()
-        || entry
-            .network_public_hosts
-            .iter()
-            .any(|host| !wonderland_net::valid_public_host(host))
-        || (!entry
-            .capabilities
-            .iter()
-            .any(|capability| capability == "network.public")
-            && !entry.network_public_hosts.is_empty())
         || !services_valid
         || entry
             .capabilities
@@ -4147,21 +4139,13 @@ pub async fn plugins_install(
                     "尚未安装".to_owned()
                 }
             });
-        let capabilities = if manifest.capabilities.is_empty() {
+        let requested_permissions = manifest.capabilities.iter()
+            .filter(|capability| wonderland_plugin_protocol::requires_capability_approval(capability))
+            .cloned().collect::<Vec<_>>();
+        let capabilities = if requested_permissions.is_empty() {
             "无".to_owned()
         } else {
-            manifest.capabilities.iter().map(|capability| {
-                if capability == "network.public" {
-                    let scope = if manifest.network_public_hosts.is_empty() {
-                        "全部 HTTP(S) 目标".to_owned()
-                    } else {
-                        manifest.network_public_hosts.join("、")
-                    };
-                    format!("network.public（{scope}）")
-                } else {
-                    capability.clone()
-                }
-            }).collect::<Vec<_>>().join("、")
+            requested_permissions.join("、")
         };
         let confirmed = app
             .dialog()

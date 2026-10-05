@@ -1,3 +1,4 @@
+import { requestedPermissions } from '../plugins/capabilities'
 import { useEffect, useMemo, useState } from 'react'
 import { Download, PackageSearch, RefreshCw, Search } from 'lucide-react'
 
@@ -47,10 +48,9 @@ export function OnlinePluginCatalog({ onInstalled }: {
       const previousSource = installed?.installationSource
         ? `${installed.installationSource.kind === 'catalog' ? 'GitHub' : '本地'}：${installed.installationSource.origin}`
         : installed ? t('settings.plugins.source.unknown') : t('settings.plugins.source.none')
-      const requested = entry.capabilities.length > 0
-        ? entry.capabilities.map((capability) => capability === 'network.public'
-          ? `• ${capability}：${entry.networkPublicHosts.length > 0 ? entry.networkPublicHosts.join('、') : '全部 HTTP(S) 目标'}`
-          : `• ${capability}`).join('\n')
+      const permissions = requestedPermissions(entry.capabilities)
+      const requested = permissions.length > 0
+        ? permissions.map((capability) => `• ${capability}`).join('\n')
         : t('settings.plugins.catalog.noCapabilities')
       const serviceLines = [
         ...entry.provides.map((service) => `• ${service.id}@${service.version}：${service.methods.join('、')}`),
@@ -69,7 +69,7 @@ export function OnlinePluginCatalog({ onInstalled }: {
         services: requestedServices,
       })
       if (!window.confirm(confirmation)) return
-      const states = await pluginApi.installCatalog(entry.id, entry.version, entry.sha256, entry.capabilities, true)
+      const states = await pluginApi.installCatalog(entry.id, entry.version, entry.sha256, permissions, true)
       onInstalled(states)
       setCatalog((current) => current && ({
         ...current,

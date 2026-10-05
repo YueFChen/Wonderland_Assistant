@@ -36,28 +36,23 @@
 .mobile-tool-card small[data-ready='true'] { color: var(--app-success); }
 .mobile-empty { border-radius: 18px; padding: 30px 20px; color: var(--app-ink-muted); font-size: 14px; display: grid; justify-items: center; gap: 15px; text-align: center; }
 .mobile-note { color: var(--app-ink-faint); font-size: 11px; line-height: 1.8; margin-top: 22px; }
-.mobile-nav { position: fixed; z-index: 20; bottom: 0; left: 0; right: 0; display: flex; justify-content: space-around; padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); background: var(--app-page); border-top: 1px solid var(--app-glass-line); }
-.mobile-nav button { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; min-height: 48px; min-width: 100px; border: 0; border-radius: 12px; background: transparent; color: var(--app-ink-muted); font-size: 10px; }
-.mobile-nav button[aria-current] { color: var(--app-accent); background: var(--app-accent-soft); }
-.mobile-tool { height: calc(100dvh - 142px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); min-height: 250px; display: flex; flex-direction: column; }
+.mobile-tool { min-height: 0; display: flex; flex-direction: column; }
 .mobile-tool-bar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; }
 .mobile-tool-bar h1 { margin: 0; font-size: 15px; letter-spacing: 0; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-tool-bar > span { display: none; }
 .mobile-surface { position: relative; flex: 1; min-height: 0; }
 .mobile-surface .plugin-surface-frame { position: absolute; inset: 0; display: flex; flex-direction: column; overflow: hidden; }
 .mobile-surface .plugin-surface-frame[hidden] { display: none; }
-.mobile-view-selector { display: flex; align-items: center; gap: 10px; padding: 0 16px 10px; color: var(--app-ink-muted); font-size: 12px; }
-.mobile-view-selector select { flex: 1; min-width: 0; min-height: 44px; padding: 8px 12px; border: 1px solid var(--app-field-border); border-radius: 10px; background: var(--app-field); color: var(--app-ink); font-size: 16px; }
 .mobile-surface iframe { min-height: 0; flex: 1; width: 100%; border: 0; background: transparent; }
 .mobile-banner { margin: 0; padding: 8px 16px; font-size: 12px; background: var(--app-accent-soft); color: var(--app-ink); }
 .mobile-banner button { margin-left: 12px; text-decoration: underline; }
-@media (min-width: 700px) { .mobile-tools { grid-template-columns: repeat(3, minmax(0, 1fr)); } .mobile-header { padding-left: 32px; padding-right: 32px; } .mobile-tool-bar > span { display: block; color: var(--app-ink-faint); font-size: 12px; } }
+@media (min-width: 700px) { .mobile-tools { grid-template-columns: repeat(3, minmax(0, 1fr)); } .mobile-header { padding-left: 32px; padding-right: 32px; } }
 @media (max-width: 350px) { .mobile-tools { grid-template-columns: 1fr; } .mobile-connect { padding: 18px; } }
 
 /* One surface tree across breakpoints: resizing never remounts plugin frames. */
 .remote-desktop-only, .remote-rail { display: none; }
 .remote-header-actions { display: flex; align-items: center; gap: 20px; }
-.remote-interactions { position: fixed; z-index: 50; right: 16px; bottom: calc(80px + env(safe-area-inset-bottom)); width: min(420px, calc(100vw - 32px)); max-height: 65dvh; display: flex; flex-direction: column; border-radius: 14px; background: var(--app-page); box-shadow: 0 10px 40px #0003; }
+.remote-interactions { position: fixed; z-index: 50; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); width: min(420px, calc(100vw - 32px)); max-height: 65dvh; display: flex; flex-direction: column; border-radius: 14px; background: var(--app-page); box-shadow: 0 10px 40px #0003; }
 .remote-interactions-heading { display: flex; align-items: center; gap: 10px; text-align: left; padding: 16px; flex-shrink: 0; }
 .remote-interactions-body { overflow-y: auto; padding: 0 16px 16px; font-size: 13px; }
 .remote-interactions-body > p { color: var(--app-ink-muted); line-height: 1.7; }
@@ -73,15 +68,39 @@
 .remote-plugin-icon { width: 18px; height: 18px; flex-shrink: 0; }
 .mobile-app[data-connected='true'] { height: 100dvh; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .mobile-app[data-connected='true'] .mobile-header { flex-shrink: 0; }
-.remote-workspace { min-height: 0; flex: 1; display: flex; padding-bottom: calc(66px + env(safe-area-inset-bottom)); }
+.remote-workspace { min-height: 0; flex: 1; display: flex; padding-bottom: env(safe-area-inset-bottom); }
 .remote-content { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .remote-content > .mobile-banner { flex-shrink: 0; }
 .remote-content > .mobile-workspace { width: 100%; overflow-y: auto; padding-bottom: 30px; }
 .remote-content > .mobile-tool { height: auto; min-height: 0; flex: 1; }
-.remote-content .mobile-tool-bar, .remote-content .mobile-view-selector { flex-shrink: 0; }
+.remote-content .mobile-tool-bar { flex-shrink: 0; }
+
+.mobile-workspace-bar { position: relative; z-index: 30; display: flex; align-items: center; flex-shrink: 0; gap: 4px; min-height: calc(52px + env(safe-area-inset-top)); padding: calc(4px + env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) 4px max(8px, env(safe-area-inset-left)); border-bottom: 1px solid var(--app-glass-line); background: var(--app-page); }
+.mobile-workspace-bar h1 { flex: 1; min-width: 0; font-size: 16px; letter-spacing: 0; margin: 0 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-workspace-bar .mobile-icon { border: 0; border-radius: 10px; background: transparent; }
+.mobile-workspace-bar .mobile-icon:hover, .mobile-workspace-bar .mobile-icon[aria-expanded='true'] { background: var(--app-accent-soft); }
+.mobile-page-select { flex: 1; width: 0; min-width: 0; height: 44px; padding: 0 8px; border: 0; border-radius: 8px; background: var(--app-page); color: var(--app-ink); font: inherit; font-size: 16px; font-weight: 600; text-overflow: ellipsis; }
+.mobile-workspace-menu { position: relative; flex-shrink: 0; }
+.mobile-workspace-actions { position: absolute; top: calc(100% + 8px); right: 0; width: min(280px, calc(100vw - 32px)); max-height: calc(100dvh - 76px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto; padding: 8px; border-radius: 14px; background: var(--app-page); box-shadow: 0 10px 40px #0003; }
+.mobile-session-info { padding: 8px 10px 12px; border-bottom: 1px solid var(--app-glass-line); margin-bottom: 4px; font-size: 12px; color: var(--app-ink-muted); }
+.mobile-session-info small { display: block; margin-top: 4px; overflow-wrap: anywhere; color: var(--app-ink-faint); }
+.mobile-workspace-actions button { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 10px; border: 0; border-radius: 8px; background: transparent; color: var(--app-ink); text-align: left; font-size: 13px; }
+.mobile-workspace-actions button:hover { background: var(--app-accent-soft); }
+
+@media (max-width: 1023px) {
+  .remote-content > .mobile-workspace { padding: 16px max(16px, env(safe-area-inset-right)) 20px max(16px, env(safe-area-inset-left)); }
+  .remote-workspace-heading { display: none; }
+  .mobile-search { margin: 0 0 16px; border-radius: 10px; }
+  .mobile-search input { min-height: 44px; }
+  .mobile-tool-card { padding: 14px; border-radius: 14px; }
+  .mobile-tool-glyph { width: 36px; height: 36px; border-radius: 10px; margin-bottom: 12px; }
+  .mobile-tool-arrow { right: 12px; top: 14px; }
+  .mobile-tool-card span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; line-height: 1.6; }
+  .mobile-tool-card small { margin-top: 12px; }
+}
 
 @media (min-width: 1024px) {
-  .remote-mobile-only, .mobile-nav { display: none; }
+  .remote-mobile-only { display: none; }
   .remote-desktop-only { display: flex; }
   .mobile-header { height: 64px; padding: 0 28px; background: var(--app-glass); }
   .mobile-brand { font-size: 15px; }
@@ -122,6 +141,7 @@
   .mobile-tool-card small { margin-top: auto; padding-top: 18px; }
   .mobile-tool-bar { min-height: 58px; padding: 10px 24px; border-bottom: 1px solid var(--app-glass-line); }
   .mobile-tool-bar h1 { font-size: 14px; }
+  .mobile-tool-bar > span { display: block; color: var(--app-ink-faint); font-size: 12px; }
   .remote-page-tabs { flex-shrink: 0; min-height: 44px; gap: 6px; padding: 6px 24px; overflow-x: auto; border-bottom: 1px solid var(--app-glass-line); background: var(--app-glass); }
   .remote-page-tabs button { flex-shrink: 0; border: 1px solid transparent; border-radius: 7px; padding: 6px 14px; color: var(--app-ink-muted); background: transparent; font-size: 12px; }
   .remote-page-tabs button:hover { background: var(--app-glass-hover); color: var(--app-ink); }

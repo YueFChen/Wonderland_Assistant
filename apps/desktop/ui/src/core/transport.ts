@@ -1,26 +1,36 @@
 import { invoke as nativeInvoke, isTauri } from '@tauri-apps/api/core'
 import { listen as nativeListen } from '@tauri-apps/api/event'
+import { forgetConnection, rememberConnection, rememberedConnection } from './connectionMemory.ts'
 
 export const isWebClient = !isTauri()
 let accessToken = ''
 let clientId = ''
+let sessionId: string | undefined
+let connected = false
 let cursor: number | undefined
 let generation = 0
 let timer: ReturnType<typeof setTimeout> | undefined
 const listeners = new Map<string, Set<(event: { payload: unknown }) => void>>()
 
+function keyHeaders(token: string): Record<string, string> {
+  if (!token) return {}
+  if (/^[\x20-\x7e]+$/.test(token)) return { Authorization: `Bearer ${token}` }
+  const bytes = new TextEncoder().encode(token)
+  return { 'X-Wonderland-Key': btoa(String.fromCharCode(...bytes)) }
+}
+
 async function webFetch(path: string, body?: unknown): Promise<Response> {
   const requestGeneration = generation
   const response = await fetch(`/api/${path}`, {
     method: body === undefined ? 'GET' : 'POST',
-    headers: { Authorization: `Bearer ${accessToken}`, 'X-Wonderland-Client': clientId, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+    headers: { ...keyHeaders(accessToken), 'X-Wonderland-Client': clientId, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
     body: body === undefined ? undefined : JSON.stringify(body),
     credentials: 'omit',
     cache: 'no-store',
     signal: AbortSignal.timeout(body === undefined ? 15_000 : 300_000),
   })
   if (response.status === 401) {
-    if (requestGeneration === generation) disconnectWeb()
+    if (requestGeneration === generation) resetWeb(true, '访问密钥无效或已失效，请输入当前密钥重新连接。')
     throw new Error('连接已关闭或访问密钥已失效，请重新连接。')
   }
   if (!response.ok) {
@@ -46,33 +56,47 @@ export async function webDownload(path: string): Promise<Blob> {
 }
 
 export async function connectWeb(token: string): Promise<{ version: string }> {
-  disconnectWeb()
+  const saved = rememberedConnection()
+  resetWeb(false)
   accessToken = token.trim()
   // getRandomValues is also available on trusted-LAN HTTP pages.
+  // Remember authentication, but isolate file interactions between browser tabs.
   clientId = Array.from(crypto.getRandomValues(new Uint8Array(32)), (value) => value.toString(16).padStart(2, '0')).join('')
+  sessionId = saved?.token === accessToken ? saved.sessionId : undefined
   const connectionGeneration = generation
   try {
-    const status = await webRequest<{ version: string; cursor: number }>('status')
+    const status = await webRequest<{ version: string; cursor: number; sessionId?: string; keyRequired?: boolean }>('status')
+    sessionId = status.sessionId
+    if (status.keyRequired === false) accessToken = ''
     cursor = status.cursor
+    connected = true
+    rememberConnection({ token: accessToken, sessionId })
     schedulePoll()
     return status
   } catch (error) {
-    if (connectionGeneration === generation) disconnectWeb()
+    if (connectionGeneration === generation) resetWeb(false)
     throw error
   }
 }
 
 export function disconnectWeb() {
+  resetWeb(true)
+}
+
+function resetWeb(forget: boolean, reason?: string) {
+  if (forget) forgetConnection(accessToken, sessionId)
   accessToken = ''
   clientId = ''
+  sessionId = undefined
+  connected = false
   cursor = undefined
   generation++
   clearTimeout(timer)
-  window.dispatchEvent(new Event('wonderland:web-disconnected'))
+  window.dispatchEvent(new CustomEvent('wonderland:web-disconnected', { detail: reason }))
 }
 
 function schedulePoll() {
-  if (!accessToken) return
+  if (!connected) return
   const current = generation
   timer = setTimeout(() => {
     void webRequest<{ cursor: number; events: unknown[]; missed: boolean }>(`events${cursor === undefined ? '' : `?after=${cursor}`}`)

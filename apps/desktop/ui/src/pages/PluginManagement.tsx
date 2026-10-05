@@ -1,3 +1,4 @@
+import { requestedPermissions } from '../plugins/capabilities'
 import { useEffect, useRef, useState } from 'react'
 import type { PluginRuntimeState } from '@wonderland/plugin-protocol'
 import { ChevronDown, Clipboard, PackagePlus, RotateCw, Trash2 } from 'lucide-react'
@@ -229,6 +230,8 @@ function PluginCard({ state, busy, onToggle, onUninstall, onCapabilitiesChange, 
 }) {
   const [copiedDiagnostic, setCopiedDiagnostic] = useState(false)
   const enabled = state.enabled
+  const permissions = requestedPermissions(state.manifest.capabilities)
+  const grantedPermissions = requestedPermissions(state.grantedCapabilities)
   const issue = state.scanDiagnostic?.message ?? state.lastError?.message ?? state.serviceDependencyIssues?.join(' · ')
   const copyScanDiagnostic = async () => {
     if (!state.scanDiagnostic) return
@@ -348,30 +351,28 @@ function PluginCard({ state, busy, onToggle, onUninstall, onCapabilitiesChange, 
           </button>
         </div>
       </div>
-      {state.manifest.capabilities.length > 0 ? (
+      {permissions.length > 0 ? (
         <details className="group mt-2 border-t border-dashed border-glass-line pt-2">
           <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[10px] font-medium text-ink-faint [&::-webkit-details-marker]:hidden">
             <ChevronDown className="h-3 w-3 transition-transform group-open:rotate-180" aria-hidden />
-            {t('settings.plugins.capabilities')} · {state.grantedCapabilities.length}/{state.manifest.capabilities.length}
+            {t('settings.plugins.capabilities')} · {grantedPermissions.length}/{permissions.length}
           </summary>
           <fieldset className="mt-2 flex flex-wrap gap-x-3 gap-y-1.5" disabled={busy || state.installation !== 'installed'}>
             <legend className="sr-only">{t('settings.plugins.capabilities')}</legend>
-            {state.manifest.capabilities.map((capability) => (
+            {permissions.map((capability) => (
               <label key={capability} className="flex items-center gap-1.5 text-[11px] text-ink-muted">
                 <input
                   type="checkbox"
-                  checked={state.grantedCapabilities.includes(capability)}
+                  checked={grantedPermissions.includes(capability)}
                   onChange={(event) => {
-                    const next = new Set(state.grantedCapabilities)
+                    const next = new Set(grantedPermissions)
                     if (event.target.checked) next.add(capability)
                     else next.delete(capability)
                     onCapabilitiesChange([...next])
                   }}
                   className="h-3.5 w-3.5 accent-brand-500"
                 />
-                <span>{capability === 'network.public'
-                  ? `${capability}（${state.manifest.networkPublicHosts?.length ? state.manifest.networkPublicHosts.join('、') : '全部 HTTP(S) 目标'}）`
-                  : capability}</span>
+                <span>{capability}</span>
               </label>
             ))}
           </fieldset>

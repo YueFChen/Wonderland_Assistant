@@ -68,7 +68,7 @@ impl HostClient {
         }
     }
 
-    /// Make a capability-gated Core service request.
+    /// Make a Core service request; account, credential and filesystem services require grants.
     pub fn call_core(&self, method: &str, params: Value) -> Result<Value, PluginError> {
         self.call_core_with_timeout(method, params, SERVICE_TIMEOUT)
     }

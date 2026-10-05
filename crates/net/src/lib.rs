@@ -1,4 +1,4 @@
-//! 受控 HTTP 网络出口；统一处理超时、错误分类和主机白名单。
+//! HTTP clients for plugin requests, Core accounts and signed package downloads.
 
 use std::fmt;
 use std::sync::{Arc, RwLock};
@@ -38,37 +38,16 @@ const CORE_PLATFORM_HOSTS: &[&str] = &[
     "act-webstatic.mihoyo.com",
 ];
 
-/// Accept only canonical, exact DNS-style host names in plugin declarations.
-pub fn valid_public_host(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .as_bytes()
-                    .last()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
-}
-
 /// Parse once so the checked host is the same host reqwest will contact.
-fn ensure_allowed(raw: &str, allowed_hosts: &[String]) -> Result<reqwest::Url, KernelError> {
+fn ensure_allowed(raw: &str, platform_only: bool) -> Result<reqwest::Url, KernelError> {
     let url = reqwest::Url::parse(raw).map_err(|_| KernelError::InvalidInput)?;
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let destination_allowed = if allowed_hosts.is_empty() {
+    let destination_allowed = if !platform_only {
         matches!(url.scheme(), "http" | "https") && !host.is_empty()
     } else {
         url.scheme() == "https"
             && url.port().is_none()
-            && allowed_hosts.iter().any(|allowed| allowed == &host)
+            && CORE_PLATFORM_HOSTS.contains(&host.as_str())
     };
     if destination_allowed
         && url.username().is_empty()
@@ -86,29 +65,25 @@ fn ensure_allowed(raw: &str, allowed_hosts: &[String]) -> Result<reqwest::Url, K
 #[derive(Clone)]
 pub struct HttpClient {
     cached: Arc<RwLock<Option<(u64, reqwest::Client)>>>,
-    allowed_hosts: Arc<Vec<String>>,
+    platform_only: bool,
 }
 
 impl HttpClient {
     pub fn new() -> Result<Self, KernelError> {
-        Self::with_allowed_hosts(
-            CORE_PLATFORM_HOSTS
-                .iter()
-                .map(|host| (*host).to_owned())
-                .collect(),
-        )
-    }
-
-    pub fn with_allowed_hosts(allowed_hosts: Vec<String>) -> Result<Self, KernelError> {
-        if allowed_hosts.iter().any(|host| !valid_public_host(host)) {
-            return Err(KernelError::InvalidInput);
-        }
         let client = Self {
-            cached: Arc::new(RwLock::new(None)),
-            allowed_hosts: Arc::new(allowed_hosts),
+            platform_only: true,
+            ..Self::unrestricted()
         };
         client.inner()?;
         Ok(client)
+    }
+
+    /// Plugin networking is a convenience service, not a process sandbox.
+    pub fn unrestricted() -> Self {
+        Self {
+            cached: Arc::new(RwLock::new(None)),
+            platform_only: false,
+        }
     }
 
     fn inner(&self) -> Result<reqwest::Client, KernelError> {
@@ -125,7 +100,11 @@ impl HttpClient {
         }
 
         let builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(if !self.platform_only {
+                reqwest::redirect::Policy::limited(10)
+            } else {
+                reqwest::redirect::Policy::none()
+            })
             .timeout(REQUEST_TIMEOUT)
             .user_agent(USER_AGENT);
         let client = snapshot
@@ -141,20 +120,87 @@ impl HttpClient {
         Ok(client)
     }
 
-    /// 有限重试只针对只读 GET 的临时失败；不记录 URL、Cookie 或响应体。
+    /// GET with bounded retries for transient read-only failures.
     pub async fn get_bytes(
         &self,
         url: &str,
         headers: &[(&str, &str)],
         query: &[(String, String)],
     ) -> Result<Vec<u8>, KernelError> {
-        let url = ensure_allowed(url, &self.allowed_hosts)?;
-        let inner = self.inner()?;
-        for attempt in 0..3 {
-            let mut request = inner.get(url.clone()).query(query);
-            for (name, value) in headers {
-                request = request.header(*name, *value);
-            }
+        self.request_bytes("GET", url, headers, query, None).await
+    }
+
+    /// Account JSON requests retain their single-attempt behavior and error format.
+    pub async fn get_json<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<T, KernelError> {
+        let url = ensure_allowed(url, self.platform_only)?;
+        let response = self
+            .request_builder(reqwest::Method::GET, url, headers, &[], None)?
+            .send()
+            .await
+            .map_err(classify)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(KernelError::Transport(format!("HTTP 状态码 {status}")));
+        }
+        let body = read_limited_body(response, MAX_HTTP_RESPONSE_BYTES).await?;
+        serde_json::from_slice(&body)
+            .map_err(|error| KernelError::Transport(format!("响应解析失败：{error}")))
+    }
+
+    fn request_builder(
+        &self,
+        method: reqwest::Method,
+        url: reqwest::Url,
+        headers: &[(&str, &str)],
+        query: &[(String, String)],
+        body: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder, KernelError> {
+        let post_json = method == reqwest::Method::POST
+            && body.is_some()
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+        let mut request = self.inner()?.request(method, url).query(query);
+        if post_json {
+            request = request.header(reqwest::header::CONTENT_TYPE, "application/json");
+        }
+        for (name, value) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| KernelError::InvalidInput)?;
+            let value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|_| KernelError::InvalidInput)?;
+            request = request.header(name, value);
+        }
+        if let Some(body) = body {
+            request = request.body(body.to_owned());
+        }
+        Ok(request)
+    }
+
+    /// Only a GET without a request body is retried; mutations are sent once.
+    pub async fn request_bytes(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        query: &[(String, String)],
+        body: Option<&str>,
+    ) -> Result<Vec<u8>, KernelError> {
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| KernelError::InvalidInput)?;
+        let url = ensure_allowed(url, self.platform_only)?;
+        let attempts = if method == reqwest::Method::GET && body.is_none() {
+            3
+        } else {
+            1
+        };
+        for attempt in 0..attempts {
+            let request =
+                self.request_builder(method.clone(), url.clone(), headers, query, body)?;
             let result = async {
                 let response = request.send().await.map_err(classify)?;
                 read_limited_response(response, MAX_HTTP_RESPONSE_BYTES).await
@@ -167,7 +213,7 @@ impl HttpClient {
                     | KernelError::Http(429 | 500 | 502 | 503 | 504))
             );
             if let Err(error) = &result {
-                if retry && attempt < 2 {
+                if retry && attempt + 1 < attempts {
                     debug!(
                         code = error.code(),
                         attempt = attempt + 1,
@@ -177,65 +223,12 @@ impl HttpClient {
                     warn!(code = error.code(), attempts = attempt + 1, "出站请求失败");
                 }
             }
-            if !retry || attempt == 2 {
+            if !retry || attempt + 1 == attempts {
                 return result;
             }
             tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
         }
         unreachable!()
-    }
-
-    /// GET 请求并把响应体解析为 JSON。
-    pub async fn get_json<T: DeserializeOwned>(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-    ) -> Result<T, KernelError> {
-        let url = ensure_allowed(url, &self.allowed_hosts)?;
-        let mut request = self.inner()?.get(url);
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-
-        let response = request.send().await.map_err(classify)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(KernelError::Transport(format!("HTTP 状态码 {status}")));
-        }
-        let body = read_limited_body(response, MAX_HTTP_RESPONSE_BYTES).await?;
-
-        serde_json::from_slice(&body)
-            .map_err(|error| KernelError::Transport(format!("响应解析失败：{error}")))
-    }
-
-    /// POST JSON，响应体原样返回（各接口的响应外壳不同，交给调用方解析）。
-    ///
-    /// **不重试**：POST 能否重放由调用方判断，这里只发一次。
-    pub async fn post_json(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-        body: &str,
-    ) -> Result<Vec<u8>, KernelError> {
-        let url = ensure_allowed(url, &self.allowed_hosts)?;
-        let mut request = self
-            .inner()?
-            .post(url)
-            .header("content-type", "application/json");
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-
-        let response = request
-            .body(body.to_owned())
-            .send()
-            .await
-            .map_err(classify)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(KernelError::Http(status.as_u16()));
-        }
-        read_limited_response(response, MAX_HTTP_RESPONSE_BYTES).await
     }
 }
 
@@ -507,14 +500,12 @@ impl fmt::Display for ModelError {
 impl std::error::Error for ModelError {}
 
 /// 用户自配的 OpenAI 兼容模型端点。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelEndpoint {
     /// 用户填写的基础地址，例如 `https://api.example.com/v1`。
     pub base_url: String,
     /// 单次请求超时。
     pub timeout: Duration,
-    /// 是否允许本机回环（`http`）端点，仅供开发联调打开。
-    pub allow_loopback: bool,
     /// 响应体大小上限。
     pub max_response_bytes: usize,
 }
@@ -524,7 +515,6 @@ impl ModelEndpoint {
         Self {
             base_url: base_url.into(),
             timeout: MODEL_TIMEOUT,
-            allow_loopback: false,
             max_response_bytes: MODEL_MAX_RESPONSE_BYTES,
         }
     }
@@ -532,9 +522,8 @@ impl ModelEndpoint {
 
 /// 校验用户填写的模型端点地址，返回可直接用于拼接路径的 [`reqwest::Url`]。
 ///
-/// 规则集中在收口处：只有 `https`（或用户显式允许、且主机确为回环的 `http`）能通过。
-/// 这样"用户自配主机"不会变成一条绕过传输安全的后门。
-pub fn validate_endpoint(base_url: &str, allow_loopback: bool) -> Result<reqwest::Url, ModelError> {
+/// Accept user-configured HTTP(S) endpoints, including LAN and loopback services.
+pub fn validate_endpoint(base_url: &str) -> Result<reqwest::Url, ModelError> {
     let url = reqwest::Url::parse(base_url)
         .map_err(|error| ModelError::Config(format!("地址无法解析：{error}")))?;
 
@@ -542,35 +531,18 @@ pub fn validate_endpoint(base_url: &str, allow_loopback: bool) -> Result<reqwest
         return Err(ModelError::Config("地址不得包含用户名或密码".to_owned()));
     }
 
-    let host = url
-        .host_str()
+    url.host_str()
         .filter(|host| !host.is_empty())
         .ok_or_else(|| ModelError::Config("地址缺少主机名".to_owned()))?;
 
     match url.scheme() {
-        "https" => {}
-        "http" if allow_loopback && is_loopback_host(host) => {}
-        "http" => {
-            return Err(ModelError::Config(
-                "仅允许 https；本机联调需显式允许回环地址".to_owned(),
-            ));
-        }
+        "http" | "https" => {}
         other => {
             return Err(ModelError::Config(format!("不支持的协议：{other}")));
         }
     }
 
     Ok(url)
-}
-
-/// 回环主机判定。
-///
-/// `Url::host_str` 对 IPv6 会带上方括号，因此 `::1` 会以 `[::1]` 出现。
-fn is_loopback_host(host: &str) -> bool {
-    matches!(
-        host.to_ascii_lowercase().as_str(),
-        "127.0.0.1" | "localhost" | "[::1]" | "::1"
-    )
 }
 
 /// 把相对路径拼到已校验的 base 上。
@@ -611,7 +583,7 @@ pub struct ModelClient {
 
 impl ModelClient {
     pub fn new(endpoint: ModelEndpoint) -> Result<Self, ModelError> {
-        let base = validate_endpoint(&endpoint.base_url, endpoint.allow_loopback)?;
+        let base = validate_endpoint(&endpoint.base_url)?;
         let proxy = proxy::current_proxy()
             .map_err(|_| ModelError::Config("代理设置暂不可用".to_owned()))?;
         let inner = proxy
@@ -753,63 +725,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outbound_allowlist_checks_the_canonical_url_authority() {
-        let hosts = vec!["api-takumi.mihoyo.com".to_owned()];
-        let allowed = ensure_allowed("https://API-TAKUMI.MIHOYO.COM:443/path", &hosts).unwrap();
+    fn account_requests_keep_fixed_https_destinations() {
+        let allowed = ensure_allowed("https://API-TAKUMI.MIHOYO.COM:443/path", true).unwrap();
         assert_eq!(allowed.host_str(), Some("api-takumi.mihoyo.com"));
-
+        for host in CORE_PLATFORM_HOSTS {
+            assert!(ensure_allowed(&format!("https://{host}/"), true).is_ok());
+        }
         for raw in [
             r"https://evil.com\@api-takumi.mihoyo.com/path",
             "http://api-takumi.mihoyo.com/path",
             "https://user@api-takumi.mihoyo.com/path",
             "https://api-takumi.mihoyo.com:8443/path",
             "https://api-takumi.mihoyo.com/path#fragment",
+            "https://api.example.com/resource",
         ] {
             assert!(
-                matches!(ensure_allowed(raw, &hosts), Err(KernelError::InvalidInput)),
-                "URL should be rejected: {raw}"
+                matches!(ensure_allowed(raw, true), Err(KernelError::InvalidInput)),
+                "{raw}"
             );
-        }
-        assert!(matches!(
-            ensure_allowed("https://bbs-api.miyoushe.com/", &hosts),
-            Err(KernelError::InvalidInput)
-        ));
-        assert!(
-            ensure_allowed(
-                "https://api.example.com/resource",
-                &["api.example.com".to_owned()]
-            )
-            .is_ok()
-        );
-        assert!(valid_public_host("api.example.com"));
-        for host in [
-            "*.example.com",
-            "EXAMPLE.com",
-            "example.com:443",
-            "bad..example",
-            "-bad.example",
-        ] {
-            assert!(!valid_public_host(host));
         }
     }
 
     #[test]
-    fn empty_host_scope_allows_http_targets_but_not_non_http_urls() {
-        let unrestricted = Vec::new();
+    fn plugin_requests_allow_http_ips_and_ports_but_reject_non_http_urls() {
         for url in [
             "http://127.0.0.1:8080/",
             "https://api.example.com:8443/path",
         ] {
-            assert!(ensure_allowed(url, &unrestricted).is_ok(), "{url}");
+            assert!(ensure_allowed(url, false).is_ok(), "{url}");
         }
         for url in [
             "file:///C:/secret",
             "ftp://example.com/file",
             "https://user@example.com/",
         ] {
-            assert!(ensure_allowed(url, &unrestricted).is_err(), "{url}");
+            assert!(ensure_allowed(url, false).is_err(), "{url}");
         }
-        assert!(ensure_allowed("http://127.0.0.1:8080/", &["127.0.0.1".to_owned()]).is_err());
     }
 
     #[test]
@@ -865,14 +816,14 @@ mod tests {
         server.join().unwrap();
     }
 
-    fn ok(base_url: &str, allow_loopback: bool) -> String {
-        validate_endpoint(base_url, allow_loopback)
+    fn ok(base_url: &str) -> String {
+        validate_endpoint(base_url)
             .expect("应当校验通过")
             .to_string()
     }
 
-    fn config_err(base_url: &str, allow_loopback: bool) -> String {
-        match validate_endpoint(base_url, allow_loopback) {
+    fn config_err(base_url: &str) -> String {
+        match validate_endpoint(base_url) {
             Err(ModelError::Config(reason)) => reason,
             other => panic!("期望 Config，实际为 {other:?}"),
         }
@@ -881,61 +832,49 @@ mod tests {
     #[test]
     fn https_with_and_without_path_prefix_passes() {
         assert_eq!(
-            ok("https://api.example.com/v1", false),
+            ok("https://api.example.com/v1"),
             "https://api.example.com/v1"
         );
-        assert_eq!(
-            ok("https://api.example.com", false),
-            "https://api.example.com/"
-        );
+        assert_eq!(ok("https://api.example.com"), "https://api.example.com/");
     }
 
     #[test]
-    fn plain_http_is_rejected_by_default() {
-        config_err("http://api.example.com/v1", false);
-    }
-
-    #[test]
-    fn loopback_http_allowed_only_when_enabled() {
-        config_err("http://127.0.0.1:8080/v1", false);
-        config_err("http://localhost:1/v1", false);
-        assert_eq!(
-            ok("http://127.0.0.1:8080/v1", true),
-            "http://127.0.0.1:8080/v1"
-        );
-        assert_eq!(ok("http://localhost:1/v1", true), "http://localhost:1/v1");
-        assert_eq!(ok("http://[::1]:8080/v1", true), "http://[::1]:8080/v1");
-        config_err("http://api.example.com/v1", true);
-    }
-
-    #[test]
-    fn loopback_ip_without_flag_fails() {
-        config_err("http://127.0.0.1", false);
+    fn user_model_endpoints_accept_http_ips_and_custom_ports_without_flags() {
+        for url in [
+            "http://api.example.com:8080/v1",
+            "http://192.168.1.10:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:1/v1",
+            "http://[::1]:8080/v1",
+            "https://api.example.com:8443/v1",
+        ] {
+            assert_eq!(ok(url), url);
+        }
     }
 
     #[test]
     fn non_http_scheme_userinfo_and_missing_host_are_rejected() {
-        config_err("ftp://x/", false);
-        config_err("https://user:pw@api.example.com/v1", false);
-        config_err("", false);
-        config_err("https://", false);
-        config_err("file:///tmp/model", false);
+        config_err("ftp://x/");
+        config_err("https://user:pw@api.example.com/v1");
+        config_err("");
+        config_err("https://");
+        config_err("file:///tmp/model");
     }
 
     #[test]
     fn join_url_keeps_prefix_without_double_slash() {
-        let base = validate_endpoint("https://api.example.com/v1", false).unwrap();
+        let base = validate_endpoint("https://api.example.com/v1").unwrap();
         let joined = join_url(&base, "/chat/completions").unwrap();
         assert_eq!(
             joined.as_str(),
             "https://api.example.com/v1/chat/completions"
         );
-        let bare = validate_endpoint("https://api.example.com", false).unwrap();
+        let bare = validate_endpoint("https://api.example.com").unwrap();
         assert_eq!(
             join_url(&bare, "/chat/completions").unwrap().as_str(),
             "https://api.example.com/chat/completions"
         );
-        let trailing = validate_endpoint("https://api.example.com/v1/", false).unwrap();
+        let trailing = validate_endpoint("https://api.example.com/v1/").unwrap();
         assert_eq!(
             join_url(&trailing, "/chat/completions").unwrap().as_str(),
             "https://api.example.com/v1/chat/completions"
@@ -944,7 +883,7 @@ mod tests {
 
     #[test]
     fn join_url_rejects_traversal_and_scheme_relative_paths() {
-        let base = validate_endpoint("https://api.example.com/v1", false).unwrap();
+        let base = validate_endpoint("https://api.example.com/v1").unwrap();
         assert!(matches!(
             join_url(&base, "/../admin"),
             Err(ModelError::Config(_))
@@ -963,9 +902,169 @@ mod tests {
     fn origin_has_no_path_or_userinfo() {
         let client = ModelClient::new(ModelEndpoint::new("https://api.example.com/v1")).unwrap();
         assert_eq!(client.origin(), "https://api.example.com");
-        let mut endpoint = ModelEndpoint::new("http://127.0.0.1:8080/v1");
-        endpoint.allow_loopback = true;
+        let endpoint = ModelEndpoint::new("http://127.0.0.1:8080/v1");
         let client = ModelClient::new(endpoint).unwrap();
         assert_eq!(client.origin(), "http://127.0.0.1:8080");
+    }
+}
+
+#[cfg(test)]
+mod plugin_http_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn direct_client() -> HttpClient {
+        let client = HttpClient::unrestricted();
+        let revision = proxy::current_proxy().unwrap().revision;
+        // Loopback integration tests must not depend on the workstation's system proxy.
+        *client.cached.write().unwrap() = Some((
+            revision,
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        ));
+        client
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, String) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        let size = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0; size];
+        reader.read_exact(&mut body).unwrap();
+        (
+            headers.to_ascii_lowercase(),
+            String::from_utf8(body).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn plugin_requests_support_auth_custom_headers_post_queries_and_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for path in ["/start?existing=1&q=two", "/next"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (headers, body) = read_request(&mut stream);
+                assert!(headers.starts_with(&format!("post {path} http/1.1")));
+                assert!(headers.contains("authorization: bearer plugin-key"));
+                assert!(headers.contains("x-plugin-custom: yes"));
+                assert!(headers.contains("content-type: text/plain"));
+                assert!(!headers.contains("application/json"));
+                assert_eq!(body, "payload");
+                let response = if path.starts_with("/start") {
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let client = direct_client();
+        let bytes = client
+            .request_bytes(
+                "POST",
+                &format!("{base}/start?existing=1"),
+                &[
+                    ("Authorization", "Bearer plugin-key"),
+                    ("X-Plugin-Custom", "yes"),
+                    ("Content-Type", "text/plain"),
+                ],
+                &[("q".into(), "two".into())],
+                Some("payload"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"ok");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn plugin_client_reuses_connections_for_put_patch_and_delete() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            // All three requests must arrive over the same accepted connection.
+            let (mut stream, _) = listener.accept().unwrap();
+            for method in ["put", "patch", "delete"] {
+                let (headers, _) = read_request(&mut stream);
+                assert!(headers.starts_with(&format!("{method} / http/1.1")));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+            }
+        });
+        let client = direct_client();
+        for method in ["PUT", "PATCH", "DELETE"] {
+            assert_eq!(
+                client
+                    .request_bytes(method, &url, &[], &[], None)
+                    .await
+                    .unwrap(),
+                b"ok"
+            );
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_failures_retry_only_get_without_a_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for (method, status, expected_body) in [
+                ("get", "503 Service Unavailable", ""),
+                ("get", "200 OK", ""),
+                ("post", "503 Service Unavailable", "{}"),
+                ("get", "503 Service Unavailable", "payload"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (headers, body) = read_request(&mut stream);
+                assert!(headers.starts_with(&format!("{method} / http/1.1")));
+                assert_eq!(body, expected_body);
+                if method == "post" {
+                    assert!(headers.contains("content-type: application/json"));
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        let client = direct_client();
+        assert!(client.get_bytes(&url, &[], &[]).await.unwrap().is_empty());
+        for (method, body) in [("POST", "{}"), ("GET", "payload")] {
+            assert!(matches!(
+                client
+                    .request_bytes(method, &url, &[], &[], Some(body))
+                    .await,
+                Err(KernelError::Http(503))
+            ));
+        }
+        server.join().unwrap();
     }
 }

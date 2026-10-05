@@ -18,6 +18,8 @@ pub const UI_BRIDGE_VERSION: &str = "1.1.0";
 /// List every bridge version this host still implements, in ascending order.
 /// Keep the list explicit: a version bump must not silently remove old plugin compatibility.
 pub const UI_BRIDGE_SUPPORTED_VERSIONS: &[&str] = &["1.0.0", "1.1.0"];
+/// Host services advertised to every plugin without a permission grant.
+pub const IMPLICIT_CAPABILITIES: &[&str] = &["network.public", "network.model"];
 
 /// Icons are decorative metadata. Invalid icon values must not make an otherwise valid plugin fail to load.
 fn deserialize_optional_icon<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -55,7 +57,7 @@ pub struct PluginManifest {
     /// Explicit opt-in to remote workspaces; absent or false means local only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_access: Option<bool>,
-    /// Exact HTTPS hosts available through core.network.public.
+    /// Legacy metadata, retained for old packages and signed manifests; does not restrict networking.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub network_public_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -68,6 +70,11 @@ impl PluginManifest {
     pub fn supports_remote_access(&self) -> bool {
         self.remote_access == Some(true) && self.backend.supports_service_context == Some(true)
     }
+}
+
+/// Legacy network declarations remain readable but no longer need user approval.
+pub fn requires_capability_approval(capability: &str) -> bool {
+    !IMPLICIT_CAPABILITIES.contains(&capability)
 }
 
 /// A versioned service contract offered to other plugins through a future Core broker.
