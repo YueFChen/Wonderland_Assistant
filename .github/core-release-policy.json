@@ -3,7 +3,7 @@
   "allowRelease": false,
   "reason": "所有维护插件正式接入 Cloudflare 并完成配套验收前，暂缓 GitHub Release；Cloudflare Core 更新独立正常发布。",
   "requiredPlugins": [
-    "comment_collector", "distribution_manager", "genshin_ugc", "knowledge_library",
+    "comment_collector", "wla_distribution_manager", "genshin_ugc", "knowledge_library",
     "wla_my_wonderland", "primitive_workbench", "rich_editor", "wla_template_plugin", "translator", "wa_bookmarks"
   ],
   "integratedPlugins": {}
