@@ -24,18 +24,17 @@ import { userDataApi } from '../user-data/api'
 import { setStartupMemoryEnabled, startupMemoryEnabled } from '../startupMemory'
 import { readCloseBehavior, writeCloseBehavior, type CloseBehavior } from '../closeBehavior'
 import { t, type MessageKey } from '../i18n'
-import { AccountManagementSection } from './AccountSection'
 import { CoreUpdateCard } from '../components/CoreUpdateCard'
 import { NetworkProxyCard } from '../components/NetworkProxyCard'
 import { WebAccessCard } from '../components/WebAccessCard'
 import { ToggleSwitch } from '../components/ToggleSwitch'
 
-/** 主题档位。自定义档的控件保持深色，与后端 `ThemeMode` 的语义一致。 */
-const MODES: { value: ThemeMode; labelKey: MessageKey; hintKey: MessageKey; icon: LucideIcon }[] = [
-  { value: 'system', labelKey: 'settings.theme.system', hintKey: 'settings.theme.systemHint', icon: Monitor },
-  { value: 'light', labelKey: 'settings.theme.light', hintKey: 'settings.theme.lightHint', icon: Sun },
-  { value: 'dark', labelKey: 'settings.theme.dark', hintKey: 'settings.theme.darkHint', icon: Moon },
-  { value: 'custom', labelKey: 'settings.theme.custom', hintKey: 'settings.theme.customHint', icon: Palette },
+/** Custom backgrounds adapt component colors while keeping the shared geometry and decoration. */
+const MODES: { value: ThemeMode; labelKey: MessageKey; icon: LucideIcon }[] = [
+  { value: 'system', labelKey: 'settings.theme.system', icon: Monitor },
+  { value: 'light', labelKey: 'settings.theme.light', icon: Sun },
+  { value: 'dark', labelKey: 'settings.theme.dark', icon: Moon },
+  { value: 'custom', labelKey: 'settings.theme.custom', icon: Palette },
 ]
 
 const IMAGE_ACCEPT = 'image/png,image/jpeg,image/webp,image/gif,image/bmp'
@@ -44,15 +43,15 @@ const FALLBACK_COLOR = '#1b1830'
 const PRESET_COLORS = ['#0b0b12', '#1b1830', '#2a2440', '#3b3358', '#f3f2fa', '#ffffff']
 
 /** 日志级别；值与后端 `LogLevel` 的 snake_case 名字一致。 */
-const LOG_LEVELS: { value: LogLevel; labelKey: MessageKey; hintKey: MessageKey }[] = [
-  { value: 'error', labelKey: 'settings.logLevel.error', hintKey: 'settings.logLevel.errorHint' },
-  { value: 'warn', labelKey: 'settings.logLevel.warn', hintKey: 'settings.logLevel.warnHint' },
-  { value: 'info', labelKey: 'settings.logLevel.info', hintKey: 'settings.logLevel.infoHint' },
-  { value: 'debug', labelKey: 'settings.logLevel.debug', hintKey: 'settings.logLevel.debugHint' },
-  { value: 'trace', labelKey: 'settings.logLevel.trace', hintKey: 'settings.logLevel.traceHint' },
+const LOG_LEVELS: { value: LogLevel; labelKey: MessageKey }[] = [
+  { value: 'error', labelKey: 'settings.logLevel.error' },
+  { value: 'warn', labelKey: 'settings.logLevel.warn' },
+  { value: 'info', labelKey: 'settings.logLevel.info' },
+  { value: 'debug', labelKey: 'settings.logLevel.debug' },
+  { value: 'trace', labelKey: 'settings.logLevel.trace' },
 ]
 
-/** 设置页：按账号、应用、网络、外观和维护分组。 */
+/** 设置页：按应用、网络、外观和维护分组。 */
 export function SettingsPage() {
   const [userData, setUserData] = useState<UserDataState | null>(null)
   const [userDataFailure, setUserDataFailure] = useState('')
@@ -81,10 +80,6 @@ export function SettingsPage() {
   return (
     <section className="w-full">
       <div className="min-w-0 space-y-8">
-        <SettingsGroup id="settings-account" title={t('settings.section.account')}>
-          <AccountManagementSection />
-        </SettingsGroup>
-
         <SettingsGroup id="settings-app" title={t('settings.section.app')}>
           <div className="glass-card divide-y divide-glass-line overflow-hidden rounded-card">
             <StartupMemoryCard />
@@ -114,9 +109,8 @@ export function SettingsPage() {
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div className="min-w-0 space-y-1">
                   <p className="font-semibold text-ink">{t('settings.restart.title')}</p>
-                  {userData?.pending_path && <p className="break-all text-xs text-ink-muted">{t('settings.restart.data', { path: userData.pending_path })}</p>}
                 </div>
-                <button type="button" onClick={() => void restart()} className="rounded-lg bg-brand-600 px-4 py-2 text-sm text-white hover:bg-brand-500">
+                <button type="button" onClick={() => void restart()} className="app-button app-button-primary">
                   {t('settings.restart.now')}
                 </button>
               </div>
@@ -137,7 +131,7 @@ function SettingsGroup({ id, title, children }: {
   return (
     <section id={id} aria-labelledby={`${id}-title`} className="min-w-0">
       <div className="mb-3">
-        <h2 id={`${id}-title`} className="text-sm font-semibold text-ink">{title}</h2>
+        <h2 id={`${id}-title`} className="app-background-copy app-section-title">{title}</h2>
       </div>
       {children}
     </section>
@@ -156,7 +150,6 @@ function StartupMemoryCard() {
     <section className="flex items-center justify-between gap-4 px-4 py-4">
       <div className="min-w-0">
         <h3 className="text-sm font-semibold text-ink">{t('settings.startupMemory.title')}</h3>
-        <p className="mt-1 text-xs leading-relaxed text-ink-muted">{t('settings.startupMemory.description')}</p>
       </div>
       <ToggleSwitch
         checked={enabled}
@@ -186,20 +179,13 @@ function CloseBehaviorCard() {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
           <h3 className="text-sm font-semibold text-ink">{t('settings.closeBehavior.title')}</h3>
-          <p className="mt-1 text-xs leading-relaxed text-ink-muted">
-            {behavior === 'ask'
-              ? t('settings.closeBehavior.askHint')
-              : behavior === 'tray'
-                ? t('settings.closeBehavior.trayHint')
-                : t('settings.closeBehavior.exitHint')}
-          </p>
         </div>
         <label className="flex shrink-0 items-center gap-2 text-xs text-ink-muted">
-          <span>{t('settings.closeBehavior.label')}</span>
+          <span className="sr-only">{t('settings.closeBehavior.label')}</span>
           <select
             value={behavior}
             onChange={(event) => changeBehavior(event.target.value as CloseBehavior)}
-            className="rounded-lg border border-[var(--app-field-border)] bg-[var(--app-field)] px-2.5 py-1.5 text-sm text-ink transition"
+            className="app-input"
           >
             <option value="ask">{t('settings.closeBehavior.ask')}</option>
             <option value="tray">{t('settings.closeBehavior.tray')}</option>
@@ -254,7 +240,7 @@ function UserDataCard({ state, setState, loadFailure }: {
 
   return (
     <section className="glass-card rounded-card p-6">
-      <SectionHead title={t('settings.userData.title')} hint={t('settings.userData.hint')} />
+      <SectionHead title={t('settings.userData.title')} />
 
       {!state ? (
         <p className="mt-4 text-sm text-ink-faint">{loadFailure || t('settings.userData.loading')}</p>
@@ -263,13 +249,13 @@ function UserDataCard({ state, setState, loadFailure }: {
           <div className="flex items-start gap-3 rounded-lg border border-glass-line bg-glass-subtle p-3">
             <HardDrive className="mt-0.5 h-4 w-4 shrink-0 text-ink-muted" aria-hidden />
             <div className="min-w-0">
-              <p className="text-xs text-ink-faint">{t('settings.userData.current')}</p>
-              <p className="mt-1 break-all font-mono text-xs text-ink">{state.active_path}</p>
-              <p className="mt-1 text-[11px] text-ink-faint">
+              <p className="text-xs text-ink-faint">
+                {t('settings.userData.current')} · {' '}
                 {state.location === 'default'
                   ? t('settings.userData.defaultBadge')
                   : t('settings.userData.customBadge')}
               </p>
+              <p className="mt-1 break-all font-mono text-xs text-ink">{state.active_path}</p>
             </div>
           </div>
 
@@ -284,7 +270,7 @@ function UserDataCard({ state, setState, loadFailure }: {
                   type="button"
                   disabled={busy}
                   onClick={() => void run(userDataApi.cancelMigration)}
-                  className="rounded-lg border border-glass-line px-3 py-1.5 text-xs text-ink-muted transition hover:bg-glass disabled:opacity-60"
+                  className="app-button"
                 >
                   {t('settings.userData.cancelPending')}
                 </button>
@@ -302,13 +288,13 @@ function UserDataCard({ state, setState, loadFailure }: {
                     disabled={busy || choosing}
                     placeholder={t('settings.userData.customPlaceholder')}
                     onChange={(event) => setCustomPath(event.target.value)}
-                    className="min-w-0 flex-1 rounded-lg border border-glass-line bg-glass px-3 py-2 font-mono text-xs text-ink outline-none transition placeholder:text-ink-faint focus:border-brand-400 disabled:opacity-60"
+                    className="app-input min-w-0 flex-1 font-mono"
                   />
                   <button
                     type="button"
                     disabled={busy || choosing}
                     onClick={() => void chooseDirectory()}
-                    className="flex shrink-0 items-center gap-1 rounded-lg border border-glass-line px-3 py-2 text-xs text-ink-muted hover:bg-glass disabled:opacity-60"
+                    className="app-button flex shrink-0 items-center"
                   >
                     <FolderOpen className="h-4 w-4" aria-hidden />
                     {t('settings.userData.browse')}
@@ -320,7 +306,7 @@ function UserDataCard({ state, setState, loadFailure }: {
                   type="button"
                   disabled={busy || customPath.trim() === '' || customPath.trim() === state.active_path}
                   onClick={() => void run(() => userDataApi.migrateCustom(customPath.trim()))}
-                  className="rounded-lg bg-brand-600 px-3 py-1.5 text-xs text-white transition hover:bg-brand-500 disabled:cursor-default disabled:opacity-50"
+                  className="app-button app-button-primary"
                 >
                   {t('settings.userData.useCustom')}
                 </button>
@@ -328,17 +314,14 @@ function UserDataCard({ state, setState, loadFailure }: {
                   type="button"
                   disabled={busy || state.location === 'default'}
                   onClick={() => void run(userDataApi.migrateDefault)}
-                  className="rounded-lg border border-glass-line px-3 py-1.5 text-xs text-ink-muted transition hover:bg-glass hover:text-ink disabled:cursor-default disabled:opacity-50"
+                  className="app-button"
                 >
                   {t('settings.userData.useDefault')}
                 </button>
               </div>
-              <p className="text-[11px] leading-relaxed text-ink-faint">
+              {(state.location !== 'default' || (customPath.trim() !== '' && customPath.trim() !== state.active_path)) && <p className="text-xs leading-relaxed text-ink-muted">
                 {t('settings.userData.requirements')}
-              </p>
-              <p className="text-[11px] leading-relaxed text-ink-faint">
-                {t('settings.userData.legacyExports')}
-              </p>
+              </p>}
             </div>
           )}
 
@@ -348,7 +331,7 @@ function UserDataCard({ state, setState, loadFailure }: {
             </p>
           )}
           {state.last_migration_path && !state.pending_path && !state.last_migration_error && (
-            <p role="status" className="text-xs text-ink-muted">{t('settings.userData.lastSuccess', { path: state.last_migration_path })}</p>
+            <p role="status" className="text-xs text-ink-muted">{t('settings.userData.lastSuccess')}</p>
           )}
           {state.last_migration_warning && (
             <p role="status" className="rounded-lg border border-brand-400/40 bg-glass px-3 py-2 text-xs text-ink-muted">
@@ -370,7 +353,7 @@ function UserDataCard({ state, setState, loadFailure }: {
 
 /** 外观：主题档位 + 自定义背景。 */
 function AppearanceCard() {
-  const { settings, backgroundUrl, thumbnails, ensureThumbnail, setTheme } = useTheme()
+  const { settings, backgroundUrl, thumbnails, ensureThumbnail, setTheme, effectsEnabled, setEffectsEnabled } = useTheme()
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState('')
 
@@ -398,7 +381,7 @@ function AppearanceCard() {
 
   return (
     <section className="glass-card rounded-card p-6">
-      <SectionHead title={t('settings.appearance.title')} hint={t('settings.appearance.hint')} />
+      <SectionHead title={t('settings.appearance.title')} />
 
       <div
         role="radiogroup"
@@ -411,7 +394,6 @@ function AppearanceCard() {
             key={mode.value}
             icon={mode.icon}
             label={t(mode.labelKey)}
-            hint={t(mode.hintKey)}
             active={settings.mode === mode.value}
             disabled={busy}
             onSelect={() => void run(() => setTheme({ ...settings, mode: mode.value }))}
@@ -430,6 +412,11 @@ function AppearanceCard() {
         </div>
       )}
 
+      <div className="mt-6 flex min-h-10 items-center justify-between gap-4 border-t border-glass-line pt-4">
+        <span className="text-sm text-ink">{t('settings.appearance.effects')}</span>
+        <ToggleSwitch label={t('settings.appearance.effects')} checked={effectsEnabled} onChange={setEffectsEnabled} />
+      </div>
+
       {failure && (
         <p role="alert" className="mt-4 text-sm text-[var(--app-danger)]">
           {failure}
@@ -439,11 +426,10 @@ function AppearanceCard() {
   )
 }
 
-/** 档位卡片：上方是该档位的缩略示意，下方是名称与说明。 */
+/** 档位卡片：预览与名称共同表达选项，不重复附加说明。 */
 function ThemeTile({
   icon: Icon,
   label,
-  hint,
   active,
   disabled,
   onSelect,
@@ -451,7 +437,6 @@ function ThemeTile({
 }: {
   icon: LucideIcon
   label: string
-  hint: string
   active: boolean
   disabled: boolean
   onSelect: () => void
@@ -475,7 +460,6 @@ function ThemeTile({
         <Icon className="h-4 w-4 shrink-0 text-ink-muted" aria-hidden />
         <span className="min-w-0 flex-1">
           <span className="block truncate text-sm text-ink">{label}</span>
-          <span className="mt-0.5 block truncate text-[11px] text-ink-faint">{hint}</span>
         </span>
         {active ? <Check className="h-4 w-4 shrink-0 text-brand-400" aria-hidden /> : null}
       </span>
@@ -498,9 +482,9 @@ function ThemePreview({ variant, image }: { variant: ThemeMode; image: string | 
   }
 
   const background: Record<ResolvedTheme | 'system', string> = {
-    light: 'linear-gradient(135deg, #ffffff, #e9e7f6)',
-    dark: 'linear-gradient(135deg, #262145, #0b0b12)',
-    system: 'linear-gradient(115deg, #ffffff 0 50%, #1b1830 50% 100%)',
+    light: 'linear-gradient(135deg, #ffffff, #e8e8f3)',
+    dark: 'linear-gradient(135deg, #212b47, #121a2d)',
+    system: 'linear-gradient(115deg, #f7f6fc 0 50%, #181f36 50% 100%)',
   }
   const panel = 'rgb(128 128 145 / 0.22)'
   const line = 'rgb(128 128 145 / 0.45)'
@@ -606,9 +590,6 @@ function BackgroundPicker() {
           active={tab === 'color'}
           onClick={() => setTab('color')}
         />
-        <span className="ml-auto text-[11px] text-ink-faint">
-          {t('settings.background.hint')}
-        </span>
       </div>
 
       {tab === 'image' ? (
@@ -649,9 +630,6 @@ function BackgroundPicker() {
                   : t('settings.background.chooseOrDrop')}
             </span>
           </label>
-          <p className="text-[11px] text-ink-faint">
-            {t('settings.background.limits')}
-          </p>
 
           {backgrounds.length > 0 && (
             <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4">
@@ -670,7 +648,7 @@ function BackgroundPicker() {
                       disabled={busy !== ''}
                       onClick={() => void run(asset.id, () => selectBackground(asset.id))}
                       title={asset.name}
-                      className="relative block w-full disabled:cursor-default"
+                      className="relative block w-full"
                     >
                       <span className="block aspect-video w-full bg-glass">
                         {url ? (
@@ -680,7 +658,7 @@ function BackgroundPicker() {
                         )}
                       </span>
                       {active ? (
-                        <span className="absolute top-2 left-2 inline-flex items-center gap-1 rounded-full bg-brand-600/85 px-2 py-0.5 text-[10px] text-white">
+                        <span className="absolute top-2 left-2 inline-flex items-center gap-1 rounded-md bg-[var(--app-accent)] px-2 py-0.5 text-xs text-[var(--app-primary-ink)]">
                           <Check className="h-3 w-3" aria-hidden />
                           {t('common.current')}
                         </span>
@@ -691,7 +669,7 @@ function BackgroundPicker() {
                         <span className="block truncate text-xs text-ink" title={asset.name}>
                           {asset.name}
                         </span>
-                        <span className="block text-[10px] text-ink-faint">
+                        <span className="block text-xs text-ink-faint">
                           {formatBytes(asset.size)}
                         </span>
                       </span>
@@ -700,7 +678,7 @@ function BackgroundPicker() {
                           <button
                             type="button"
                             disabled={busy !== ''}
-                            className="rounded border border-[var(--app-danger-line)] bg-[var(--app-danger-soft)] px-1.5 py-0.5 text-[10px] text-[var(--app-danger)] disabled:opacity-60"
+                            className="app-button app-button-danger"
                             onClick={() =>
                               void run(asset.id, async () => {
                                 await removeBackground(asset.id)
@@ -712,7 +690,7 @@ function BackgroundPicker() {
                           </button>
                           <button
                             type="button"
-                            className="rounded px-1.5 py-0.5 text-[10px] text-ink-muted transition hover:text-ink"
+                            className="app-button app-button-quiet"
                             onClick={() => setPendingDelete('')}
                           >
                             {t('common.cancel')}
@@ -722,7 +700,7 @@ function BackgroundPicker() {
                         <button
                           type="button"
                           aria-label={t('settings.background.removeAria', { name: asset.name })}
-                          className="shrink-0 rounded p-1 text-ink-faint opacity-0 transition group-hover:opacity-100 hover:text-[var(--app-danger)] focus-visible:opacity-100"
+                          className="app-icon-button shrink-0"
                           onClick={() => setPendingDelete(asset.id)}
                         >
                           <Trash2 className="h-3.5 w-3.5" aria-hidden />
@@ -760,7 +738,7 @@ function BackgroundPicker() {
                 type="button"
                 aria-label={t('settings.background.usePreset', { color: preset })}
                 title={preset}
-                className={`h-5 w-5 rounded-full border transition hover:scale-110 ${
+                className={`h-8 w-8 rounded-md border transition ${
                   preset.toLowerCase() === color.toLowerCase()
                     ? 'border-brand-400 ring-1 ring-brand-400'
                     : 'border-glass-line-strong'
@@ -805,7 +783,6 @@ function BackgroundPicker() {
           onKeyUp={() => void saveOpacity()}
           onBlur={() => void saveOpacity()}
         />
-        <p className="mt-1.5 text-[11px] text-ink-faint">{t('settings.background.opacityHint')}</p>
       </div>
 
       {failure && (
@@ -831,11 +808,7 @@ function TabButton({
       type="button"
       aria-pressed={active}
       onClick={onClick}
-      className={`rounded-lg border px-3 py-1.5 text-xs transition ${
-        active
-          ? 'border-brand-400 bg-glass text-ink'
-          : 'border-glass-line text-ink-muted hover:bg-glass hover:text-ink'
-      }`}
+      className="app-button"
     >
       {label}
     </button>
@@ -890,15 +863,9 @@ function LoggingCard() {
     }
   }
 
-  const level = LOG_LEVELS.find((item) => item.value === settings?.level)
-  const hint = level ? t(level.hintKey) : ''
-
   return (
     <section className="glass-card rounded-card p-6">
-      <SectionHead
-        title={t('settings.logging.title')}
-        hint={t('settings.logging.hint')}
-      />
+      <SectionHead title={t('settings.logging.title')} />
 
       {!settings ? (
         <p className="mt-4 text-sm text-ink-faint">{t('settings.logging.loading')}</p>
@@ -911,7 +878,7 @@ function LoggingCard() {
                 value={settings.level}
                 disabled={busy}
                 onChange={(event) => void changeLevel(event.target.value as LogLevel)}
-                className="rounded-lg border border-[var(--app-field-border)] bg-[var(--app-field)] px-2.5 py-1.5 text-sm text-ink transition disabled:cursor-default disabled:opacity-60"
+                className="app-input"
               >
                 {LOG_LEVELS.map((item) => (
                   <option key={item.value} value={item.value}>
@@ -920,11 +887,10 @@ function LoggingCard() {
                 ))}
               </select>
             </label>
-            <span className="text-xs text-ink-faint">{hint}</span>
             <button
               type="button"
               onClick={() => void reveal()}
-              className="ml-auto rounded-lg border border-glass-line px-3 py-1.5 text-xs text-ink-muted transition hover:bg-glass hover:text-ink"
+              className="app-button ml-auto"
             >
               {t('settings.logging.reveal')}
             </button>
@@ -935,7 +901,6 @@ function LoggingCard() {
               <p className="mt-1 break-all font-mono text-xs text-ink">{directory}</p>
             </div>
           )}
-          <p className="text-xs leading-relaxed text-ink-faint">{t('settings.logging.retention')}</p>
         </div>
       )}
 
@@ -948,11 +913,10 @@ function LoggingCard() {
   )
 }
 
-function SectionHead({ title, hint }: { title: string; hint: string }) {
+function SectionHead({ title }: { title: string }) {
   return (
     <div className="max-w-2xl">
       <h2 className="text-base font-semibold text-ink">{title}</h2>
-      <p className="mt-1 text-xs leading-relaxed text-ink-faint">{hint}</p>
     </div>
   )
 }

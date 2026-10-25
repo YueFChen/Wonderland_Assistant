@@ -1,66 +1,92 @@
 //! One supervised stdio-NDJSON process per enabled plugin.
 
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-use serde::Deserialize;
 use serde_json::{Value, json};
-use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_dialog::DialogExt;
 use wonderland_kernel::logging::{debug, error, info, trace, warn};
 use wonderland_plugin_protocol::{
     PROTOCOL_ID, PROTOCOL_VERSION, PluginError, PluginErrorMessage, PluginEvent, PluginHello,
     PluginRequest, PluginResult, PluginRuntimeState,
 };
 
-use crate::plugin_manager::PluginManager;
+use crate::host_services::{HostInvocation, HostServices, RuntimeServices};
 use crate::remote_interaction::RemoteContext;
 
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
-const MAX_PICKED_FILE_CHUNK_BYTES: u64 = 1024 * 1024;
-const MAX_PICKED_FILE_INLINE_BYTES: u64 = 20 * 1024 * 1024;
-const MAX_EXPORTED_FILE_BYTES: usize = 20 * 1024 * 1024;
-const FILE_HANDLE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_QUEUED_WRITES: usize = 16;
+const MAX_QUEUED_WRITE_BYTES: usize = 64 * 1024 * 1024;
+
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_PLUGIN_STDERR_LINE_BYTES: usize = 8 * 1024;
 
 pub(crate) struct PluginProcess {
     child: Mutex<Child>,
-    stdin: Mutex<ChildStdin>,
+    writes: SyncSender<QueuedWrite>,
+    queued_write_bytes: Arc<AtomicUsize>,
     pending: Mutex<PendingRequests>,
     hello_waiter: Mutex<Option<SyncSender<Result<PluginHello, String>>>>,
     alive: AtomicBool,
+    process_cancelled: Arc<AtomicBool>,
     plugin_id: String,
-    granted_capabilities: HashSet<String>,
-    http: wonderland_net::HttpClient,
-    model: Mutex<Option<CachedModelClient>>,
-    data_dir: PathBuf,
-    export_dir: PathBuf,
-    picked_files: Mutex<HashMap<String, PickedFile>>,
-    invocation_contexts: Mutex<HashMap<String, Option<Arc<RemoteContext>>>>,
+    host: Arc<HostServices>,
+    invocation_contexts: Mutex<HashMap<String, HostInvocation>>,
     supports_service_context: bool,
-    supports_remote_access: bool,
-    remote_services: Arc<tokio::sync::Semaphore>,
+    host_workers: Arc<tokio::sync::Semaphore>,
 }
 
-struct CachedModelClient {
-    endpoint: wonderland_net::ModelEndpoint,
-    proxy_revision: u64,
-    client: wonderland_net::ModelClient,
+struct QueuedWrite {
+    bytes: Vec<u8>,
+    reserved_bytes: Arc<AtomicUsize>,
+    invocation: Option<HostInvocation>,
+}
+
+impl Drop for QueuedWrite {
+    fn drop(&mut self) {
+        self.reserved_bytes
+            .fetch_sub(self.bytes.len(), Ordering::AcqRel);
+    }
+}
+
+fn queue_write(
+    sender: &SyncSender<QueuedWrite>,
+    reserved_bytes: Arc<AtomicUsize>,
+    bytes: Vec<u8>,
+    invocation: Option<HostInvocation>,
+) -> Result<(), PluginError> {
+    reserved_bytes
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            queued
+                .checked_add(bytes.len())
+                .filter(|total| *total <= MAX_QUEUED_WRITE_BYTES)
+        })
+        .map_err(|_| plugin_error("RESOURCE_LIMIT", "Plugin write buffer is full."))?;
+    let queued = QueuedWrite {
+        bytes,
+        reserved_bytes,
+        invocation,
+    };
+    match sender.try_send(queued) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(plugin_error(
+            "RESOURCE_LIMIT",
+            "Plugin write queue is full.",
+        )),
+        Err(TrySendError::Disconnected(_)) => {
+            Err(plugin_error("PLUGIN_CRASHED", "Plugin writer has exited."))
+        }
+    }
 }
 
 /// Only active calls need storage. Wire IDs never reuse a caller's ID, so a late reply
@@ -127,52 +153,52 @@ impl PendingRequests {
     }
 }
 
-struct PickedFile {
-    path: PathBuf,
-    name: String,
-    mime_type: String,
-    max_bytes: u64,
-    size: u64,
-    expires_at: Instant,
-}
-
 struct InvocationGuard<'a> {
     process: &'a PluginProcess,
     id: &'a str,
 }
 
-fn dispatch_remote_service(
+fn dispatch_host_service(
     limit: Arc<tokio::sync::Semaphore>,
     work: impl FnOnce() + Send + 'static,
 ) -> Result<(), PluginError> {
     let permit = limit
         .try_acquire_owned()
-        .map_err(|_| plugin_error("RESOURCE_LIMIT", "Too many remote host service requests."))?;
+        .map_err(|_| plugin_error("RESOURCE_LIMIT", "Too many host service requests."))?;
     thread::Builder::new()
-        .name("remote-host-service".into())
+        .name("host-service".into())
         .spawn(move || {
             let _permit = permit;
             work();
         })
-        .map_err(|_| plugin_error("RESOURCE_LIMIT", "Cannot start remote host service worker."))?;
+        .map_err(|_| plugin_error("RESOURCE_LIMIT", "Cannot start host service worker."))?;
     Ok(())
 }
 
 fn resolve_invocation_context(
-    contexts: &HashMap<String, Option<Arc<RemoteContext>>>,
+    contexts: &HashMap<String, HostInvocation>,
     id: Option<&str>,
     method: &str,
 ) -> Result<Option<Arc<RemoteContext>>, PluginError> {
     if let Some(id) = id {
         return contexts
             .get(id)
-            .cloned()
+            .map(|invocation| invocation.remote.clone())
             .ok_or_else(|| plugin_error("CANCELLED", "请求上下文已失效。"));
     }
-    if contexts.values().any(Option::is_some)
-        && (method.starts_with("core.files.")
-            || matches!(method, "core.browser.open" | "core.browser.open_official")
-            || method == "core.services.invoke")
+    if contexts
+        .values()
+        .any(|invocation| invocation.remote.is_some())
+        && (matches!(
+            method,
+            "core.files.pick"
+                | "core.files.read"
+                | "core.files.export"
+                | "core.files.export_open"
+                | "core.files.export_dir"
+                | "core.files.reveal_own"
+        ) || method == "core.browser.open"
+            || method == "core.plugins.call")
     {
         return Err(plugin_error(
             "REMOTE_CONTEXT_REQUIRED",
@@ -186,18 +212,18 @@ fn resolve_invocation_context(
 mod invocation_context_tests {
     use super::*;
     #[test]
-    fn remote_waits_leave_dispatch_available_and_have_bounded_workers() {
+    fn host_waits_leave_dispatch_available_and_have_bounded_workers() {
         let limit = Arc::new(tokio::sync::Semaphore::new(1));
         let (started_tx, started_rx) = mpsc::channel();
         let (finish_tx, finish_rx) = mpsc::channel();
-        dispatch_remote_service(limit.clone(), move || {
+        dispatch_host_service(limit.clone(), move || {
             started_tx.send(()).unwrap();
             finish_rx.recv().unwrap();
         })
         .unwrap();
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(
-            dispatch_remote_service(limit.clone(), || {})
+            dispatch_host_service(limit.clone(), || {})
                 .unwrap_err()
                 .code,
             "RESOURCE_LIMIT"
@@ -208,7 +234,7 @@ mod invocation_context_tests {
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }
-        dispatch_remote_service(limit, || {}).unwrap();
+        dispatch_host_service(limit, || {}).unwrap();
     }
     #[test]
     fn local_and_remote_concurrent_calls_are_routed_independently() {
@@ -217,8 +243,13 @@ mod invocation_context_tests {
             "browser".into(),
             "plugin".into(),
         ));
-        let contexts =
-            HashMap::from([("local".into(), None), ("web".into(), Some(remote.clone()))]);
+        let contexts = HashMap::from([
+            ("local".into(), HostInvocation::default()),
+            (
+                "web".into(),
+                HostInvocation::for_call(Some(remote.clone()), Some(5000), None).unwrap(),
+            ),
+        ]);
         assert!(
             resolve_invocation_context(&contexts, Some("local"), "core.files.pick")
                 .unwrap()
@@ -234,6 +265,17 @@ mod invocation_context_tests {
             resolve_invocation_context(&contexts, Some("expired"), "core.files.export").is_err()
         );
         assert!(resolve_invocation_context(&contexts, None, "core.files.pick").is_err());
+        assert!(resolve_invocation_context(&contexts, None, "core.files.export_open").is_err());
+        assert!(
+            resolve_invocation_context(&contexts, None, "core.files.open_read")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_invocation_context(&contexts, None, "core.files.open_write")
+                .unwrap()
+                .is_none()
+        );
         assert!(
             resolve_invocation_context(&HashMap::new(), None, "core.files.pick")
                 .unwrap()
@@ -243,21 +285,32 @@ mod invocation_context_tests {
 }
 impl Drop for InvocationGuard<'_> {
     fn drop(&mut self) {
-        if let Some(Some(context)) = self
+        if let Some(invocation) = self
             .process
             .invocation_contexts
             .lock()
             .unwrap()
             .remove(self.id)
         {
-            context.cancel();
+            invocation.cancel();
+        }
+        self.process.host.cleanup();
+    }
+}
+
+// An unaccepted backend must exit before the installer restores files on Windows.
+struct StartupGuard(Option<Arc<PluginProcess>>);
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if let Some(process) = self.0.take() {
+            let _ = process.stop();
         }
     }
 }
 
 impl PluginProcess {
     pub(crate) fn start(
-        app: AppHandle,
+        services: RuntimeServices,
         state: &PluginRuntimeState,
         executable: &std::path::Path,
         contract: Value,
@@ -266,13 +319,6 @@ impl PluginProcess {
         contract_sha256: &str,
     ) -> Result<Arc<Self>, PluginError> {
         let plugin_id = state.manifest.id.clone();
-        let mut granted_capabilities = state.granted_capabilities.clone();
-        for &capability in wonderland_plugin_protocol::IMPLICIT_CAPABILITIES {
-            if !granted_capabilities.iter().any(|value| value == capability) {
-                granted_capabilities.push(capability.into());
-            }
-        }
-        let http = wonderland_net::HttpClient::unrestricted();
         let mut command = Command::new(executable);
         command
             .current_dir(
@@ -290,6 +336,9 @@ impl PluginProcess {
             .stderr(Stdio::piped())
             .env_clear()
             .env("WONDERLAND_PLUGIN_DATA_DIR", &data_dir);
+        if let Some(root) = data_dir.parent().and_then(std::path::Path::parent) {
+            command.env("WONDERLAND_HOST_DATA_DIR", root);
+        }
         for key in ["PATH", "SystemRoot", "TEMP", "TMP"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
@@ -325,25 +374,24 @@ impl PluginProcess {
             .take()
             .ok_or_else(|| internal_error("Plugin stderr was not available."))?;
         let (hello_tx, hello_rx) = mpsc::sync_channel(1);
+        let (writes, writer_rx) = mpsc::sync_channel(MAX_QUEUED_WRITES);
         let process = Arc::new(Self {
             child: Mutex::new(child),
-            stdin: Mutex::new(stdin),
+            writes,
+            queued_write_bytes: Arc::new(AtomicUsize::new(0)),
             pending: Mutex::new(PendingRequests::default()),
             hello_waiter: Mutex::new(Some(hello_tx)),
             alive: AtomicBool::new(true),
+            process_cancelled: Arc::new(AtomicBool::new(false)),
             plugin_id: plugin_id.clone(),
-            granted_capabilities: granted_capabilities.iter().cloned().collect(),
-            http,
-            model: Mutex::new(None),
-            data_dir,
-            export_dir: documents_dir
-                .join("Wonderland Assistant")
-                .join(&plugin_id)
-                .join("Exports"),
-            picked_files: Mutex::new(HashMap::new()),
+            host: Arc::new(HostServices::new(
+                plugin_id.clone(),
+                data_dir,
+                documents_dir,
+                services,
+            )),
             invocation_contexts: Mutex::new(HashMap::new()),
-            supports_remote_access: state.manifest.supports_remote_access(),
-            remote_services: Arc::new(tokio::sync::Semaphore::new(16)),
+            host_workers: Arc::new(tokio::sync::Semaphore::new(16)),
             supports_service_context: state
                 .manifest
                 .backend
@@ -351,10 +399,25 @@ impl PluginProcess {
                 .unwrap_or(false),
         });
 
+        let mut startup_guard = StartupGuard(Some(process.clone()));
+        if let Some(manager) = process.host.services.manager.upgrade() {
+            manager.register_starting_process(
+                &plugin_id,
+                process.host.services.startup_revision,
+                process.clone(),
+            )?;
+        }
+        let writer_process = Arc::downgrade(&process);
+        thread::Builder::new()
+            .name(format!("plugin-{plugin_id}-stdin"))
+            .spawn(move || write_stdin(stdin, writer_rx, writer_process))
+            .map_err(|error| {
+                internal_error(&format!("Cannot start plugin stdin writer: {error}"))
+            })?;
         let weak = Arc::downgrade(&process);
         thread::Builder::new()
             .name(format!("plugin-{plugin_id}-stdout"))
-            .spawn(move || read_stdout(stdout, weak, app, contract))
+            .spawn(move || read_stdout(stdout, weak, contract))
             .map_err(|error| {
                 internal_error(&format!("Cannot start plugin stdout reader: {error}"))
             })?;
@@ -373,7 +436,6 @@ impl PluginProcess {
             "role": "host",
             "pluginId": state.manifest.id,
             "coreVersion": env!("CARGO_PKG_VERSION"),
-            "grantedCapabilities": granted_capabilities,
         });
         process.write_frame(&hello)?;
         let hello = hello_rx
@@ -422,24 +484,26 @@ impl PluginProcess {
             phase = "handshake",
             "插件握手成功"
         );
+        startup_guard.0.take();
         Ok(process)
     }
 
-    pub(crate) fn call(
+    pub(crate) fn call_with_parent(
         &self,
         request_id: &str,
         method: &str,
         params: Value,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         remote: Option<Arc<RemoteContext>>,
+        parent: Option<&HostInvocation>,
     ) -> Result<Value, PluginError> {
         if !self.alive.load(Ordering::Acquire) {
             return Err(plugin_error("PLUGIN_CRASHED", "Plugin process has exited."));
         }
-        if remote.is_some() && !self.supports_remote_access {
+        if remote.is_some() && !self.supports_service_context {
             return Err(plugin_error(
                 "REMOTE_UNSUPPORTED",
-                "此插件未声明远程访问支持，不能从远程工作区调用。",
+                "此插件未声明调用上下文支持，不能参与远程调用。",
             ));
         }
         if request_id.is_empty() || request_id.len() > 128 {
@@ -448,23 +512,20 @@ impl PluginProcess {
                 "Request ID must contain 1 to 128 characters.",
             ));
         }
+        let invocation = HostInvocation::for_call(remote, timeout_ms, parent)?;
         let (tx, rx) = mpsc::channel();
         let wire_id = self
             .pending
             .lock()
             .map_err(|_| internal_error("Plugin request table is unavailable."))?
             .insert(request_id, tx)?;
-        let _invocation_guard = if self.supports_service_context {
-            self.invocation_contexts
-                .lock()
-                .unwrap()
-                .insert(wire_id.clone(), remote);
-            Some(InvocationGuard {
-                process: self,
-                id: &wire_id,
-            })
-        } else {
-            None
+        self.invocation_contexts
+            .lock()
+            .unwrap()
+            .insert(wire_id.clone(), invocation.clone());
+        let _invocation_guard = InvocationGuard {
+            process: self,
+            id: &wire_id,
         };
         let mut frame = json!({
             "protocol": PROTOCOL_ID,
@@ -474,27 +535,31 @@ impl PluginProcess {
             "method": method,
             "params": params,
         });
-        if _invocation_guard.is_some() {
+        if self.supports_service_context {
             frame["serviceContext"] = json!(wire_id);
         }
-        if let Err(error) = self.write_frame(&frame) {
+        if let Err(error) = self.queue_frame(&frame, Some(invocation.clone())) {
             self.remove_pending(&wire_id);
             return Err(error);
         }
-        match rx.recv_timeout(Duration::from_millis(timeout_ms.clamp(1, MAX_TIMEOUT_MS))) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+        trace!(plugin_id = %self.plugin_id, request_id, phase = "call_queued", "插件请求已入队");
+        loop {
+            if let Err(error) = invocation.check() {
                 let _ = self.cancel_wire(&wire_id);
                 self.remove_pending(&wire_id);
-                Err(plugin_error(
-                    "TIMEOUT",
-                    "Plugin call exceeded its contract timeout.",
-                ))
+                return Err(error);
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(plugin_error(
-                "PLUGIN_CRASHED",
-                "Plugin process exited during the request.",
-            )),
+            let remaining = invocation.remaining().unwrap_or(Duration::from_millis(20));
+            match rx.recv_timeout(remaining.min(Duration::from_millis(20))) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(plugin_error(
+                        "PLUGIN_CRASHED",
+                        "Plugin process exited during the request.",
+                    ));
+                }
+            }
         }
     }
 
@@ -511,9 +576,10 @@ impl PluginProcess {
     }
 
     fn cancel_wire(&self, request_id: &str) -> Result<(), PluginError> {
-        if let Some(Some(context)) = self.invocation_contexts.lock().unwrap().get(request_id) {
-            context.cancel();
+        if let Some(invocation) = self.invocation_contexts.lock().unwrap().get(request_id) {
+            invocation.cancel();
         }
+        self.host.cleanup();
         let active = self
             .pending
             .lock()
@@ -541,6 +607,8 @@ impl PluginProcess {
     /// Stops the backend synchronously before Core removes its package or private data.
     pub(crate) fn stop(&self) -> Result<(), PluginError> {
         self.alive.store(false, Ordering::Release);
+        self.cancel_host_invocations();
+        self.close_lifecycle();
         let mut child = self
             .child
             .lock()
@@ -565,10 +633,24 @@ impl PluginProcess {
     }
 
     fn write_frame(&self, frame: &Value) -> Result<(), PluginError> {
+        self.queue_frame(frame, None)
+    }
+
+    fn close_lifecycle(&self) {
+        if let Some(manager) = self.host.services.manager.upgrade() {
+            manager.lifecycle_instance_closed(&self.plugin_id, self.host.services.instance_id);
+        }
+    }
+
+    fn queue_frame(
+        &self,
+        frame: &Value,
+        invocation: Option<HostInvocation>,
+    ) -> Result<(), PluginError> {
         if !self.alive.load(Ordering::Acquire) {
             return Err(plugin_error("PLUGIN_CRASHED", "Plugin process has exited."));
         }
-        let bytes = serde_json::to_vec(frame)
+        let mut bytes = serde_json::to_vec(frame)
             .map_err(|error| internal_error(&format!("Cannot encode protocol frame: {error}")))?;
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(plugin_error(
@@ -576,27 +658,13 @@ impl PluginProcess {
                 "Protocol frame exceeds 32 MiB.",
             ));
         }
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| internal_error("Plugin stdin is unavailable."))?;
-        stdin
-            .write_all(&bytes)
-            .and_then(|()| stdin.write_all(b"\n"))
-            .and_then(|()| stdin.flush())
-            .map_err(|error| {
-                self.alive.store(false, Ordering::Release);
-                warn!(
-                    plugin_id = %self.plugin_id,
-                    phase = "protocol_write",
-                    reason = %error,
-                    "向插件后端发送协议消息失败"
-                );
-                plugin_error(
-                    "PLUGIN_CRASHED",
-                    &format!("Plugin process is not accepting input: {error}"),
-                )
-            })
+        bytes.push(b'\n');
+        queue_write(
+            &self.writes,
+            self.queued_write_bytes.clone(),
+            bytes,
+            invocation,
+        )
     }
 
     fn remove_pending(&self, request_id: &str) {
@@ -659,6 +727,7 @@ fn stop_child(child: &mut Child) -> Result<(), PluginError> {
 impl Drop for PluginProcess {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
+        self.cancel_host_invocations();
         if let Ok(child) = self.child.get_mut() {
             // Drop can run while a caller holds the plugin state lock. Never block there
             // waiting for process exit; `Child` closes its handle after this best-effort kill.
@@ -673,12 +742,63 @@ impl Drop for PluginProcess {
     }
 }
 
-fn read_stdout(
-    stdout: std::process::ChildStdout,
+/// One process-owned pipe writer; no strong process reference survives a blocking write.
+fn write_stdin(
+    mut stdin: ChildStdin,
+    receiver: Receiver<QueuedWrite>,
     process: Weak<PluginProcess>,
-    app: AppHandle,
-    contract: Value,
 ) {
+    while let Ok(queued) = receiver.recv() {
+        if !process.upgrade().is_some_and(|process| process.is_alive()) {
+            return;
+        }
+        if queued
+            .invocation
+            .as_ref()
+            .is_some_and(|invocation| invocation.check().is_err())
+        {
+            continue;
+        }
+        if let Err(error) = stdin.write_all(&queued.bytes).and_then(|()| stdin.flush()) {
+            if let Some(process) = process.upgrade() {
+                protocol_ended(
+                    &process,
+                    plugin_error(
+                        "PLUGIN_CRASHED",
+                        &format!("Plugin process is not accepting input: {error}"),
+                    ),
+                    "protocol_write",
+                );
+            }
+            return;
+        }
+    }
+}
+
+fn protocol_ended(process: &Arc<PluginProcess>, error: PluginError, phase: &'static str) {
+    process.close_lifecycle();
+    if process.alive.swap(false, Ordering::AcqRel) {
+        warn!(
+            plugin_id = %process.plugin_id,
+            code = %error.code,
+            reason = %error.message,
+            phase,
+            "插件后端通信流已结束"
+        );
+    }
+    if let Ok(mut waiter) = process.hello_waiter.lock()
+        && let Some(waiter) = waiter.take()
+    {
+        let _ = waiter.send(Err(error.message.clone()));
+    }
+    process.fail_pending(error.clone());
+    process.cancel_host_invocations();
+    if let Some(manager) = process.host.services.manager.upgrade() {
+        manager.process_exited(&process.plugin_id, process, error);
+    }
+}
+
+fn read_stdout(stdout: std::process::ChildStdout, process: Weak<PluginProcess>, contract: Value) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     let mut first_frame = true;
@@ -838,7 +958,7 @@ fn read_stdout(
                     },
                     None => None,
                 };
-                let _ = app.emit(
+                process.host.services.environment.emit(
                     "plugin:event",
                     json!({
                         "pluginId": process.plugin_id,
@@ -871,35 +991,45 @@ fn read_stdout(
                         );
                     }
                 };
-                let remote = request.service_context.as_ref().is_some_and(|id| {
-                    process
-                        .invocation_contexts
-                        .lock()
-                        .unwrap()
-                        .get(id)
-                        .is_some_and(Option::is_some)
-                });
-                if remote {
-                    // A browser file picker must not block this plugin's stdout reader.
-                    // Native host calls retain their existing synchronous path.
-                    let worker = process.clone();
-                    let app = app.clone();
-                    let service_id = request.id.clone();
-                    if let Err(error) =
-                        dispatch_remote_service(process.remote_services.clone(), move || {
-                            if let Err(error) = worker.reply_to_host_service(&app, &request) {
-                                worker.fail_pending(error);
-                            }
-                        })
-                        && let Err(error) = process.write_frame(&json!({
-                            "protocol": PROTOCOL_ID, "version": PROTOCOL_VERSION,
-                            "type": "error", "id": service_id, "error": error,
-                        }))
+                let admission = process
+                    .host
+                    .services
+                    .manager
+                    .upgrade()
+                    .ok_or_else(|| {
+                        plugin_error("SERVICE_UNAVAILABLE", "Plugin manager is unavailable.")
+                    })
+                    .and_then(|manager| manager.admit_work());
+                let admission = match admission {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        process.host.cleanup();
+                        if let Err(error) = process.reply_to_host_service(&request.id, Err(error)) {
+                            break error;
+                        }
+                        continue;
+                    }
+                };
+                let host = process.host.clone();
+                let invocation = process.host_invocation(&request);
+                let worker = Arc::downgrade(&process);
+                let service_id = request.id.clone();
+                if let Err(error) = dispatch_host_service(process.host_workers.clone(), move || {
+                    let _admission = admission;
+                    let result = invocation.and_then(|invocation| {
+                        host.call(&request.method, &request.params, &invocation)
+                    });
+                    host.cleanup();
+                    if let Some(process) = worker.upgrade()
+                        && let Err(error) = process.reply_to_host_service(&request.id, result)
                     {
+                        process.fail_pending(error);
+                    }
+                }) {
+                    process.host.cleanup();
+                    if let Err(error) = process.reply_to_host_service(&service_id, Err(error)) {
                         break error;
                     }
-                } else if let Err(error) = process.reply_to_host_service(&app, &request) {
-                    break error;
                 }
             }
             Some("hello") | Some("cancel") | None | Some(_) => {
@@ -912,872 +1042,77 @@ fn read_stdout(
     };
 
     if let Some(process) = process.upgrade() {
-        if process.alive.swap(false, Ordering::AcqRel) {
-            warn!(
-                plugin_id = %process.plugin_id,
-                code = %exit_error.code,
-                reason = %exit_error.message,
-                phase = "protocol_stream",
-                "插件后端通信流已结束"
-            );
-        }
-        if let Ok(mut waiter) = process.hello_waiter.lock()
-            && let Some(waiter) = waiter.take()
-        {
-            let _ = waiter.send(Err(exit_error.message.clone()));
-        }
-        process.fail_pending(exit_error);
+        protocol_ended(&process, exit_error, "protocol_stream");
     }
 }
 
 impl PluginProcess {
+    fn host_invocation(&self, request: &PluginRequest) -> Result<HostInvocation, PluginError> {
+        let contexts = self
+            .invocation_contexts
+            .lock()
+            .map_err(|_| internal_error("Invocation table is unavailable."))?;
+        let remote = resolve_invocation_context(
+            &contexts,
+            request.service_context.as_deref(),
+            &request.method,
+        )?;
+        let mut invocation = match request.service_context.as_deref() {
+            Some(id) => contexts
+                .get(id)
+                .cloned()
+                .ok_or_else(|| plugin_error("CANCELLED", "Host invocation has ended."))?,
+            None => HostInvocation::default(),
+        };
+        invocation.remote = remote;
+        invocation = invocation.with_timeout_ms(request.timeout_ms)?;
+        Ok(invocation.with_cancellation_parent(self.process_cancelled.clone()))
+    }
+
     fn reply_to_host_service(
         &self,
-        app: &AppHandle,
-        request: &PluginRequest,
+        id: &str,
+        result: Result<Value, PluginError>,
     ) -> Result<(), PluginError> {
-        let reply = match self.host_service(
-            app,
-            &request.method,
-            &request.params,
-            request.service_context.as_deref(),
-        ) {
+        let reply = match result {
             Ok(result) => {
-                json!({"protocol":PROTOCOL_ID,"version":PROTOCOL_VERSION,"type":"result","id":request.id,"result":result})
+                json!({"protocol":PROTOCOL_ID,"version":PROTOCOL_VERSION,"type":"result","id":id,"result":result})
             }
             Err(error) => {
-                json!({"protocol":PROTOCOL_ID,"version":PROTOCOL_VERSION,"type":"error","id":request.id,"error":error})
+                json!({"protocol":PROTOCOL_ID,"version":PROTOCOL_VERSION,"type":"error","id":id,"error":error})
             }
         };
         self.write_frame(&reply)
     }
 
-    fn host_service(
-        &self,
-        app: &AppHandle,
-        method: &str,
-        params: &Value,
-        service_context: Option<&str>,
-    ) -> Result<Value, PluginError> {
-        let required_capability = match method {
-            "core.account.snapshot" => "account.read",
-            "core.account.authed_get" => "account.authed_get",
-            "core.network.public" => "network.public",
-            "core.network.model" => "network.model",
-            "core.secrets.plugin.get"
-            | "core.secrets.plugin.set"
-            | "core.secrets.plugin.delete"
-            | "core.secrets.plugin.has" => "secrets.plugin",
-            "core.files.pick" | "core.files.read" => "files.pick",
-            "core.files.export" | "core.files.export_dir" => "files.export",
-            "core.files.reveal_own" => "files.reveal_own",
-            "core.browser.open" | "core.browser.open_official" => "browser.open",
-            "core.services.resolve" | "core.services.invoke" => "services.call",
-            _ => {
-                return Err(plugin_error(
-                    "METHOD_NOT_FOUND",
-                    "Core service is not available.",
-                ));
+    fn cancel_host_invocations(&self) {
+        self.process_cancelled.store(true, Ordering::Release);
+        if let Ok(contexts) = self.invocation_contexts.lock() {
+            for invocation in contexts.values() {
+                invocation.cancel();
             }
-        };
-        if wonderland_plugin_protocol::requires_capability_approval(required_capability)
-            && !self.granted_capabilities.contains(required_capability)
-            && !(required_capability == "browser.open"
-                && self.granted_capabilities.contains("browser.open_official"))
-        {
-            return Err(plugin_error(
-                "UNAUTHORIZED",
-                "The requested Core service capability has not been granted.",
-            ));
         }
-        if method == "core.network.model" && !self.granted_capabilities.contains("secrets.plugin") {
-            return Err(plugin_error(
-                "UNAUTHORIZED",
-                "Model requests require the secrets.plugin capability.",
-            ));
-        }
-
-        let remote = resolve_invocation_context(
-            &self.invocation_contexts.lock().unwrap(),
-            service_context,
-            method,
-        )?;
-        if let Some(context) = &remote
-            && (method.starts_with("core.files.")
-                || matches!(method, "core.browser.open" | "core.browser.open_official"))
-        {
-            return context.service(method, params);
-        }
-        match method {
-            "core.account.snapshot" => account_snapshot(app),
-            "core.account.authed_get" => account_authed_get(app, params),
-            "core.network.public" => network_public(params, &self.http),
-            "core.network.model" => self.network_model(params),
-            "core.secrets.plugin.get" => self.secret_get(params),
-            "core.secrets.plugin.set" => self.secret_set(params),
-            "core.secrets.plugin.delete" => self.secret_delete(params),
-            "core.secrets.plugin.has" => self.secret_has(params),
-            "core.files.pick" => self.pick_file(app, params),
-            "core.files.read" => self.read_picked_file(params),
-            "core.files.export" => self.export_file(params),
-            "core.files.export_dir" => self.export_dir(),
-            "core.files.reveal_own" => self.reveal_own(params),
-            "core.browser.open" | "core.browser.open_official" => open_browser(params),
-            "core.services.resolve" => {
-                let service_id = params
-                    .get("serviceId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| plugin_error("INVALID_INPUT", "Service ID is missing."))?;
-                let manager = app.try_state::<PluginManager>().ok_or_else(|| {
-                    plugin_error(
-                        "SERVICE_UNAVAILABLE",
-                        "Plugin service broker is unavailable.",
-                    )
-                })?;
-                let resolution = manager.resolve_service(&self.plugin_id, service_id)?;
-                serde_json::to_value(resolution).map_err(|_| {
-                    plugin_error("INTERNAL", "Service resolution could not be serialized.")
-                })
-            }
-            "core.services.invoke" => {
-                let service_id = params
-                    .get("serviceId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| plugin_error("INVALID_INPUT", "Service ID is missing."))?;
-                let service_method = params
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| plugin_error("INVALID_INPUT", "Service method is missing."))?;
-                let service_params = params.get("params").cloned().unwrap_or_else(|| json!({}));
-                let manager = app.try_state::<PluginManager>().ok_or_else(|| {
-                    plugin_error(
-                        "SERVICE_UNAVAILABLE",
-                        "Plugin service broker is unavailable.",
-                    )
-                })?;
-                if remote.is_some() {
-                    manager.invoke_service_with_context(
-                        &self.plugin_id,
-                        service_id,
-                        service_method,
-                        service_params,
-                        remote,
-                    )
-                } else {
-                    manager.invoke_service(
-                        &self.plugin_id,
-                        service_id,
-                        service_method,
-                        service_params,
-                    )
-                }
-            }
-            _ => unreachable!(),
-        }
+        self.host.cleanup();
     }
 
-    fn pick_file(&self, app: &AppHandle, params: &Value) -> Result<Value, PluginError> {
-        let extensions = match params.get("extensions") {
-            None => Vec::new(),
-            Some(value) => value
-                .as_array()
-                .filter(|items| items.len() <= 128)
-                .ok_or_else(|| {
-                    plugin_error("INVALID_INPUT", "File picker extensions are invalid.")
-                })?
-                .iter()
-                .map(|item| item.as_str())
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    plugin_error("INVALID_INPUT", "File picker extensions are invalid.")
-                })?,
-        };
-        if extensions.iter().any(|extension| {
-            extension.is_empty()
-                || extension.len() > 32
-                || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        }) {
-            return Err(plugin_error(
-                "INVALID_INPUT",
-                "File picker extensions are invalid.",
-            ));
-        }
-        let max_bytes = match params.get("maxBytes") {
-            None => u64::MAX,
-            Some(value) => value
-                .as_u64()
-                .filter(|size| *size > 0)
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "File size limit is invalid."))?,
-        };
-        let mut dialog = app.dialog().file();
-        if !extensions.is_empty() {
-            dialog = dialog.add_filter("Plugin files", &extensions);
-        }
-        let file = dialog.blocking_pick_file();
-        let Some(file) = file else {
-            return Ok(json!({ "cancelled": true }));
-        };
-        let path = file.into_path().map_err(|error| {
-            plugin_error(
-                "INVALID_INPUT",
-                &format!("Selected file path is invalid: {error}"),
-            )
-        })?;
-        let metadata = fs::metadata(&path)
-            .map_err(|error| plugin_error("INTERNAL", &format!("Cannot inspect file: {error}")))?;
-        if !metadata.is_file() || metadata.len() > max_bytes {
-            return Err(plugin_error(
-                "RESOURCE_LIMIT",
-                "Selected file exceeds its size limit.",
-            ));
-        }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Selected file name is invalid."))?
-            .to_owned();
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !extensions.is_empty()
-            && !extensions
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(&extension))
-        {
-            return Err(plugin_error(
-                "INVALID_INPUT",
-                "Selected file type does not match the requested file types.",
-            ));
-        }
-        let mime_type = file_mime_type(&extension).to_owned();
-        let token = file_handle_token()?;
-        let mut picked_files = self
-            .picked_files
+    pub(crate) fn active_request_count(&self) -> usize {
+        self.pending.lock().map_or(0, |pending| pending.calls.len())
+            + 16usize.saturating_sub(self.host_workers.available_permits())
+            + usize::from(self.queued_write_bytes.load(Ordering::Acquire) > 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_request_for_test(&self, request_id: &str) -> bool {
+        self.pending
             .lock()
-            .map_err(|_| plugin_error("INTERNAL", "File handle table is unavailable."))?;
-        picked_files.retain(|_, picked| Instant::now() <= picked.expires_at);
-        if picked_files.len() >= 32 {
-            return Err(plugin_error(
-                "RESOURCE_LIMIT",
-                "Too many selected files are waiting to be read.",
-            ));
-        }
-        picked_files.insert(
-            token.clone(),
-            PickedFile {
-                path,
-                name: name.clone(),
-                mime_type: mime_type.clone(),
-                max_bytes,
-                size: metadata.len(),
-                expires_at: Instant::now() + FILE_HANDLE_TTL,
-            },
-        );
-        Ok(json!({
-            "cancelled": false,
-            "handle": token,
-            "name": name,
-            "mimeType": mime_type,
-            "size": metadata.len(),
-        }))
-    }
-
-    fn read_picked_file(&self, params: &Value) -> Result<Value, PluginError> {
-        let handle = params
-            .get("handle")
-            .and_then(Value::as_str)
-            .filter(|handle| !handle.is_empty() && handle.len() <= 128)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "File handle is invalid."))?;
-        if params.get("offset").is_some() || params.get("chunkBytes").is_some() {
-            let offset = params
-                .get("offset")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "File chunk offset is invalid."))?;
-            let chunk_bytes = params
-                .get("chunkBytes")
-                .and_then(Value::as_u64)
-                .filter(|size| (1..=MAX_PICKED_FILE_CHUNK_BYTES).contains(size))
-                .ok_or_else(|| plugin_error("INVALID_INPUT", "File chunk size is invalid."))?;
-            return self.read_picked_file_chunk(handle, offset, chunk_bytes);
-        }
-        let picked = self
-            .picked_files
-            .lock()
-            .map_err(|_| plugin_error("INTERNAL", "File handle table is unavailable."))?
-            .remove(handle)
-            .ok_or_else(|| plugin_error("UNAUTHORIZED", "File handle is invalid or expired."))?;
-        if Instant::now() > picked.expires_at {
-            return Err(plugin_error("UNAUTHORIZED", "File handle has expired."));
-        }
-        let metadata = fs::metadata(&picked.path).map_err(|error| {
-            plugin_error(
-                "INTERNAL",
-                &format!("Cannot inspect selected file: {error}"),
-            )
-        })?;
-        if !metadata.is_file()
-            || metadata.len() > picked.max_bytes
-            || metadata.len() > MAX_PICKED_FILE_INLINE_BYTES
-        {
-            return Err(plugin_error(
-                "RESOURCE_LIMIT",
-                "Selected file exceeds its size limit.",
-            ));
-        }
-        let file = fs::File::open(&picked.path).map_err(|error| {
-            plugin_error("INTERNAL", &format!("Cannot read selected file: {error}"))
-        })?;
-        let mut bytes = Vec::with_capacity(metadata.len().min(picked.max_bytes) as usize);
-        file.take(
-            picked
-                .max_bytes
-                .min(MAX_PICKED_FILE_INLINE_BYTES)
-                .saturating_add(1),
-        )
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            plugin_error("INTERNAL", &format!("Cannot read selected file: {error}"))
-        })?;
-        if bytes.len() as u64 > picked.max_bytes
-            || bytes.len() as u64 > MAX_PICKED_FILE_INLINE_BYTES
-        {
-            return Err(plugin_error(
-                "RESOURCE_LIMIT",
-                "Selected file exceeds its size limit.",
-            ));
-        }
-        Ok(json!({
-            "name": picked.name,
-            "mimeType": picked.mime_type,
-            "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }))
-    }
-
-    fn read_picked_file_chunk(
-        &self,
-        handle: &str,
-        offset: u64,
-        chunk_bytes: u64,
-    ) -> Result<Value, PluginError> {
-        let mut picked_files = self
-            .picked_files
-            .lock()
-            .map_err(|_| plugin_error("INTERNAL", "File handle table is unavailable."))?;
-        let picked = picked_files
-            .get(handle)
-            .ok_or_else(|| plugin_error("UNAUTHORIZED", "File handle is invalid or expired."))?;
-        if Instant::now() > picked.expires_at {
-            picked_files.remove(handle);
-            return Err(plugin_error("UNAUTHORIZED", "File handle has expired."));
-        }
-        if offset > picked.size || offset > picked.max_bytes {
-            return Err(plugin_error(
-                "INVALID_INPUT",
-                "File chunk offset is outside the selected file.",
-            ));
-        }
-        let path = picked.path.clone();
-        let name = picked.name.clone();
-        let mime_type = picked.mime_type.clone();
-        let expected_size = picked.size;
-        let max_bytes = picked.max_bytes;
-        let remaining = expected_size.saturating_sub(offset);
-        let read_size = remaining.min(chunk_bytes);
-        let is_final = offset + read_size >= expected_size;
-        drop(picked_files);
-        let metadata = fs::metadata(&path)
-            .map_err(|_| plugin_error("INTERNAL", "Selected file is unavailable."))?;
-        if !metadata.is_file() || metadata.len() != expected_size || metadata.len() > max_bytes {
-            return Err(plugin_error(
-                "RESOURCE_LIMIT",
-                "Selected file changed or exceeds its size limit.",
-            ));
-        }
-        let mut file = fs::File::open(&path)
-            .map_err(|_| plugin_error("INTERNAL", "Selected file cannot be read."))?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|_| plugin_error("INTERNAL", "Selected file cannot be read."))?;
-        let mut bytes = vec![0; read_size as usize];
-        file.read_exact(&mut bytes)
-            .map_err(|_| plugin_error("INTERNAL", "Selected file cannot be read."))?;
-        if is_final && let Ok(mut table) = self.picked_files.lock() {
-            table.remove(handle);
-        }
-        Ok(json!({
-            "name": name,
-            "mimeType": mime_type,
-            "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes),
-            "offset": offset,
-            "eof": is_final,
-        }))
-    }
-
-    fn export_file(&self, params: &Value) -> Result<Value, PluginError> {
-        let name = params
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| safe_export_name(name))
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Export file name is invalid."))?;
-        let content = params
-            .get("contentBase64")
-            .and_then(Value::as_str)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Export content is invalid."))?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(content)
-            .map_err(|_| plugin_error("INVALID_INPUT", "Export content is not valid base64."))?;
-        if bytes.len() > MAX_EXPORTED_FILE_BYTES {
-            return Err(plugin_error(
-                "RESOURCE_LIMIT",
-                "Export exceeds its size limit.",
-            ));
-        }
-        fs::create_dir_all(&self.export_dir).map_err(|error| {
-            plugin_error(
-                "INTERNAL",
-                &format!("Cannot create export directory: {error}"),
-            )
-        })?;
-        let path = self.export_dir.join(name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                plugin_error("INTERNAL", &format!("Cannot create export file: {error}"))
-            })?;
-        if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-            drop(file);
-            let _ = fs::remove_file(&path);
-            return Err(plugin_error(
-                "INTERNAL",
-                &format!("Cannot write export file: {error}"),
-            ));
-        }
-        Ok(json!({ "path": path.to_string_lossy() }))
-    }
-
-    fn export_dir(&self) -> Result<Value, PluginError> {
-        fs::create_dir_all(&self.export_dir).map_err(|error| {
-            plugin_error(
-                "INTERNAL",
-                &format!("Cannot create export directory: {error}"),
-            )
-        })?;
-        Ok(json!({ "path": self.export_dir.to_string_lossy() }))
-    }
-
-    fn secret_path(&self, key: &str) -> Result<PathBuf, PluginError> {
-        if key.is_empty()
-            || key.len() > 120
-            || key == "."
-            || key == ".."
-            || !key
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-        {
-            return Err(plugin_error(
-                "INVALID_INPUT",
-                "Plugin secret key is invalid.",
-            ));
-        }
-        let app_data = self
-            .data_dir
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| plugin_error("INTERNAL", "Plugin secret directory is unavailable."))?;
-        Ok(app_data
-            .join("plugin-secrets")
-            .join(&self.plugin_id)
-            .join(format!("{key}.dpapi")))
-    }
-
-    fn secret_get(&self, params: &Value) -> Result<Value, PluginError> {
-        let key = params
-            .get("key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Plugin secret key is invalid."))?;
-        let path = self.secret_path(key)?;
-        let sealed = match fs::read(path) {
-            Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(json!({ "value": null }));
-            }
-            Err(_) => return Err(plugin_error("INTERNAL", "Plugin secret is unavailable.")),
-        };
-        let plain = wonderland_secret::unseal(&sealed)
-            .map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be decrypted."))?;
-        let value = String::from_utf8(plain)
-            .map_err(|_| plugin_error("INTERNAL", "Plugin secret is not valid text."))?;
-        Ok(json!({ "value": value }))
-    }
-
-    fn secret_set(&self, params: &Value) -> Result<Value, PluginError> {
-        let key = params
-            .get("key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Plugin secret key is invalid."))?;
-        let value = params
-            .get("value")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty() && value.len() <= 16_384)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Plugin secret value is invalid."))?;
-        let path = self.secret_path(key)?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| plugin_error("INTERNAL", "Plugin secret directory is unavailable."))?;
-        fs::create_dir_all(parent)
-            .map_err(|_| plugin_error("INTERNAL", "Plugin secret directory cannot be created."))?;
-        let sealed = wonderland_secret::seal(value.as_bytes())
-            .map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be protected."))?;
-        let temp = path.with_extension("tmp");
-        fs::write(&temp, sealed)
-            .map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be written."))?;
-        if path.exists() {
-            fs::remove_file(&path)
-                .map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be replaced."))?;
-        }
-        fs::rename(&temp, &path)
-            .map_err(|_| plugin_error("INTERNAL", "Plugin secret cannot be committed."))?;
-        Ok(json!({ "ok": true }))
-    }
-
-    fn secret_delete(&self, params: &Value) -> Result<Value, PluginError> {
-        let key = params
-            .get("key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Plugin secret key is invalid."))?;
-        match fs::remove_file(self.secret_path(key)?) {
-            Ok(()) => Ok(json!({ "ok": true })),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({ "ok": true })),
-            Err(_) => Err(plugin_error("INTERNAL", "Plugin secret cannot be deleted.")),
-        }
-    }
-
-    fn secret_has(&self, params: &Value) -> Result<Value, PluginError> {
-        let key = params
-            .get("key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Plugin secret key is invalid."))?;
-        Ok(json!({ "exists": self.secret_path(key)?.is_file() }))
-    }
-
-    fn network_model(&self, params: &Value) -> Result<Value, PluginError> {
-        let secret_id = params
-            .get("secretId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.len() <= 120)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Model secret reference is invalid."))?;
-        let base_url = params
-            .get("baseUrl")
-            .and_then(Value::as_str)
-            .filter(|value| value.len() <= 2048)
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Model endpoint is invalid."))?;
-        let timeout_seconds = params
-            .get("timeoutSeconds")
-            .and_then(Value::as_u64)
-            .filter(|value| (10..=600).contains(value))
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Model timeout is invalid."))?;
-        let path = params
-            .get("path")
-            .and_then(Value::as_str)
-            .filter(|value| {
-                value.starts_with('/') && !value.starts_with("//") && value.len() <= 256
-            })
-            .ok_or_else(|| plugin_error("INVALID_INPUT", "Model request path is invalid."))?;
-        let body = params
-            .get("body")
-            .and_then(Value::as_str)
-            .filter(|value| value.len() <= 4 * 1024 * 1024)
-            .ok_or_else(|| plugin_error("RESOURCE_LIMIT", "Model request body is too large."))?;
-        let sealed = fs::read(self.secret_path(secret_id)?).map_err(|_| {
-            plugin_error(
-                "UNAUTHORIZED",
-                "The selected model profile has no saved API key.",
-            )
-        })?;
-        let api_key = String::from_utf8(wonderland_secret::unseal(&sealed).map_err(|_| {
-            plugin_error(
-                "INTERNAL",
-                "The selected model API key cannot be decrypted.",
-            )
-        })?)
-        .map_err(|_| plugin_error("INTERNAL", "The selected model API key is invalid."))?;
-        let endpoint = wonderland_net::ModelEndpoint {
-            timeout: Duration::from_secs(timeout_seconds),
-            ..wonderland_net::ModelEndpoint::new(base_url)
-        };
-        let revision = wonderland_net::proxy::current_proxy()
-            .map_err(|_| internal_error("Proxy configuration is unavailable."))?
-            .revision;
-        let client = {
-            let mut cached = self
-                .model
-                .lock()
-                .map_err(|_| internal_error("Model HTTP client is unavailable."))?;
-            if let Some(previous) = cached.as_ref()
-                && previous.endpoint == endpoint
-                && previous.proxy_revision == revision
-            {
-                previous.client.clone()
-            } else {
-                let client = wonderland_net::ModelClient::new(endpoint.clone())
-                    .map_err(model_service_error)?;
-                *cached = Some(CachedModelClient {
-                    endpoint,
-                    proxy_revision: revision,
-                    client: client.clone(),
-                });
-                client
-            }
-        };
-        let bytes = tauri::async_runtime::block_on(client.post_json(path, &api_key, body))
-            .map_err(model_service_error)?;
-        Ok(json!({ "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
-    }
-
-    fn reveal_own(&self, params: &Value) -> Result<Value, PluginError> {
-        let directory = match params.get("scope").and_then(Value::as_str) {
-            Some("data") => &self.data_dir,
-            Some("exports") => &self.export_dir,
-            _ => return Err(plugin_error("INVALID_INPUT", "Reveal scope is invalid.")),
-        };
-        fs::create_dir_all(directory).map_err(|error| {
-            plugin_error(
-                "INTERNAL",
-                &format!("Cannot create plugin directory: {error}"),
-            )
-        })?;
-        crate::reveal::open_dir(directory).map_err(|error| {
-            plugin_error(
-                "INTERNAL",
-                &format!("Cannot open plugin directory: {error}"),
-            )
-        })?;
-        Ok(json!({ "ok": true }))
+            .is_ok_and(|pending| pending.wire_id(request_id).is_some())
     }
 
     fn deliver(&self, request_id: &str, result: Result<Value, PluginError>) {
+        trace!(plugin_id = %self.plugin_id, request_id, phase = "reply_received", "收到插件响应");
         if let Ok(mut pending) = self.pending.lock() {
             pending.deliver(request_id, result);
         }
-    }
-}
-
-fn account_snapshot(app: &AppHandle) -> Result<Value, PluginError> {
-    let context = app.state::<wonderland_kernel::AppContext>();
-    let account = context
-        .account
-        .as_ref()
-        .ok_or_else(|| plugin_error("NOT_RUNNING", "Core account service is unavailable."))?;
-    serde_json::to_value(account.snapshot())
-        .map_err(|_| plugin_error("INTERNAL", "Cannot serialize the Core account snapshot."))
-}
-
-fn open_browser(params: &Value) -> Result<Value, PluginError> {
-    let url = browser_url(params)?;
-    crate::reveal::open_url(&url).map_err(|error| {
-        plugin_error(
-            "INTERNAL",
-            &format!("Cannot open browser destination: {error}"),
-        )
-    })?;
-    Ok(json!({ "ok": true }))
-}
-
-pub(crate) fn browser_url(params: &Value) -> Result<String, PluginError> {
-    if let Some(raw) = params.get("url") {
-        let url = raw
-            .as_str()
-            .and_then(|raw| tauri::Url::parse(raw).ok())
-            .filter(|url| {
-                matches!(url.scheme(), "http" | "https")
-                    && url.host_str().is_some()
-                    && url.username().is_empty()
-                    && url.password().is_none()
-            })
-            .ok_or_else(|| {
-                plugin_error("INVALID_INPUT", "Browser URL must be an HTTP(S) address.")
-            })?;
-        return Ok(url.into());
-    }
-    // Compatibility adapter for existing plugins. New callers supply their own URL.
-    let url = match params.get("target").and_then(Value::as_str) {
-        Some("document") => {
-            let path_id = params
-                .get("pathId")
-                .and_then(Value::as_str)
-                .filter(|value| {
-                    !value.is_empty()
-                        && value.len() <= 128
-                        && value
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-                })
-                .ok_or_else(|| {
-                    plugin_error("INVALID_INPUT", "Official document identifier is invalid.")
-                })?;
-            format!("https://act.mihoyo.com/ys/ugc/tutorial/detail/{path_id}")
-        }
-        Some("onnx") => "https://github.com/microsoft/onnxruntime/releases".to_owned(),
-        Some("model") => "https://huggingface.co/BAAI/bge-small-zh-v1.5".to_owned(),
-        _ => {
-            return Err(plugin_error(
-                "INVALID_INPUT",
-                "Browser URL is missing or legacy destination is invalid.",
-            ));
-        }
-    };
-    Ok(url)
-}
-
-fn account_authed_get(app: &AppHandle, params: &Value) -> Result<Value, PluginError> {
-    let account_key = params
-        .get("accountKey")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= 100)
-        .ok_or_else(|| plugin_error("INVALID_INPUT", "Account key is invalid."))?;
-    let path = params
-        .get("path")
-        .and_then(Value::as_str)
-        .filter(|value| value.starts_with('/') && !value.starts_with("//") && value.len() <= 512)
-        .ok_or_else(|| plugin_error("INVALID_INPUT", "Account request path is invalid."))?;
-    let query = params
-        .get("query")
-        .and_then(Value::as_array)
-        .filter(|items| items.len() <= 32)
-        .ok_or_else(|| plugin_error("INVALID_INPUT", "Account request query is invalid."))?
-        .iter()
-        .map(|item| {
-            let pair = item
-                .as_array()
-                .filter(|pair| pair.len() == 2)
-                .ok_or_else(|| {
-                    plugin_error("INVALID_INPUT", "Account request query is invalid.")
-                })?;
-            let key = pair[0]
-                .as_str()
-                .filter(|value| value.len() <= 100)
-                .ok_or_else(|| {
-                    plugin_error("INVALID_INPUT", "Account request query is invalid.")
-                })?;
-            let value = pair[1]
-                .as_str()
-                .filter(|value| value.len() <= 512)
-                .ok_or_else(|| {
-                    plugin_error("INVALID_INPUT", "Account request query is invalid.")
-                })?;
-            Ok((key.to_owned(), value.to_owned()))
-        })
-        .collect::<Result<Vec<_>, PluginError>>()?;
-    let context = app.state::<wonderland_kernel::AppContext>();
-    let account = context
-        .account
-        .as_ref()
-        .ok_or_else(|| plugin_error("NOT_RUNNING", "Core account service is unavailable."))?;
-    let bytes = tauri::async_runtime::block_on(account.authed_get(account_key, path, &query))
-        .map_err(|error| {
-            plugin_error(
-                match error {
-                    wonderland_kernel::KernelError::NotLoggedIn => {
-                        "PLUGIN_MY_WONDERLAND_NOT_LOGGED_IN"
-                    }
-                    wonderland_kernel::KernelError::AccountNotFound(_) => "INVALID_INPUT",
-                    wonderland_kernel::KernelError::SessionExpired => {
-                        "PLUGIN_MY_WONDERLAND_SESSION_EXPIRED"
-                    }
-                    wonderland_kernel::KernelError::ResourceLimit => "RESOURCE_LIMIT",
-                    wonderland_kernel::KernelError::InvalidInput => "UNAUTHORIZED",
-                    wonderland_kernel::KernelError::Timeout => "TIMEOUT",
-                    wonderland_kernel::KernelError::Http(_) => "PLUGIN_MY_WONDERLAND_HTTP_ERROR",
-                    _ => "INTERNAL",
-                },
-                "Core account request failed.",
-            )
-        })?;
-    Ok(json!({ "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NetworkRequest {
-    method: String,
-    url: String,
-    #[serde(default)]
-    headers: Vec<(String, String)>,
-    #[serde(default)]
-    query: Vec<(String, String)>,
-    #[serde(default)]
-    body: Option<String>,
-}
-
-fn network_public(
-    params: &Value,
-    client: &wonderland_net::HttpClient,
-) -> Result<Value, PluginError> {
-    let request: NetworkRequest = serde_json::from_value(params.clone())
-        .map_err(|_| plugin_error("INVALID_INPUT", "HTTP request parameters are invalid."))?;
-    if request
-        .body
-        .as_ref()
-        .is_some_and(|body| body.len() > 1_048_576)
-    {
-        return Err(plugin_error(
-            "RESOURCE_LIMIT",
-            "HTTP request body is too large.",
-        ));
-    }
-    let headers = request
-        .headers
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect::<Vec<_>>();
-    let bytes = tauri::async_runtime::block_on(client.request_bytes(
-        &request.method,
-        &request.url,
-        &headers,
-        &request.query,
-        request.body.as_deref(),
-    ))
-    .map_err(|error| {
-        plugin_error(
-            match error {
-                wonderland_kernel::KernelError::Timeout => "TIMEOUT",
-                wonderland_kernel::KernelError::ResourceLimit => "RESOURCE_LIMIT",
-                wonderland_kernel::KernelError::InvalidInput => "INVALID_INPUT",
-                wonderland_kernel::KernelError::Http(_) => "PLUGIN_NETWORK_HTTP_ERROR",
-                _ => "PLUGIN_NETWORK_REQUEST_FAILED",
-            },
-            "HTTP request failed.",
-        )
-    })?;
-    Ok(json!({ "contentBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }))
-}
-
-fn model_service_error(error: wonderland_net::ModelError) -> PluginError {
-    match error {
-        wonderland_net::ModelError::Transient {
-            status: Some(status),
-            ..
-        } => plugin_error(
-            "PLUGIN_TRANSLATOR_MODEL_TRANSIENT",
-            &format!("Model service returned HTTP {status}."),
-        ),
-        wonderland_net::ModelError::Transient { status: None, .. } => {
-            plugin_error("TIMEOUT", "Model service timed out or could not connect.")
-        }
-        wonderland_net::ModelError::Invalid(_) => plugin_error(
-            "PLUGIN_TRANSLATOR_MODEL_INVALID",
-            "Model service response was invalid.",
-        ),
-        wonderland_net::ModelError::Config(_) => {
-            plugin_error("INVALID_INPUT", "Model endpoint configuration is invalid.")
-        }
-        wonderland_net::ModelError::Indeterminate => plugin_error(
-            "PLUGIN_TRANSLATOR_MODEL_INDETERMINATE",
-            "Model request completed without a confirmed response.",
-        ),
     }
 }
 
@@ -1921,42 +1256,6 @@ fn log_plugin_diagnostic(
     }
 }
 
-fn file_handle_token() -> Result<String, PluginError> {
-    let mut bytes = [0_u8; 32];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes)
-        .map_err(|_| plugin_error("INTERNAL", "Cannot create a file access handle."))?;
-    Ok(hex::encode(bytes))
-}
-
-pub(crate) fn file_mime_type(extension: &str) -> &'static str {
-    match extension {
-        "json" => "application/json",
-        "csv" => "text/csv",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "bmp" => "image/bmp",
-        _ => "application/octet-stream",
-    }
-}
-
-pub(crate) fn safe_export_name(name: &str) -> bool {
-    name.len() <= 180
-        && matches!(
-            Path::new(name)
-                .extension()
-                .and_then(|value| value.to_str())
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("json" | "csv" | "xlsx")
-        )
-        && Path::new(name).file_name().and_then(|file| file.to_str()) == Some(name)
-        && !name
-            .chars()
-            .any(|character| character.is_control() || matches!(character, ':' | '/' | '\\'))
-}
-
 fn valid_envelope(frame: &Value) -> bool {
     frame.get("protocol").and_then(Value::as_str) == Some(PROTOCOL_ID)
         && frame.get("version").and_then(Value::as_str) == Some(PROTOCOL_VERSION)
@@ -2005,6 +1304,20 @@ fn sanitize_plugin_error(error: &mut PluginError) {
         "RESOURCE_LIMIT",
         "REMOTE_UNSUPPORTED",
         "REMOTE_CONTEXT_REQUIRED",
+        "REMOTE_DEPENDENCY_NOT_DECLARED",
+        "CALL_DEPTH_EXCEEDED",
+        "INTERACTION_UNAVAILABLE",
+        "SERVICE_UNAVAILABLE",
+        "SECRET_NOT_FOUND",
+        "NOT_LOGGED_IN",
+        "SESSION_EXPIRED",
+        "HTTP_ERROR",
+        "NETWORK_ERROR",
+        "MODEL_TRANSIENT",
+        "MODEL_INVALID",
+        "MODEL_INDETERMINATE",
+        "UPGRADE_IN_PROGRESS",
+        "UPGRADE_BUSY",
         "INTERNAL",
     ];
     if !KNOWN.contains(&error.code.as_str()) && !error.code.starts_with("PLUGIN_") {
@@ -2078,6 +1391,58 @@ mod network_and_request_tests {
     use super::*;
 
     #[test]
+    fn writer_backpressure_bounds_frames_and_bytes_and_releases_failed_reservations() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let bytes = Arc::new(AtomicUsize::new(0));
+        queue_write(&sender, bytes.clone(), vec![1, 2, 3], None).unwrap();
+        assert_eq!(bytes.load(Ordering::Acquire), 3);
+        assert_eq!(
+            queue_write(&sender, bytes.clone(), vec![4, 5], None)
+                .unwrap_err()
+                .code,
+            "RESOURCE_LIMIT"
+        );
+        assert_eq!(bytes.load(Ordering::Acquire), 3);
+        drop(receiver.recv().unwrap());
+        assert_eq!(bytes.load(Ordering::Acquire), 0);
+        bytes.store(MAX_QUEUED_WRITE_BYTES, Ordering::Release);
+        assert_eq!(
+            queue_write(&sender, bytes.clone(), vec![1], None)
+                .unwrap_err()
+                .code,
+            "RESOURCE_LIMIT"
+        );
+        assert_eq!(bytes.load(Ordering::Acquire), MAX_QUEUED_WRITE_BYTES);
+        bytes.store(0, Ordering::Release);
+        drop(receiver);
+        assert_eq!(
+            queue_write(&sender, bytes.clone(), vec![1], None)
+                .unwrap_err()
+                .code,
+            "PLUGIN_CRASHED"
+        );
+        assert_eq!(bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn relayed_host_errors_keep_their_generic_codes_and_sanitize_diagnostics() {
+        for code in [
+            "CALL_DEPTH_EXCEEDED",
+            "INTERACTION_UNAVAILABLE",
+            "SECRET_NOT_FOUND",
+            "MODEL_INVALID",
+            "UPGRADE_IN_PROGRESS",
+        ] {
+            let mut error = plugin_error(code, "host failure\u{0001}");
+            error.details = Some(json!({"private":"redacted"}));
+            sanitize_plugin_error(&mut error);
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, "host failure");
+            assert!(error.details.is_none());
+        }
+    }
+
+    #[test]
     fn completed_call_ids_can_be_reused_without_delivering_stale_replies_or_events() {
         let mut pending = PendingRequests::default();
         let (first_tx, first_rx) = mpsc::channel();
@@ -2114,10 +1479,11 @@ mod network_and_request_tests {
     }
 
     #[test]
-    fn browser_urls_accept_lan_ports_queries_and_fragments_and_keep_legacy_calls() {
+    fn browser_urls_accept_lan_ports_queries_and_fragments_and_reject_legacy_calls() {
+        use crate::host_services::browser_url;
         let url = "http://192.168.1.20:8080/tools?q=example#section";
         assert_eq!(browser_url(&json!({"url": url})).unwrap(), url);
-        assert!(browser_url(&json!({"target":"onnx"})).is_ok());
+        assert!(browser_url(&json!({"target":"onnx"})).is_err());
         for url in [
             "file:///C:/test",
             "javascript:alert(1)",

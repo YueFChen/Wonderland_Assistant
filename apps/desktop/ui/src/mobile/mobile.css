@@ -6,36 +6,30 @@
 .mobile-app button:focus-visible, .mobile-app a:focus-visible, .mobile-app input:focus-visible, .mobile-app select:focus-visible { outline: 2px solid var(--app-accent); outline-offset: 3px; }
 .mobile-header { height: calc(76px + env(safe-area-inset-top)); padding: env(safe-area-inset-top) 22px 0; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--app-glass-line); }
 .mobile-brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: inherit; font-size: 17px; font-weight: 700; }
-.mobile-brand img { width: 38px; height: 38px; border-radius: 13px; }
-.mobile-brand small { display: block; color: var(--app-ink-muted); font-size: 10px; font-weight: 400; letter-spacing: .12em; margin-top: 1px; }
-.mobile-icon { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 14px; border: 1px solid var(--app-glass-line); color: var(--app-ink); background: var(--app-glass); flex-shrink: 0; }
+.mobile-brand img { width: 38px; height: 38px; border-radius: var(--app-radius-control); }
+.mobile-icon { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: var(--app-radius-control); border: 1px solid var(--app-glass-line); color: var(--app-ink); background: var(--app-glass); flex-shrink: 0; }
 .mobile-login, .mobile-workspace { max-width: 860px; margin: 0 auto; padding: 34px 22px calc(100px + env(safe-area-inset-bottom)); }
 .mobile-login { max-width: 540px; padding-top: clamp(38px, 8vh, 86px); }
-.mobile-kicker { display: flex; align-items: center; gap: 7px; color: var(--app-accent); font-size: 11px; letter-spacing: .08em; font-weight: 650; }
 .mobile-app h1 { margin: 16px 0 10px; font-size: clamp(28px, 6vw, 38px); line-height: 1.25; font-weight: 750; letter-spacing: -.04em; }
-.mobile-intro { color: var(--app-ink-muted); font-size: 14px; line-height: 1.9; margin: 0; }
-.mobile-connect { margin-top: 30px; border-radius: 22px; padding: 24px; }
-.mobile-connect-title { display: flex; align-items: center; gap: 10px; color: var(--app-accent); }
-.mobile-connect h2 { color: var(--app-ink); margin: 0; font-size: 18px; font-weight: 650; }
+.mobile-connect { border-radius: var(--app-radius-panel); padding: 24px; }
+.mobile-connect-title { display: flex; align-items: center; gap: 10px; color: var(--app-accent); margin-bottom: 24px; }
+.mobile-connect-title h1 { color: var(--app-ink); margin: 0; font-size: 18px; font-weight: 650; letter-spacing: 0; }
 .mobile-connect p { color: var(--app-ink-muted); font-size: 13px; line-height: 1.8; margin: 12px 0 22px; }
 .mobile-connect label { font-size: 12px; font-weight: 600; }
-.mobile-connect input { margin: 8px 0 16px; width: 100%; min-height: 50px; padding: 12px; border: 1px solid var(--app-field-border); background: var(--app-field); color: var(--app-ink); border-radius: 11px; font-size: 16px; }
-.mobile-primary { display: flex; justify-content: center; align-items: center; gap: 10px; min-height: 50px; width: 100%; background: var(--app-accent); color: var(--app-page); border: 0; border-radius: 11px; font-weight: 600; }
-.mobile-security { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: var(--app-ink-muted); line-height: 1.8; margin: 22px 8px; }
-.mobile-security svg { flex-shrink: 0; margin-top: 2px; }
+.mobile-connect input { margin: 8px 0 16px; width: 100%; min-height: 50px; padding: 12px; border: 1px solid var(--app-field-border); background: var(--app-field); color: var(--app-ink); border-radius: var(--app-radius-control); font-size: 16px; }
+.mobile-primary { display: flex; justify-content: center; align-items: center; gap: 10px; min-height: 50px; width: 100%; background: var(--app-accent); color: var(--app-primary-ink); border: 0; border-radius: var(--app-radius-control); font-weight: 600; }
 .mobile-app .mobile-error { color: var(--app-danger); overflow-wrap: anywhere; }
-.mobile-search { display: flex; align-items: center; gap: 10px; margin: 25px 0 20px; padding: 0 14px; border: 1px solid var(--app-field-border); border-radius: 13px; color: var(--app-ink-faint); background: var(--app-field); }
+.mobile-search { display: flex; align-items: center; gap: 10px; margin: 25px 0 20px; padding: 0 14px; border: 1px solid var(--app-field-border); border-radius: var(--app-radius-control); color: var(--app-ink-faint); background: var(--app-field); }
 .mobile-search input { border: 0; outline: none; width: 100%; min-height: 48px; background: transparent; color: var(--app-ink); font-size: 16px; }
 .mobile-tools { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.mobile-tool-card { position: relative; display: flex; flex-direction: column; align-items: flex-start; border-radius: 18px; padding: 18px; text-align: left; min-width: 0; }
-.mobile-tool-glyph { display: grid; place-items: center; width: 43px; height: 43px; background: var(--app-accent-soft); color: var(--app-accent); border-radius: 13px; margin-bottom: 20px; }
+.mobile-tool-card { position: relative; display: flex; flex-direction: column; align-items: flex-start; border-radius: var(--app-radius-panel); padding: 18px; text-align: left; min-width: 0; }
+.mobile-tool-glyph { display: grid; place-items: center; width: 43px; height: 43px; background: var(--app-accent-soft); color: var(--app-accent); border-radius: var(--app-radius-control); margin-bottom: 20px; }
 .mobile-tool-arrow { position: absolute; right: 16px; top: 18px; color: var(--app-ink-faint); }
 .mobile-tool-card strong { font-size: 15px; overflow-wrap: anywhere; }
-.mobile-tool-card span { color: var(--app-ink-muted); font-size: 11px; margin-top: 5px; overflow-wrap: anywhere; }
-.mobile-tool-card small { color: var(--app-ink-faint); font-size: 10px; margin-top: 18px; }
+.mobile-tool-card span { color: var(--app-ink-muted); font-size: 12px; margin-top: 5px; overflow-wrap: anywhere; }
+.mobile-tool-card small { color: var(--app-ink-faint); font-size: 12px; margin-top: 18px; }
 .mobile-tool-card small[data-ready='true'] { color: var(--app-success); }
-.mobile-empty { border-radius: 18px; padding: 30px 20px; color: var(--app-ink-muted); font-size: 14px; display: grid; justify-items: center; gap: 15px; text-align: center; }
-.mobile-note { color: var(--app-ink-faint); font-size: 11px; line-height: 1.8; margin-top: 22px; }
+.mobile-empty { border-radius: var(--app-radius-panel); padding: 30px 20px; color: var(--app-ink-muted); font-size: 14px; display: grid; justify-items: center; gap: 15px; text-align: center; }
 .mobile-tool { min-height: 0; display: flex; flex-direction: column; }
 .mobile-tool-bar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; }
 .mobile-tool-bar h1 { margin: 0; font-size: 15px; letter-spacing: 0; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -52,17 +46,17 @@
 /* One surface tree across breakpoints: resizing never remounts plugin frames. */
 .remote-desktop-only, .remote-rail { display: none; }
 .remote-header-actions { display: flex; align-items: center; gap: 20px; }
-.remote-interactions { position: fixed; z-index: 50; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); width: min(420px, calc(100vw - 32px)); max-height: 65dvh; display: flex; flex-direction: column; border-radius: 14px; background: var(--app-page); box-shadow: 0 10px 40px #0003; }
+.remote-interactions { position: fixed; z-index: 50; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); width: min(420px, calc(100vw - 32px)); max-height: 65dvh; display: flex; flex-direction: column; border-radius: var(--app-radius-control); background: var(--app-page); box-shadow: 0 10px 40px #0003; }
 .remote-interactions-heading { display: flex; align-items: center; gap: 10px; text-align: left; padding: 16px; flex-shrink: 0; }
 .remote-interactions-body { overflow-y: auto; padding: 0 16px 16px; font-size: 13px; }
 .remote-interactions-body > p { color: var(--app-ink-muted); line-height: 1.7; }
-.remote-interaction { margin-top: 12px; padding: 14px; border: 1px solid var(--app-glass-line); border-radius: 10px; overflow-wrap: anywhere; }
+.remote-interaction { margin-top: 12px; padding: 14px; border: 1px solid var(--app-glass-line); border-radius: var(--app-radius-control); overflow-wrap: anywhere; }
 .remote-interaction header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .remote-interaction header button { padding: 8px; }
 .remote-interaction label, .remote-interaction small { display: block; }
 .remote-interaction small { color: var(--app-ink-muted); margin: 5px 0; }
 .remote-interaction input { display: block; width: 100%; margin-top: 10px; }
-.remote-file-action { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 8px; color: var(--app-accent-ink); background: var(--app-accent-soft); text-decoration: none; }
+.remote-file-action { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: var(--app-radius-control); color: var(--app-accent-ink); background: var(--app-accent-soft); text-decoration: none; }
 .remote-content { min-width: 0; }
 .remote-card-icon { width: 23px; height: 23px; }
 .remote-plugin-icon { width: 18px; height: 18px; flex-shrink: 0; }
@@ -77,23 +71,23 @@
 
 .mobile-workspace-bar { position: relative; z-index: 30; display: flex; align-items: center; flex-shrink: 0; gap: 4px; min-height: calc(52px + env(safe-area-inset-top)); padding: calc(4px + env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) 4px max(8px, env(safe-area-inset-left)); border-bottom: 1px solid var(--app-glass-line); background: var(--app-page); }
 .mobile-workspace-bar h1 { flex: 1; min-width: 0; font-size: 16px; letter-spacing: 0; margin: 0 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mobile-workspace-bar .mobile-icon { border: 0; border-radius: 10px; background: transparent; }
+.mobile-workspace-bar .mobile-icon { border: 0; border-radius: var(--app-radius-control); background: transparent; }
 .mobile-workspace-bar .mobile-icon:hover, .mobile-workspace-bar .mobile-icon[aria-expanded='true'] { background: var(--app-accent-soft); }
-.mobile-page-select { flex: 1; width: 0; min-width: 0; height: 44px; padding: 0 8px; border: 0; border-radius: 8px; background: var(--app-page); color: var(--app-ink); font: inherit; font-size: 16px; font-weight: 600; text-overflow: ellipsis; }
+.mobile-page-select { flex: 1; width: 0; min-width: 0; height: 44px; padding: 0 8px; border: 0; border-radius: var(--app-radius-control); background: var(--app-page); color: var(--app-ink); font: inherit; font-size: 16px; font-weight: 600; text-overflow: ellipsis; }
 .mobile-workspace-menu { position: relative; flex-shrink: 0; }
-.mobile-workspace-actions { position: absolute; top: calc(100% + 8px); right: 0; width: min(280px, calc(100vw - 32px)); max-height: calc(100dvh - 76px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto; padding: 8px; border-radius: 14px; background: var(--app-page); box-shadow: 0 10px 40px #0003; }
+.mobile-workspace-actions { position: absolute; top: calc(100% + 8px); right: 0; width: min(280px, calc(100vw - 32px)); max-height: calc(100dvh - 76px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto; padding: 8px; border-radius: var(--app-radius-control); background: var(--app-page); box-shadow: 0 10px 40px #0003; }
 .mobile-session-info { padding: 8px 10px 12px; border-bottom: 1px solid var(--app-glass-line); margin-bottom: 4px; font-size: 12px; color: var(--app-ink-muted); }
 .mobile-session-info small { display: block; margin-top: 4px; overflow-wrap: anywhere; color: var(--app-ink-faint); }
-.mobile-workspace-actions button { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 10px; border: 0; border-radius: 8px; background: transparent; color: var(--app-ink); text-align: left; font-size: 13px; }
+.mobile-workspace-actions button { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 10px; border: 0; border-radius: var(--app-radius-control); background: transparent; color: var(--app-ink); text-align: left; font-size: 13px; }
 .mobile-workspace-actions button:hover { background: var(--app-accent-soft); }
 
 @media (max-width: 1023px) {
   .remote-content > .mobile-workspace { padding: 16px max(16px, env(safe-area-inset-right)) 20px max(16px, env(safe-area-inset-left)); }
   .remote-workspace-heading { display: none; }
-  .mobile-search { margin: 0 0 16px; border-radius: 10px; }
+  .mobile-search { margin: 0 0 16px; border-radius: var(--app-radius-control); }
   .mobile-search input { min-height: 44px; }
-  .mobile-tool-card { padding: 14px; border-radius: 14px; }
-  .mobile-tool-glyph { width: 36px; height: 36px; border-radius: 10px; margin-bottom: 12px; }
+  .mobile-tool-card { padding: 14px; border-radius: var(--app-radius-control); }
+  .mobile-tool-glyph { width: 36px; height: 36px; border-radius: var(--app-radius-control); margin-bottom: 12px; }
   .mobile-tool-arrow { right: 12px; top: 14px; }
   .mobile-tool-card span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; line-height: 1.6; }
   .mobile-tool-card small { margin-top: 12px; }
@@ -104,46 +98,41 @@
   .remote-desktop-only { display: flex; }
   .mobile-header { height: 64px; padding: 0 28px; background: var(--app-glass); }
   .mobile-brand { font-size: 15px; }
-  .mobile-brand img { width: 32px; height: 32px; border-radius: 10px; }
-  .mobile-icon { width: 36px; height: 36px; border-radius: 9px; }
-  .remote-session { align-items: center; gap: 8px; font-size: 11px; color: var(--app-ink-faint); }
-  .remote-login-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(380px, 1fr); min-height: calc(100dvh - 64px); max-width: 1440px; margin: 0 auto; }
-  .remote-login-brand { flex-direction: column; justify-content: center; align-items: flex-start; padding: 64px clamp(40px, 5vw, 88px); border-right: 1px dashed var(--app-glass-line); }
-  .remote-login-brand > img { width: 104px; height: 104px; border-radius: 26px; margin-bottom: 38px; border: 1px solid var(--app-glass-line); }
-  .remote-login-brand h1 { max-width: 470px; font-size: clamp(32px, 3vw, 46px); line-height: 1.3; margin: 18px 0 22px; text-wrap: balance; }
-  .remote-login-features { display: flex; flex-wrap: wrap; gap: 20px; margin-top: 42px; font-size: 12px; color: var(--app-ink-muted); }
-  .remote-login-features span { display: flex; align-items: center; gap: 8px; }
+  .mobile-brand img { width: 32px; height: 32px; border-radius: var(--app-radius-control); }
+  .mobile-icon { width: 36px; height: 36px; border-radius: var(--app-radius-control); }
+  .remote-session { align-items: center; gap: 8px; font-size: 12px; color: var(--app-ink-faint); }
+  .remote-login-layout { display: grid; place-items: center; min-height: calc(100dvh - 64px); }
   .mobile-login { align-self: center; width: 100%; max-width: 490px; padding: 48px 36px; }
-  .mobile-connect { margin: 0; border-radius: 16px; padding: 28px; }
+  .mobile-connect { margin: 0; border-radius: var(--app-radius-panel); padding: 28px; }
   .mobile-connect input { font-size: 14px; }
   .remote-workspace { padding-bottom: 0; }
   .remote-rail { display: flex; width: 248px; min-width: 248px; }
   .remote-rail button { font-size: 13px; }
   .remote-host { min-width: 0; flex: 1; padding: 4px; }
   .remote-host > span { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 650; }
-  .remote-host small { display: block; font-size: 11px; color: var(--app-ink-faint); margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .remote-host small { display: block; font-size: 12px; color: var(--app-ink-faint); margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .remote-rail .workspace-rail-action { width: 100%; }
-  .remote-connection { display: flex; align-items: center; gap: 7px; color: var(--app-ink-muted); font-size: 11px; padding: 8px 12px; }
+  .remote-connection { display: flex; align-items: center; gap: 7px; color: var(--app-ink-muted); font-size: 12px; padding: 8px 12px; }
   .remote-connection > span { width: 6px; height: 6px; border-radius: 50%; background: var(--app-warning, #e2aa54); }
   .remote-connection > span[data-connected='true'] { background: var(--app-success); }
   .remote-connection small { margin-left: auto; color: var(--app-ink-faint); }
   .remote-content > .mobile-workspace { max-width: 1400px; padding: 42px clamp(28px, 3vw, 56px); }
   .remote-workspace-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
   .remote-workspace-heading h1 { font-size: 30px; margin: 12px 0 8px; }
-  .remote-tool-count { flex-shrink: 0; font-size: 12px; color: var(--app-ink-muted); border: 1px solid var(--app-glass-line); border-radius: 8px; padding: 8px 12px; }
-  .mobile-search { max-width: 480px; margin: 28px 0 24px; border-radius: 9px; }
+  .remote-tool-count { flex-shrink: 0; font-size: 12px; color: var(--app-ink-muted); border: 1px solid var(--app-glass-line); border-radius: var(--app-radius-control); padding: 8px 12px; }
+  .mobile-search { max-width: 480px; margin: 28px 0 24px; border-radius: var(--app-radius-control); }
   .mobile-search input { min-height: 40px; font-size: 13px; }
   .mobile-tools { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 18px; }
-  .mobile-tool-card { border-radius: 14px; padding: 24px; min-height: 190px; transition: background .15s, border-color .15s; }
+  .mobile-tool-card { border-radius: var(--app-radius-control); padding: 24px; min-height: 190px; transition: background .15s, border-color .15s; }
   .mobile-tool-card:hover { background: var(--app-glass-hover); border-color: var(--app-accent-line); }
   .mobile-tool-card span { font-size: 12px; line-height: 1.8; }
-  .mobile-tool-glyph { border-radius: 11px; }
+  .mobile-tool-glyph { border-radius: var(--app-radius-control); }
   .mobile-tool-card small { margin-top: auto; padding-top: 18px; }
   .mobile-tool-bar { min-height: 58px; padding: 10px 24px; border-bottom: 1px solid var(--app-glass-line); }
   .mobile-tool-bar h1 { font-size: 14px; }
   .mobile-tool-bar > span { display: block; color: var(--app-ink-faint); font-size: 12px; }
   .remote-page-tabs { flex-shrink: 0; min-height: 44px; gap: 6px; padding: 6px 24px; overflow-x: auto; border-bottom: 1px solid var(--app-glass-line); background: var(--app-glass); }
-  .remote-page-tabs button { flex-shrink: 0; border: 1px solid transparent; border-radius: 7px; padding: 6px 14px; color: var(--app-ink-muted); background: transparent; font-size: 12px; }
+  .remote-page-tabs button { flex-shrink: 0; border: 1px solid transparent; border-radius: var(--app-radius-control); padding: 6px 14px; color: var(--app-ink-muted); background: transparent; font-size: 12px; }
   .remote-page-tabs button:hover { background: var(--app-glass-hover); color: var(--app-ink); }
   .remote-page-tabs button[aria-current] { color: var(--app-accent-ink); background: var(--app-accent-soft); border-color: var(--app-accent-line); }
 }

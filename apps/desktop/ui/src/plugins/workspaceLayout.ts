@@ -1,39 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
+import { emptyWorkspaceLayout, MAX_OPEN_ACTIVITY_SURFACES, reduceWorkspaceLayout, type WorkspaceAction, type WorkspaceLayoutState } from './workspaceActions.ts'
+export { MAX_OPEN_ACTIVITY_SURFACES, type WorkspaceLayoutState } from './workspaceActions.ts'
 
 const STORAGE_KEY = 'wonderland.workspace.layout.v1'
 const CHANGE_EVENT = 'wonderland:workspace-layout-change'
-export const MAX_OPEN_ACTIVITY_SURFACES = 8
-
-export interface WorkspaceLayoutState {
-  version: 1
-  collapsed: boolean
-  pinnedIds: string[]
-  hiddenIds: string[]
-  /** Ordering for the pinned workspace rail. */
-  orderIds: string[]
-  /** Independent, freely arranged order for cards in All Activities. */
-  activityOrderIds: string[]
-  openContributionIds: string[]
-  activeContributionId: string | null
-  activeSidebarContributionId: string | null
-}
-
-const EMPTY_LAYOUT: WorkspaceLayoutState = {
-  version: 1,
-  collapsed: false,
-  pinnedIds: [],
-  hiddenIds: [],
-  orderIds: [],
-  activityOrderIds: [],
-  openContributionIds: [],
-  activeContributionId: null,
-  activeSidebarContributionId: null,
-}
 
 export function readWorkspaceLayout(): WorkspaceLayoutState {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
-    if (!isRecord(value) || value.version !== 1) return { ...EMPTY_LAYOUT }
+    if (!isRecord(value) || value.version !== 1) return emptyWorkspaceLayout()
     return {
       version: 1,
       collapsed: value.collapsed === true,
@@ -52,7 +27,7 @@ export function readWorkspaceLayout(): WorkspaceLayoutState {
         : null,
     }
   } catch {
-    return { ...EMPTY_LAYOUT }
+    return emptyWorkspaceLayout()
   }
 }
 
@@ -65,17 +40,17 @@ export function writeWorkspaceLayout(layout: WorkspaceLayoutState) {
 }
 
 export function rememberOpenContribution(id: string) {
-  const current = readWorkspaceLayout()
-  writeWorkspaceLayout({
-    ...current,
-    openContributionIds: [...current.openContributionIds.filter((item) => item !== id), id].slice(-MAX_OPEN_ACTIVITY_SURFACES),
-    activeContributionId: id,
-  })
+  applyWorkspaceAction({ type: 'openActivity', id })
 }
 
 export function setActiveSidebarContribution(id: string | null) {
-  const current = readWorkspaceLayout()
-  writeWorkspaceLayout({ ...current, activeSidebarContributionId: id })
+  applyWorkspaceAction({ type: 'sidebar', id })
+}
+
+export function applyWorkspaceAction(action: WorkspaceAction): WorkspaceLayoutState {
+  const next = normalizeLayout(reduceWorkspaceLayout(readWorkspaceLayout(), action))
+  writeWorkspaceLayout(next)
+  return next
 }
 
 export function useWorkspaceLayout() {
@@ -97,54 +72,26 @@ export function useWorkspaceLayout() {
     setLayout(next)
   }, [])
 
-  const toggleCollapsed = useCallback(() => {
-    update((current) => ({ ...current, collapsed: !current.collapsed }))
-  }, [update])
+  const dispatch = useCallback((action: WorkspaceAction) => update((current) => reduceWorkspaceLayout(current, action)), [update])
+  const toggleCollapsed = useCallback(() => dispatch({ type: 'collapse' }), [dispatch])
 
   const togglePinned = useCallback((id: string) => {
-    update((current) => {
-      const pinned = current.pinnedIds.includes(id)
-      return {
-        ...current,
-        pinnedIds: pinned ? current.pinnedIds.filter((item) => item !== id) : [...current.pinnedIds, id],
-        hiddenIds: pinned ? current.hiddenIds : current.hiddenIds.filter((item) => item !== id),
-        orderIds: current.orderIds.includes(id) ? current.orderIds : [...current.orderIds, id],
-      }
-    })
-  }, [update])
+    dispatch({ type: 'pin', id })
+  }, [dispatch])
 
   const toggleHidden = useCallback((id: string) => {
-    update((current) => {
-      const hidden = current.hiddenIds.includes(id)
-      return {
-        ...current,
-        hiddenIds: hidden ? current.hiddenIds.filter((item) => item !== id) : [...current.hiddenIds, id],
-        pinnedIds: hidden ? current.pinnedIds : current.pinnedIds.filter((item) => item !== id),
-      }
-    })
-  }, [update])
+    dispatch({ type: 'hide', id })
+  }, [dispatch])
 
   const move = useCallback((id: string, direction: -1 | 1) => {
-    update((current) => {
-      const ordered = unique([...current.orderIds, ...current.pinnedIds])
-      const index = ordered.indexOf(id)
-      const target = index + direction
-      if (index < 0 || target < 0 || target >= ordered.length) return current
-      ;[ordered[index], ordered[target]] = [ordered[target], ordered[index]]
-      return { ...current, orderIds: ordered }
-    })
-  }, [update])
+    dispatch({ type: 'move', id, direction })
+  }, [dispatch])
 
   const reorderActivities = useCallback((orderedIds: readonly string[]) => {
-    update((current) => {
-      const ordered = unique(orderedIds)
-      const orderedSet = new Set(ordered)
-      const retained = current.activityOrderIds.filter((id) => !orderedSet.has(id))
-      return { ...current, activityOrderIds: [...ordered, ...retained] }
-    })
-  }, [update])
+    dispatch({ type: 'reorderActivities', ids: orderedIds })
+  }, [dispatch])
 
-  const reset = useCallback(() => update(() => ({ ...EMPTY_LAYOUT })), [update])
+  const reset = useCallback(() => dispatch({ type: 'reset' }), [dispatch])
 
   return { layout, toggleCollapsed, togglePinned, toggleHidden, move, reorderActivities, reset, update }
 }

@@ -1,3 +1,4 @@
+import { PluginInstallController } from '../components/PluginInstallController'
 import { Outlet } from 'react-router-dom'
 
 import { TitleBar } from '../components/TitleBar'
@@ -16,6 +17,7 @@ export function AppLayout() {
       </div>
       <CliUiBridge />
       <TrayNavigationController />
+      <PluginInstallController />
     </div>
   )
 }

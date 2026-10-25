@@ -5,13 +5,8 @@
       "name": "Core：运行桌面应用",
       "type": "node-terminal",
       "request": "launch",
-      "command": "pnpm --filter @wonderland/desktop run dev",
-      "cwd": "${workspaceFolder}",
-      "env": {
-        "CARGO_HOME": "${workspaceFolder}\\.cargo-home",
-        "RUSTUP_HOME": "${workspaceFolder}\\.cargo-home\\rustup",
-        "npm_config_cache": "${workspaceFolder}\\.npm-cache"
-      }
+      "command": "pnpm run dev",
+      "cwd": "${workspaceFolder}"
     },
     {
       "name": "Core：调试 Rust 宿主（LLDB）",
@@ -21,14 +16,21 @@
         "args": ["build", "--locked", "--package=wonderland-desktop", "--bin=wonderland-desktop"],
         "filter": { "name": "wonderland-desktop", "kind": "bin" }
       },
-      "cwd": "${workspaceFolder}/apps/desktop/src-tauri",
-      "env": {
-        "CARGO_HOME": "${workspaceFolder}\\.cargo-home",
-        "RUSTUP_HOME": "${workspaceFolder}\\.cargo-home\\rustup",
-        "npm_config_cache": "${workspaceFolder}\\.npm-cache"
-      },
+      "cwd": "${workspaceFolder}",
       "sourceLanguages": ["rust"],
-      "preLaunchTask": "prepare: Core Rust 调试"
+      "preLaunchTask": "Core: dev:ui"
+    },
+    {
+      "name": "Core：调试 CLI（LLDB）",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--locked", "--package=wonderland-desktop", "--bin=wla"],
+        "filter": { "name": "wla", "kind": "bin" }
+      },
+      "args": ["core", "status"],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["rust"]
     }
   ]
 }

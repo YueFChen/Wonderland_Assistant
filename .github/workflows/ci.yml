@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,7 +14,7 @@ permissions:
 
 jobs:
   frontend:
-    name: Frontend（typecheck / build）
+    name: Frontend（typecheck / test / build）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,10 +24,10 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: node --check scripts/create-plugin.mjs
+      - run: node scripts/check-core-release.mjs --status
       - run: pnpm install --frozen-lockfile
-      - run: pnpm -r run typecheck
-      - run: pnpm -r run test
-      - run: pnpm --filter @wonderland/desktop-ui run build
+      - run: pnpm run check:docs
+      - run: pnpm run check:frontend
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-ui-dist
@@ -48,7 +49,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - run: cargo run --locked -p wonderland-kernel --example generate_bindings --features bindings -- --check
+      - name: Build direct-call fixture and verify actual plugin processes
+        run: |
+          cargo build --manifest-path tests/fixtures/direct-plugin/Cargo.toml --locked
+          cargo test -p wonderland-desktop plugin_manager:: --lib --locked -- --ignored --test-threads=1
+          cargo test -p wonderland-desktop web_access::tests::cold_remote --lib --locked -- --ignored --test-threads=1
+      - run: cargo run --locked -p wonderland-kernel --example generate_core_bindings --features bindings -- --check
       - run: cargo run --locked -p wonderland-plugin-protocol --example generate_bindings --features bindings -- --check
       - run: cargo build --workspace --locked
       - uses: pnpm/action-setup@v4
@@ -57,7 +63,9 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @wonderland/desktop exec tauri build --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.ci.conf.json
+      - run: pnpm run build:ci
+      - name: Verify Windows author vault with the built native key helper
+        run: pnpm --filter @wonderland/plugin-tools test
       - name: Verify Windows Core bundle
         shell: pwsh
         run: |
@@ -100,9 +108,22 @@ jobs:
         run: |
           $msiInstallers = @(Get-ChildItem -Path 'target/release/bundle/msi' -Filter '*.msi' -File)
           if ($msiInstallers.Count -eq 0) { throw 'MSI installer missing from target/release/bundle/msi' }
-          # The earlier NSIS smoke test writes its install path here; clear that CI-created search value so this MSI test uses its own isolated target.
-          $nsisInstallRegistryKey = 'HKCU:\Software\Yuef Chen\Wonderland Assistant'
-          if (Test-Path -LiteralPath $nsisInstallRegistryKey) { Remove-Item -LiteralPath $nsisInstallRegistryKey -Recurse -Force }
+          # MSI deliberately discovers an existing NSIS directory. Remove only the default
+          # value written by this CI run, using the same publisher as the generated installers.
+          $appConfig = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $nsisInstallRegistryKey = "HKCU:\Software\$($appConfig.bundle.publisher)\$($appConfig.productName)"
+          if (Test-Path -LiteralPath $nsisInstallRegistryKey) {
+            $registryKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\$($appConfig.bundle.publisher)\$($appConfig.productName)", $true)
+            try {
+              $previous = [string]$registryKey.GetValue('')
+              $expected = Join-Path $env:TEMP "WonderlandAssistant-InstallCheck-$env:GITHUB_RUN_ID"
+              if ($previous -and [System.IO.Path]::GetFullPath($previous).TrimEnd('\') -ne [System.IO.Path]::GetFullPath($expected).TrimEnd('\')) {
+                throw 'Refusing to clear an install path not created by this CI run.'
+              }
+              $registryKey.DeleteValue('', $false)
+            }
+            finally { $registryKey.Dispose() }
+          }
           $installRoot = Join-Path $env:TEMP "WonderlandAssistant-MsiCheck-$env:GITHUB_RUN_ID"
           $profile = Join-Path $env:TEMP "WonderlandAssistant-MsiCliCheck-$env:GITHUB_RUN_ID"
           $appVersion = (Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version

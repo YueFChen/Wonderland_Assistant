@@ -6,11 +6,9 @@ use wonderland_kernel::KernelError;
 use wonderland_kernel::logging::LogLevel;
 
 /// 第一方 crate 清单，值即 target 的 crate 根模块名。
-pub const FIRST_PARTY_TARGETS: [&str; 9] = [
+pub const FIRST_PARTY_TARGETS: [&str; 7] = [
     "wonderland_kernel",
-    "wonderland_account",
     "wonderland_config",
-    "wonderland_mihoyo",
     "wonderland_net",
     "wonderland_logging",
     "wonderland_desktop",

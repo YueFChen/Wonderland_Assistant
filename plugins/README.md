@@ -19,3 +19,29 @@ pnpm run create:plugin -- --id my_plugin --name "我的插件" --author "作者�
 ```powershell
 pnpm --dir .\plugins\my_plugin run debug
 ```
+
+## 本地维护范围
+
+当前维护评论采集器、分发管理、奇域监测、知识库、我的奇域、富文本编辑器、插件模板、翻译工作台和网站收藏。各仓库的 README 说明自身业务、数据位置和检查命令；构建与检查从对应插件目录执行。
+
+日常修改沿用清单中的开发版本，覆盖安装保留 pluginId 对应的数据与密钥。正式在线版本的内容不可覆盖；作者构建完整签名包，分发管理端只验签和发布。Core 根仓库的提交不包含这些独立仓库的修改。
+
+## UI 组件规范
+
+插件页面跟随 Core 的主题与容器宽度，复用语义色、控件尺寸、边框、圆角及动效，不重复绘制宿主页头、品牌或背景。业务预览中的自选颜色和图片由插件保留。
+
+- 普通 CSS 入口导入 `@wonderland/ui/plugin.css`；Tailwind 页面使用 `@wonderland/ui/theme.css`。
+- 设置、编辑与辅助资料使用 `@wonderland/ui` 的 `Drawer` 非模态侧栏：主页面可继续操作，不放全屏遮罩，统一标题、正文滚动、底部提交和关闭后的焦点。内容留在插件 iframe 内，不穿透宿主 DOM；已注册为 Core View 的独立页面继续使用宿主侧栏。
+- 删除、替换、稳定推广和身份变化等确认使用 `Dialog` 与 `DialogButton`。提交期间禁止重复操作与退出；不把关键后果藏进 hint、折叠说明或 hover。色板等锚定小浮层继续就地呈现。
+- Vite 的 `resolve.dedupe` 包含 `react` 和 `react-dom`，确保独立插件与链接的共享 UI 包使用同一运行时。
+- 默认文案保留操作、状态、错误及实际后果；使用说明放入文档，避免常驻重复的副标题和脚注。
+
+## 插件图标
+
+`manifest.json` 与 UI contribution 的 `icon` 字段继续接受旧版内置 Lucide 名称（如 `languages`）。也可以引用插件包内图标，例如：
+
+```json
+"icon": "asset:ui/icons/brand.svg"
+```
+
+自定义图标文件放在 `ui/icons/` 下，支持 SVG、PNG 和 WebP，单个文件上限为 512 KiB。该路径只指向已安装插件包内资源；Core 不加载远程图标 URL。资源缺失、读取失败或图标值无效时会回退到通用拼图图标，不影响插件加载。

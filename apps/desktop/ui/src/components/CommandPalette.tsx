@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Search, X } from 'lucide-react'
+import { Search } from 'lucide-react'
+import { Dialog } from '@wonderland/ui'
 import { PluginIcon } from '../plugins/icons'
 import type { WorkspaceContribution } from '../plugins/contributions'
 import { t } from '../i18n'
@@ -21,15 +22,6 @@ export function CommandPalette({ open, contributions, onClose, onSelect }: Props
     input.current?.focus()
   }, [open])
 
-  useEffect(() => {
-    if (!open) return
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [open, onClose])
-
   const filtered = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase()
     if (!needle) return contributions
@@ -40,31 +32,7 @@ export function CommandPalette({ open, contributions, onClose, onSelect }: Props
     )
   }, [contributions, query])
 
-  if (!open) return null
-
-  return (
-    <div className="fixed inset-0 z-[80] flex items-start justify-center bg-black/40 px-5 pt-[12vh] backdrop-blur-sm" onMouseDown={onClose}>
-      <section
-        role="dialog"
-        aria-modal="true"
-        aria-label={t('workspace.commandPalette')}
-        className="glass-card w-full max-w-2xl overflow-hidden rounded-2xl border border-glass-line shadow-2xl"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <label className="flex items-center gap-3 border-b border-glass-line px-5 py-4">
-          <Search className="h-5 w-5 shrink-0 text-ink-muted" aria-hidden />
-          <input
-            ref={input}
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder={t('workspace.searchPlaceholder')}
-            className="min-w-0 flex-1 bg-transparent text-base text-ink outline-none placeholder:text-ink-faint"
-          />
-          <button type="button" onClick={onClose} className="rounded-md p-1 text-ink-muted hover:bg-glass-hover" aria-label={t('common.cancel')}>
-            <X className="h-4 w-4" aria-hidden />
-          </button>
-        </label>
-        <div className="max-h-[55vh] overflow-y-auto p-2">
+  return <Dialog open={open} title={t('workspace.commandPalette')} size="lg" placement="top" closeLabel={t('common.close')} initialFocus={input} onClose={onClose} bodyClassName="command-palette-body" headerContent={<label className="app-search-field flex min-h-9 items-center gap-3"><Search className="h-4 w-4 shrink-0 text-ink-muted" aria-hidden /><input ref={input} value={query} onChange={event => setQuery(event.target.value)} placeholder={t('workspace.searchPlaceholder')} aria-label={t('workspace.commandPalette')} className="min-w-0 flex-1 bg-transparent text-sm text-ink outline-none placeholder:text-ink-faint" /></label>}>
           {filtered.length === 0 ? (
             <p className="px-4 py-8 text-center text-sm text-ink-muted">{t('workspace.noSearchResults')}</p>
           ) : filtered.map((contribution) => {
@@ -80,17 +48,11 @@ export function CommandPalette({ open, contributions, onClose, onSelect }: Props
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-sm font-semibold text-ink">{contribution.title}</span>
-                  <span className="block truncate text-xs text-ink-faint">{contribution.state.manifest.name} · {contribution.id}</span>
+                  {contribution.state.manifest.name !== contribution.title && <span className="block truncate text-xs text-ink-faint">{contribution.state.manifest.name}</span>}
                 </span>
-                <span className="shrink-0 text-xs text-ink-muted">{t(`workspace.contributionStatus.${contribution.status}`)}</span>
+                {contribution.status !== 'ready' && <span className="shrink-0 text-xs text-ink-muted">{t(`workspace.contributionStatus.${contribution.status}`)}</span>}
               </button>
             )
           })}
-        </div>
-        <footer className="border-t border-glass-line px-5 py-2 text-[11px] text-ink-faint">
-          Ctrl+Shift+P · Esc
-        </footer>
-      </section>
-    </div>
-  )
+  </Dialog>
 }

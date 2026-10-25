@@ -16,17 +16,28 @@ fn main() {
         serde_json::to_string(UI_BRIDGE_VERSION).unwrap()
     ));
     output.push_str(&format!(
-        "export const IMPLICIT_CAPABILITIES = {} as const\n",
-        serde_json::to_string(IMPLICIT_CAPABILITIES).unwrap()
+        "export const MANIFEST_VERSION = {} as const\n",
+        MANIFEST_VERSION
     ));
     macro_rules! emit {
         ($($ty:ty),* $(,)?) => { $(output.push_str("export "); output.push_str(&<$ty>::decl(&cfg)); output.push('\n');)* };
     }
     emit!(
         PluginManifest,
-        PluginService,
-        PluginServiceRequirement,
-        PluginServiceResolution,
+        PluginDependency,
+        PluginCallParams,
+        ByteStream,
+        StreamChunk,
+        HttpHeader,
+        HttpBody,
+        SecretHeader,
+        HttpRedirects,
+        HttpRequestParams,
+        HttpResponseMeta,
+        FileWriteMode,
+        LocalFileState,
+        RemoteFileState,
+        FileResult,
         HostCompatibility,
         ProtocolCompatibility,
         PluginPlatform,
@@ -36,10 +47,17 @@ fn main() {
         PluginUiCommand,
         PluginUiCommandEffect,
         PluginBackend,
+        PluginActivationPolicy,
+        BackgroundRestoreState,
+        PluginLifecycleState,
+        BackgroundRestoreParams,
+        ActivityBeginParams,
+        ActivityHandle,
         InstallationState,
         RuntimeState,
         PluginFailure,
         PluginInstallSource,
+        PluginSignatureState,
         PluginScanDiagnostic,
         PluginRuntimeState,
         PluginError,

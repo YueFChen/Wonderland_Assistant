@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -30,6 +30,87 @@ pub(crate) struct InspectedPlugin {
     pub contract_sha256: String,
     pub compatible: bool,
     pub directory: PathBuf,
+    pub signature_public_key: Option<String>,
+}
+
+/// Retain the previous bytes until the manager commits preferences and activation.
+pub(crate) struct PackageCommit {
+    installed_root: PathBuf,
+    destination: PathBuf,
+    backup: Option<PathBuf>,
+    recovery: Option<crate::plugin_install_recovery::InstallRecovery>,
+    activated: bool,
+    backup_moved: bool,
+    finished: bool,
+}
+
+impl PackageCommit {
+    pub(crate) fn rollback(&mut self) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        if let Some(recovery) = &self.recovery {
+            recovery.rollback()?;
+            self.finished = true;
+            return Ok(());
+        }
+        if self.activated && self.destination.exists() {
+            ensure_real_directory(&self.destination)?;
+            self.check_target(&self.destination)?;
+            fs::remove_dir_all(&self.destination)
+                .map_err(|error| format!("Cannot remove uncommitted plugin: {error}"))?;
+        }
+        if self.backup_moved
+            && let Some(backup) = &self.backup
+        {
+            self.check_target(backup)?;
+            fs::rename(backup, &self.destination)
+                .map_err(|error| format!("Cannot restore retained plugin package: {error}"))?;
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<(), String> {
+        if let Some(recovery) = self.recovery.as_mut() {
+            recovery.commit()?;
+            self.finished = true;
+            if let Err(error) = recovery.cleanup() {
+                warn!(reason = %error, "Committed installation cleanup will be retried on startup");
+            }
+            return Ok(());
+        }
+        self.finished = true;
+        if let Some(backup) = self.backup.take() {
+            let cleanup = self
+                .check_target(&backup)
+                .and_then(|()| fs::remove_dir_all(&backup).map_err(|error| error.to_string()));
+            if let Err(error) = cleanup {
+                warn!(path = %backup.display(), reason = %error, "Retained plugin backup needs cleanup");
+            }
+        }
+        Ok(())
+    }
+
+    fn check_target(&self, target: &Path) -> Result<(), String> {
+        let root = self
+            .installed_root
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let target = target.canonicalize().map_err(|error| error.to_string())?;
+        if target == root || !target.starts_with(root) {
+            return Err("Package recovery path escaped the installation root.".into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PackageCommit {
+    fn drop(&mut self) {
+        if let Err(error) = self.rollback() {
+            warn!(path = %self.destination.display(), reason = %error, "Plugin package rollback needs recovery; retained bytes were not discarded");
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -64,18 +145,19 @@ pub(crate) fn inspect_directory(
 
     let manifest_path = directory.join("manifest.json");
     let manifest_bytes = read_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
-    let manifest: PluginManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| format!("manifest.json is invalid: {error}"))?;
-    validate_manifest(&manifest)?;
+    let manifest = decode_installed_manifest(&manifest_bytes)?;
+    if manifest.manifest_version == 3 {
+        validate_manifest(&manifest)?;
+    }
 
     let contract_path = safe_join(directory, &manifest.contract)?;
     let contract_bytes = read_bounded(&contract_path, MAX_CONTRACT_BYTES)?;
     let contract: Value = serde_json::from_slice(&contract_bytes)
         .map_err(|error| format!("contract.json is invalid: {error}"))?;
     validate_contract(&contract)?;
-    validate_provided_service_methods(&manifest, &contract)?;
 
     verify_package_checksums(directory, allow_missing_checksums)?;
+    let signature_public_key = directory_signature(directory)?;
     let contract_sha256 = digest_hex(&contract_bytes);
     Ok(InspectedPlugin {
         compatible: is_compatible(&manifest),
@@ -83,6 +165,7 @@ pub(crate) fn inspect_directory(
         contract,
         contract_sha256,
         directory: directory.to_owned(),
+        signature_public_key,
     })
 }
 
@@ -118,7 +201,8 @@ pub(crate) fn install_archive(
     installed_root: &Path,
     overwrite: bool,
     reviewed_manifest: &PluginManifest,
-) -> Result<InspectedPlugin, String> {
+    recovery_config: Option<&Path>,
+) -> Result<(InspectedPlugin, PackageCommit), String> {
     let plugin_id = reviewed_manifest.id.as_str();
     let version = reviewed_manifest.version.as_str();
     let staging = run_install_stage(install_id, plugin_id, version, "staging_prepare", || {
@@ -135,17 +219,24 @@ pub(crate) fn install_archive(
         run_install_stage(install_id, plugin_id, version, "manifest_review", || {
             ensure_reviewed_manifest(reviewed_manifest, &inspected.manifest)
         })?;
-        run_install_stage(install_id, plugin_id, version, "atomic_commit", || {
-            commit_staging(&staging, installed_root, &inspected.manifest, overwrite)
+        let commit = run_install_stage(install_id, plugin_id, version, "atomic_commit", || {
+            commit_staging(
+                &staging,
+                installed_root,
+                &inspected.manifest,
+                overwrite,
+                recovery_config,
+            )
         })?;
         let destination = install_path(installed_root, &inspected.manifest);
-        run_install_stage(
+        let installed = run_install_stage(
             install_id,
             plugin_id,
             version,
             "installed_validation",
             || inspect_directory(&destination, false),
-        )
+        )?;
+        Ok((installed, commit))
     })();
     if result.is_err()
         && let Err(error) = fs::remove_dir_all(&staging)
@@ -168,7 +259,8 @@ pub(crate) fn install_development_directory(
     installed_root: &Path,
     overwrite: bool,
     reviewed_manifest: &PluginManifest,
-) -> Result<InspectedPlugin, String> {
+    recovery_config: Option<&Path>,
+) -> Result<(InspectedPlugin, PackageCommit), String> {
     if !cfg!(debug_assertions) {
         return Err("Development-directory installation is disabled in release builds.".to_owned());
     }
@@ -191,17 +283,24 @@ pub(crate) fn install_development_directory(
         run_install_stage(install_id, plugin_id, version, "manifest_review", || {
             ensure_reviewed_manifest(reviewed_manifest, &inspected.manifest)
         })?;
-        run_install_stage(install_id, plugin_id, version, "atomic_commit", || {
-            commit_staging(&staging, installed_root, &inspected.manifest, overwrite)
+        let commit = run_install_stage(install_id, plugin_id, version, "atomic_commit", || {
+            commit_staging(
+                &staging,
+                installed_root,
+                &inspected.manifest,
+                overwrite,
+                recovery_config,
+            )
         })?;
         let destination = install_path(installed_root, &inspected.manifest);
-        run_install_stage(
+        let installed = run_install_stage(
             install_id,
             plugin_id,
             version,
             "installed_validation",
             || inspect_directory(&destination, true),
-        )
+        )?;
+        Ok((installed, commit))
     })();
     if result.is_err()
         && let Err(error) = fs::remove_dir_all(&staging)
@@ -371,6 +470,11 @@ pub(crate) fn scan_installed_plugin(
     id: &str,
     active_version: Option<&str>,
 ) -> Result<InspectedPlugin, ScanFailure> {
+    ensure_real_directory(&root.join(id))
+        .map_err(|message| scan_failure(id, "plugin_directory", message))?;
+    if crate::plugin_install_recovery::InstallRecovery::requires_recovery(root, id) {
+        return Err(ScanFailure { plugin_id: id.into(), code: "INSTALL_RECOVERY_REQUIRED", phase: "installation_recovery", message: "An interrupted installation needs recovery. Original packages and data have been retained.".into(), retryable: false });
+    }
     let plugin_path = root.join(id);
     ensure_real_directory(&plugin_path)
         .map_err(|message| scan_failure(id, "plugin_directory", message))?;
@@ -489,42 +593,59 @@ fn commit_staging(
     installed_root: &Path,
     manifest: &PluginManifest,
     overwrite: bool,
-) -> Result<(), String> {
+    recovery_config: Option<&Path>,
+) -> Result<PackageCommit, String> {
     let parent = installed_root.join(&manifest.id);
     fs::create_dir_all(&parent)
         .map_err(|error| format!("Cannot create plugin version directory: {error}"))?;
     ensure_real_directory(&parent)?;
     let destination = install_path(installed_root, manifest);
-    if destination.exists() {
-        if !overwrite {
-            return Err(format!(
-                "Plugin {} version {} is already installed.",
-                manifest.id, manifest.version
-            ));
-        }
+    let existed = destination.exists();
+    if existed && !overwrite {
+        return Err(format!(
+            "Plugin {} version {} is already installed.",
+            manifest.id, manifest.version
+        ));
+    }
+    if existed {
         ensure_real_directory(&destination)?;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let backup = parent.join(format!(".backup-{nonce:x}"));
-        fs::rename(&destination, &backup).map_err(|error| {
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let backup = existed.then(|| parent.join(format!(".backup-{nonce:x}")));
+    let recovery = recovery_config
+        .map(|config| {
+            crate::plugin_install_recovery::InstallRecovery::prepare(
+                installed_root,
+                config,
+                &manifest.id,
+                &manifest.version,
+                format!("{nonce:x}"),
+                existed.then(|| format!(".backup-{nonce:x}")),
+            )
+        })
+        .transpose()?;
+    let mut commit = PackageCommit {
+        installed_root: installed_root.into(),
+        destination: destination.clone(),
+        backup: backup.clone(),
+        recovery,
+        activated: false,
+        backup_moved: false,
+        finished: false,
+    };
+    if let Some(backup) = &backup {
+        fs::rename(&destination, backup).map_err(|error| {
             format!("Cannot stage the existing plugin for replacement: {error}")
         })?;
-        if let Err(error) = fs::rename(staging, &destination) {
-            let rollback = fs::rename(&backup, &destination);
-            return Err(match rollback {
-                Ok(()) => format!("Cannot activate replacement plugin: {error}"),
-                Err(rollback_error) => format!(
-                    "Cannot activate replacement plugin: {error}; restoring the original failed: {rollback_error}"
-                ),
-            });
-        }
-        let _ = fs::remove_dir_all(backup);
-        return Ok(());
+        commit.backup_moved = true;
     }
     fs::rename(staging, &destination)
-        .map_err(|error| format!("Cannot activate staged plugin package: {error}"))
+        .map_err(|error| format!("Cannot activate staged plugin package: {error}"))?;
+    commit.activated = true;
+    Ok(commit)
 }
 
 fn extract_archive(source: &Path, destination: &Path) -> Result<(), String> {
@@ -541,7 +662,10 @@ fn extract_archive(source: &Path, destination: &Path) -> Result<(), String> {
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("Cannot read plugin package entry: {error}"))?;
-        let raw_name = entry.name().to_owned();
+        let raw_name = entry
+            .name()
+            .map_err(|error| format!("Plugin package entry has an invalid name: {error}"))?
+            .into_owned();
         if raw_name.contains('\\') || raw_name.contains(':') || raw_name.starts_with('/') {
             return Err("Plugin package contains a non-portable path.".to_owned());
         }
@@ -671,10 +795,53 @@ fn copy_package_tree(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn directory_signature(directory: &Path) -> Result<Option<String>, String> {
+    let signature = directory.join("signature.json");
+    if !signature.exists() {
+        return Ok(None);
+    }
+    let checksums = read_bounded(&directory.join("checksums.json"), 4 * 1024 * 1024)?;
+    let bytes = read_bounded(&signature, 4096)?;
+    wonderland_plugin_signing::verify(&checksums, &bytes).map(|verified| Some(verified.public_key))
+}
+
+pub(crate) fn signature_for_install_source(source: &Path) -> Result<Option<String>, String> {
+    if source.is_dir() {
+        return directory_signature(source);
+    }
+    let mut archive =
+        ZipArchive::new(File::open(source).map_err(|_| "Cannot open package signature")?)
+            .map_err(|_| "Cannot inspect package signature")?;
+    if archive.index_for_name("signature.json").is_none() {
+        return Ok(None);
+    }
+    let mut read = |name: &str, limit: u64| -> Result<Vec<u8>, String> {
+        let entry = archive
+            .by_name(name)
+            .map_err(|_| "INVALID_PACKAGE_SIGNATURE: missing content metadata")?;
+        if entry.size() > limit {
+            return Err("INVALID_PACKAGE_SIGNATURE: metadata too large".into());
+        }
+        let mut bytes = Vec::new();
+        entry
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "INVALID_PACKAGE_SIGNATURE: cannot read metadata")?;
+        if bytes.len() as u64 > limit {
+            return Err("INVALID_PACKAGE_SIGNATURE: metadata too large".into());
+        }
+        Ok(bytes)
+    };
+    let checksums = read("checksums.json", 4 * 1024 * 1024)?;
+    let signature = read("signature.json", 4096)?;
+    wonderland_plugin_signing::verify(&checksums, &signature)
+        .map(|verified| Some(verified.public_key))
+}
+
 fn verify_package_checksums(directory: &Path, allow_missing_checksums: bool) -> Result<(), String> {
     let checksums_path = directory.join("checksums.json");
     let checksums_exists = checksums_path.is_file();
-    if !checksums_exists && allow_missing_checksums {
+    if !checksums_exists && allow_missing_checksums && !directory.join("signature.json").exists() {
         return Ok(());
     }
     if !checksums_exists {
@@ -708,6 +875,7 @@ fn verify_package_checksums(directory: &Path, allow_missing_checksums: bool) -> 
 
     let mut actual = list_package_files(directory)?;
     actual.remove("checksums.json");
+    actual.remove("signature.json");
     let expected: BTreeSet<String> = listed.keys().cloned().collect();
     if actual != expected {
         return Err("Checksum path set does not match the package contents.".to_owned());
@@ -735,7 +903,13 @@ fn validate_tree(directory: &Path) -> Result<(), String> {
             ));
         }
         if !relative.contains('/')
-            && !["manifest.json", "contract.json", "checksums.json"].contains(&relative.as_str())
+            && ![
+                "manifest.json",
+                "contract.json",
+                "checksums.json",
+                "signature.json",
+            ]
+            .contains(&relative.as_str())
         {
             return Err("Plugin package contains an unsupported root file.".to_owned());
         }
@@ -764,8 +938,9 @@ fn validate_tree(directory: &Path) -> Result<(), String> {
         }
     }
     let manifest_bytes = read_bounded(&directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
-    let manifest: PluginManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| format!("manifest.json is invalid: {error}"))?;
+    // Tree inspection also runs before installed-package compatibility is known.
+    // Identify old metadata without requiring the current executable API shape.
+    let manifest = decode_installed_manifest(&manifest_bytes)?;
     if manifest.ui.is_none() && files.iter().any(|path| path.starts_with("ui/")) {
         return Err("A service-only plugin package must not include UI assets.".to_owned());
     }
@@ -831,7 +1006,7 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
     if manifest.remote_access == Some(true) && !manifest.supports_remote_access() {
         return Err("Remote access requires backend.supportsServiceContext to be true.".into());
     }
-    if manifest.manifest_version != 2 {
+    if manifest.manifest_version != 3 {
         return Err("Unsupported plugin manifest version.".to_owned());
     }
     if !valid_plugin_id(&manifest.id) {
@@ -844,6 +1019,30 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
         && description.chars().count() > 500
     {
         return Err("Plugin description is too long.".to_owned());
+    }
+    for (field, value, limit) in [
+        ("author", &manifest.author, 120),
+        ("license", &manifest.license, 256),
+    ] {
+        if let Some(value) = value
+            && (value.trim().is_empty()
+                || value.chars().count() > limit
+                || value.chars().any(char::is_control))
+        {
+            return Err(format!("Plugin {field} is invalid."));
+        }
+    }
+    if let Some(homepage) = &manifest.homepage {
+        let url = tauri::Url::parse(homepage).map_err(|_| "Plugin homepage is invalid.")?;
+        if homepage.len() > 2048
+            || !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || homepage.chars().any(char::is_control)
+        {
+            return Err("Plugin homepage must be an HTTP(S) URL without credentials.".into());
+        }
     }
     Version::parse(&manifest.version)
         .map_err(|_| "Plugin version is not valid semantic versioning.".to_owned())?;
@@ -870,7 +1069,7 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
 
     if let Some(ui) = &manifest.ui {
         if ui.entry != "ui/index.html" || !ui.entry.starts_with("ui/") {
-            return Err("Plugin UI entry must be ui/index.html in manifest v2.".to_owned());
+            return Err("Plugin UI entry must be ui/index.html in manifest v3.".to_owned());
         }
         let min_ui_bridge = Version::parse(&ui.bridge_compatibility.min_version)
             .map_err(|_| "Minimum UI bridge version is invalid.".to_owned())?;
@@ -1011,8 +1210,6 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
                 "A UI plugin must declare exactly one primary Activity contribution.".to_owned(),
             );
         }
-    } else if manifest.provides.is_empty() {
-        return Err("A plugin without UI must provide at least one service.".to_owned());
     }
     if !manifest.backend.entry.starts_with("backend/")
         || !manifest
@@ -1027,139 +1224,58 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), String> {
     if manifest.contract != "contract.json" {
         return Err("Plugin contract must be the root contract.json file.".to_owned());
     }
-    if manifest.capabilities.len() > 32 {
-        return Err("Plugin requests too many capabilities.".to_owned());
+    if manifest.dependencies.len() > 32 {
+        return Err("Plugin declares too many dependencies.".into());
     }
-    let allowed = allowed_capabilities();
-    let mut unique = BTreeSet::new();
-    for capability in &manifest.capabilities {
-        if !allowed.contains(capability.as_str()) || !unique.insert(capability) {
-            return Err(format!(
-                "Plugin requests an unknown or duplicate capability '{capability}'."
-            ));
+    let mut ids = BTreeSet::new();
+    for dependency in &manifest.dependencies {
+        if !valid_plugin_id(&dependency.plugin_id) || !ids.insert(&dependency.plugin_id) {
+            return Err("Plugin dependency ID is invalid or duplicated.".into());
         }
-    }
-    if manifest.provides.len() > 32 || manifest.requires.len() > 32 {
-        return Err("Plugin declares too many services.".to_owned());
-    }
-    let mut provided_ids = BTreeSet::new();
-    for service in &manifest.provides {
-        if !valid_service_id(&service.id) || !provided_ids.insert(&service.id) {
-            return Err(format!(
-                "Provided service ID '{}' is invalid or duplicated.",
-                service.id
-            ));
-        }
-        Version::parse(&service.version)
-            .map_err(|_| format!("Provided service '{}' has an invalid version.", service.id))?;
-        if service.methods.is_empty() || service.methods.len() > 128 {
-            return Err(format!(
-                "Provided service '{}' must export between one and 128 methods.",
-                service.id
-            ));
-        }
-        let mut methods = BTreeSet::new();
-        for method in &service.methods {
-            if !valid_method(method) || !methods.insert(method) {
-                return Err(format!(
-                    "Provided service '{}' has an invalid or duplicate method.",
-                    service.id
-                ));
-            }
-        }
-    }
-    let mut required_ids = BTreeSet::new();
-    for requirement in &manifest.requires {
-        if !valid_service_id(&requirement.id) || !required_ids.insert(&requirement.id) {
-            return Err(format!(
-                "Required service ID '{}' is invalid or duplicated.",
-                requirement.id
-            ));
-        }
-        let min = Version::parse(&requirement.min_version).map_err(|_| {
-            format!(
-                "Required service '{}' has an invalid minimum version.",
-                requirement.id
-            )
-        })?;
-        let max = Version::parse(&requirement.max_version_exclusive).map_err(|_| {
-            format!(
-                "Required service '{}' has an invalid maximum version.",
-                requirement.id
-            )
-        })?;
-        if min >= max {
-            return Err(format!(
-                "Required service '{}' has an invalid version range.",
-                requirement.id
-            ));
-        }
-        // Empty is accepted for schema-v2 manifests written before method requirements existed.
-        // It identifies the service dependency but grants no callable methods.
-        if requirement.methods.len() > 128 {
-            return Err(format!(
-                "Required service '{}' cannot declare more than 128 methods.",
-                requirement.id
-            ));
-        }
-        let mut methods = BTreeSet::new();
-        for method in &requirement.methods {
-            if !valid_method(method) || !methods.insert(method) {
-                return Err(format!(
-                    "Required service '{}' has an invalid or duplicate method.",
-                    requirement.id
-                ));
-            }
+        VersionReq::parse(&dependency.version_req)
+            .map_err(|_| "Plugin dependency range is invalid.")?;
+        if dependency.methods.len() > 128
+            || dependency
+                .methods
+                .iter()
+                .any(|method| !valid_method(method))
+            || dependency.methods.iter().collect::<BTreeSet<_>>().len() != dependency.methods.len()
+        {
+            return Err("Plugin dependency methods are invalid or duplicated.".into());
         }
     }
     Ok(())
 }
 
-fn valid_service_id(value: &str) -> bool {
-    value.split('.').count() >= 2
-        && !value.is_empty()
-        && value.len() <= 128
-        && value.split('.').all(|part| {
-            !part.is_empty()
-                && part.as_bytes()[0].is_ascii_lowercase()
-                && part.bytes().all(|byte| {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || byte == b'_'
-                        || byte == b'-'
-                })
-        })
-}
-
-fn validate_provided_service_methods(
-    manifest: &PluginManifest,
-    contract: &Value,
-) -> Result<(), String> {
-    let methods = contract
-        .get("methods")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "Plugin contract must define a methods object.".to_owned())?;
-    for service in &manifest.provides {
-        for method in &service.methods {
-            let Some(contract_method) = methods.get(method) else {
-                return Err(format!(
-                    "Provided service '{}' references missing contract method '{}'.",
-                    service.id, method
-                ));
-            };
-            if contract_method
-                .get("timeoutMs")
-                .and_then(Value::as_u64)
-                .is_none_or(|timeout| timeout > 30_000)
-            {
-                return Err(format!(
-                    "Provided service '{}' method '{}' exceeds the 30-second service-call limit.",
-                    service.id, method
-                ));
-            }
+/// Read old metadata for display only; old backends never execute on the new API.
+fn decode_installed_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
+    let mut value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("manifest.json is invalid: {error}"))?;
+    let version = value
+        .get("manifestVersion")
+        .and_then(Value::as_u64)
+        .ok_or("Plugin manifest has no format version.")?;
+    if version != 3 {
+        if ![1, 2].contains(&version) {
+            return Err("Unsupported plugin manifest format.".into());
         }
+        let object = value
+            .as_object_mut()
+            .ok_or("Plugin manifest is not an object.")?;
+        for field in ["capabilities", "networkPublicHosts", "provides", "requires"] {
+            object.remove(field);
+        }
+        object.insert("dependencies".into(), serde_json::json!([]));
     }
-    Ok(())
+    let manifest: PluginManifest = serde_json::from_value(value)
+        .map_err(|error| format!("manifest.json is invalid: {error}"))?;
+    if !valid_plugin_id(&manifest.id)
+        || Version::parse(&manifest.version).is_err()
+        || manifest.contract != "contract.json"
+    {
+        return Err("Plugin manifest identity or contract path is invalid.".into());
+    }
+    Ok(manifest)
 }
 
 /// Returns the Core-supported versions a plugin declares it can use, newest first.
@@ -1225,7 +1341,8 @@ fn is_compatible(manifest: &PluginManifest) -> bool {
     } else {
         std::env::consts::OS
     };
-    core >= min_core
+    manifest.manifest_version == 3
+        && core >= min_core
         && core < max_core
         && protocol_compatible
         && ui_compatible
@@ -1280,7 +1397,7 @@ fn validate_contract(contract: &Value) -> Result<(), String> {
             .ok_or_else(|| format!("Method '{name}' must be an object."))?;
         if method
             .keys()
-            .any(|key| !["params", "result", "timeoutMs"].contains(&key.as_str()))
+            .any(|key| !["params", "result", "timeoutMs", "localOnly"].contains(&key.as_str()))
         {
             return Err(format!("Method '{name}' contains an unknown field."));
         }
@@ -1294,12 +1411,25 @@ fn validate_contract(contract: &Value) -> Result<(), String> {
             .map_err(|error| format!("Method '{name}' params: {error}"))?;
         plugin_schema::ensure_supported_in(result, contract)
             .map_err(|error| format!("Method '{name}' result: {error}"))?;
-        let timeout = method
-            .get("timeoutMs")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("Method '{name}' timeoutMs must be an integer."))?;
-        if !(1..=86_400_000).contains(&timeout) {
-            return Err(format!("Method '{name}' timeoutMs is out of range."));
+        if method
+            .get("localOnly")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(format!("Method '{name}' localOnly must be a boolean."));
+        }
+        if let Some(value) = method.get("timeoutMs").filter(|value| !value.is_null()) {
+            let timeout = value
+                .as_u64()
+                .filter(|timeout| *timeout > 0)
+                .ok_or_else(|| {
+                    format!("Method '{name}' timeoutMs must be a positive integer or null.")
+                })?;
+            if std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(timeout))
+                .is_none()
+            {
+                return Err(format!("Method '{name}' timeoutMs cannot be represented."));
+            }
         }
     }
     for (name, event) in events {
@@ -1344,27 +1474,11 @@ fn valid_topic(value: &str) -> bool {
     valid_method(value)
 }
 
-fn allowed_capabilities() -> BTreeSet<&'static str> {
-    [
-        "account.read",
-        "account.authed_get",
-        "network.public",
-        "network.model",
-        "secrets.plugin",
-        "files.pick",
-        "files.export",
-        "files.reveal_own",
-        "browser.open",
-        "browser.open_official",
-        "services.call",
-    ]
-    .into_iter()
-    .collect()
-}
-
 fn allowed_package_file(path: &str) -> bool {
-    matches!(path, "manifest.json" | "contract.json" | "checksums.json")
-        || path.starts_with("ui/")
+    matches!(
+        path,
+        "manifest.json" | "contract.json" | "checksums.json" | "signature.json"
+    ) || path.starts_with("ui/")
         || path.starts_with("backend/")
 }
 
@@ -1403,7 +1517,7 @@ fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn ensure_real_directory(path: &Path) -> Result<(), String> {
+pub(crate) fn ensure_real_directory(path: &Path) -> Result<(), String> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| format!("Cannot inspect directory: {error}"))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -1458,6 +1572,81 @@ mod tests {
     use wonderland_plugin_protocol::{PluginUiCommand, PluginUiCommandEffect};
 
     #[test]
+    fn package_commit_retains_original_bytes_until_metadata_success() {
+        let root = std::env::temp_dir().join(format!(
+            "wla-package-commit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let manifest: PluginManifest = serde_json::from_str(include_str!(
+            "../tests/fixtures/comment_collector_manifest.json"
+        ))
+        .unwrap();
+        let destination = install_path(&root, &manifest);
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("bytes"), b"original").unwrap();
+        let stage = staging_directory(&root).unwrap();
+        fs::write(stage.join("bytes"), b"replacement").unwrap();
+        let mut commit = commit_staging(&stage, &root, &manifest, true, None).unwrap();
+        assert_eq!(fs::read(destination.join("bytes")).unwrap(), b"replacement");
+        assert_eq!(
+            fs::read(commit.backup.as_ref().unwrap().join("bytes")).unwrap(),
+            b"original"
+        );
+        commit.rollback().unwrap();
+        assert_eq!(fs::read(destination.join("bytes")).unwrap(), b"original");
+        let stage = staging_directory(&root).unwrap();
+        fs::write(stage.join("bytes"), b"final").unwrap();
+        commit_staging(&stage, &root, &manifest, true, None)
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(fs::read(destination.join("bytes")).unwrap(), b"final");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_signatures_authenticate_raw_checksums_and_nested_signature_files() {
+        let root = std::env::temp_dir().join(format!(
+            "wla-package-signature-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("ui")).unwrap();
+        fs::write(root.join("ui/signature.json"), b"ordinary nested payload").unwrap();
+        let checksums=serde_json::to_vec(&serde_json::json!({"algorithm":"sha256","files":[{"path":"ui/signature.json","sha256":digest_hex(b"ordinary nested payload")}]})).unwrap();
+        fs::write(root.join("checksums.json"), &checksums).unwrap();
+        assert!(verify_package_checksums(&root, false).is_ok());
+        assert_eq!(directory_signature(&root).unwrap(), None);
+        let signed = wonderland_plugin_signing::sign(&checksums, &[42; 32]).unwrap();
+        fs::write(
+            root.join("signature.json"),
+            serde_json::to_vec(&signed).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(directory_signature(&root).unwrap(), Some(signed.public_key));
+        assert!(verify_package_checksums(&root, false).is_ok());
+        let mut changed = checksums.clone();
+        changed.push(b'\n');
+        fs::write(root.join("checksums.json"), &changed).unwrap();
+        assert!(verify_package_checksums(&root, false).is_ok());
+        assert!(
+            directory_signature(&root)
+                .unwrap_err()
+                .starts_with("INVALID_PACKAGE_SIGNATURE")
+        );
+        fs::remove_file(root.join("checksums.json")).unwrap();
+        assert!(verify_package_checksums(&root, true).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn remote_access_is_explicit_and_requires_context_support() {
         let mut manifest: PluginManifest = serde_json::from_str(include_str!(
             "../tests/fixtures/comment_collector_manifest.json"
@@ -1478,29 +1667,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_network_hosts_are_metadata_only() {
-        let mut manifest: PluginManifest = serde_json::from_str(include_str!(
-            "../tests/fixtures/comment_collector_manifest.json"
-        ))
-        .unwrap();
-        manifest.capabilities.push("network.public".to_owned());
-        validate_manifest(&manifest).unwrap();
-
-        manifest.network_public_hosts = vec!["api.example.com".to_owned()];
-        validate_manifest(&manifest).unwrap();
-        for invalid in ["*.example.com", "API.example.com", "api.example.com:443"] {
-            manifest.network_public_hosts = vec![invalid.to_owned()];
-            validate_manifest(&manifest).unwrap();
-        }
-        manifest.network_public_hosts = vec!["api.example.com".to_owned(); 2];
-        validate_manifest(&manifest).unwrap();
-        manifest
-            .capabilities
-            .retain(|capability| capability != "network.public");
-        validate_manifest(&manifest).unwrap();
-    }
-
-    #[test]
     fn install_rejects_a_manifest_changed_after_review() {
         let reviewed: PluginManifest = serde_json::from_str(include_str!(
             "../tests/fixtures/comment_collector_manifest.json"
@@ -1508,12 +1674,118 @@ mod tests {
         .unwrap();
         let mut actual = reviewed.clone();
         ensure_reviewed_manifest(&reviewed, &actual).unwrap();
-        actual.capabilities.push("network.public".to_owned());
+        actual.name.push_str(" changed");
         assert!(ensure_reviewed_manifest(&reviewed, &actual).is_err());
-        actual
-            .network_public_hosts
-            .push("api.example.com".to_owned());
-        assert!(ensure_reviewed_manifest(&reviewed, &actual).is_err());
+    }
+
+    #[test]
+    fn installed_v2_is_identifiable_but_never_compatible_or_installable() {
+        let mut legacy: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/comment_collector_manifest.json"
+        ))
+        .unwrap();
+        legacy["manifestVersion"] = serde_json::json!(2);
+        legacy.as_object_mut().unwrap().remove("dependencies");
+        legacy["capabilities"] = serde_json::json!(["files.pick"]);
+        legacy["provides"] = serde_json::json!([]);
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let manifest = decode_installed_manifest(&bytes).unwrap();
+        assert_eq!(manifest.id, "comment_collector");
+        assert_eq!(manifest.manifest_version, 2);
+        assert!(!is_compatible(&manifest));
+        assert!(validate_manifest(&manifest).is_err());
+        assert!(serde_json::from_slice::<PluginManifest>(&bytes).is_err());
+    }
+
+    #[test]
+    fn installed_v2_full_package_scan_is_incompatible_without_rewriting_files() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temporary_root = std::env::temp_dir().join(format!(
+            "wla-installed-v2-scan-{}-{nonce}",
+            std::process::id()
+        ));
+        let installed_root = temporary_root.join("installed");
+        let package = installed_root.join("comment_collector/0.1.0");
+        fs::create_dir_all(package.join("backend")).unwrap();
+        fs::create_dir_all(package.join("ui")).unwrap();
+
+        let mut manifest: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/comment_collector_manifest.json"
+        ))
+        .unwrap();
+        manifest["manifestVersion"] = serde_json::json!(2);
+        manifest.as_object_mut().unwrap().remove("dependencies");
+        manifest["capabilities"] = serde_json::json!(["files.pick", "files.export"]);
+        manifest["networkPublicHosts"] = serde_json::json!(["example.com"]);
+        manifest["provides"] = serde_json::json!([{
+            "serviceId": "archive", "version": "1.0.0", "methods": ["archive.export"]
+        }]);
+        manifest["requires"] = serde_json::json!([]);
+        let mut original_files = BTreeMap::from([
+            (
+                "manifest.json".to_owned(),
+                serde_json::to_vec_pretty(&manifest).unwrap(),
+            ),
+            (
+                "contract.json".to_owned(),
+                br#"{"schemaVersion":1,"methods":{},"events":{}}"#.to_vec(),
+            ),
+            (
+                "backend/provider.exe".to_owned(),
+                b"legacy backend".to_vec(),
+            ),
+            ("ui/index.html".to_owned(), b"legacy UI".to_vec()),
+        ]);
+        let checksum_files = original_files
+            .iter()
+            .map(|(path, bytes)| serde_json::json!({"path": path, "sha256": digest_hex(bytes)}))
+            .collect::<Vec<_>>();
+        original_files.insert(
+            "checksums.json".to_owned(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "algorithm": "sha256", "files": checksum_files
+            }))
+            .unwrap(),
+        );
+        for (path, bytes) in &original_files {
+            fs::write(package.join(path), bytes).unwrap();
+        }
+        let private_data = temporary_root.join("plugin-data/comment_collector/data.json");
+        fs::create_dir_all(private_data.parent().unwrap()).unwrap();
+        fs::write(&private_data, b"retained plugin data").unwrap();
+
+        let inspected = inspect_directory(&package, false).unwrap();
+        assert_eq!(inspected.manifest.manifest_version, 2);
+        assert!(!inspected.compatible);
+        let selected =
+            scan_installed_plugin(&installed_root, "comment_collector", Some("0.1.0")).unwrap();
+        assert_eq!(selected.manifest.id, "comment_collector");
+        assert!(!selected.compatible);
+        let active_versions = BTreeMap::from([("comment_collector".into(), "0.1.0".into())]);
+        let scanned = scan_installed_root(&installed_root, &active_versions);
+        assert_eq!(scanned.len(), 1);
+        let scanned = scanned[0].as_ref().unwrap();
+        assert_eq!(scanned.manifest.manifest_version, 2);
+        assert!(!scanned.compatible);
+        assert!(manifest_for_install_source(&package).is_err());
+
+        for (path, bytes) in &original_files {
+            assert_eq!(fs::read(package.join(path)).unwrap(), *bytes, "{path}");
+        }
+        verify_package_checksums(&package, false).unwrap();
+        assert_eq!(fs::read(&private_data).unwrap(), b"retained plugin data");
+
+        // Display-only compatibility decoding must still verify original hashes.
+        fs::write(package.join("backend/provider.exe"), b"tampered backend").unwrap();
+        let failure =
+            scan_installed_plugin(&installed_root, "comment_collector", Some("0.1.0")).unwrap_err();
+        assert_eq!(failure.code, "INVALID_PACKAGE");
+        assert!(failure.message.contains("Checksum mismatch"));
+
+        fs::remove_dir_all(temporary_root).unwrap();
     }
 
     #[test]
@@ -1554,41 +1826,6 @@ mod tests {
     }
 
     #[test]
-    fn old_manifest_service_requirements_deserialize_without_methods() {
-        let requirement: wonderland_plugin_protocol::PluginServiceRequirement =
-            serde_json::from_value(serde_json::json!({
-                "id": "wonderland.comments.archive",
-                "minVersion": "1.0.0",
-                "maxVersionExclusive": "2.0.0",
-                "optional": true
-            }))
-            .unwrap();
-        assert!(requirement.methods.is_empty());
-        assert!(
-            serde_json::to_value(requirement)
-                .unwrap()
-                .get("methods")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn range_only_legacy_service_requirement_still_validates() {
-        let mut manifest: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/knowledge_library_manifest.json"
-        ))
-        .unwrap();
-        manifest["requires"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("methods");
-        let manifest: PluginManifest = serde_json::from_value(manifest).unwrap();
-
-        validate_manifest(&manifest).unwrap();
-        assert!(manifest.requires[0].methods.is_empty());
-    }
-
-    #[test]
     fn path_validation_rejects_windows_and_traversal_paths() {
         for path in [
             "../secret",
@@ -1610,28 +1847,6 @@ mod tests {
         assert!(valid_plugin_id("plugin_2"));
         assert!(!valid_plugin_id("Upper"));
         assert!(!valid_plugin_id("../plugin"));
-    }
-
-    #[test]
-    fn comment_archive_provider_and_consumer_contracts_validate() {
-        let cases = [
-            (
-                include_str!("../tests/fixtures/comment_collector_manifest.json"),
-                include_str!("../tests/fixtures/comment_collector_contract.json"),
-            ),
-            (
-                include_str!("../tests/fixtures/knowledge_library_manifest.json"),
-                include_str!("../tests/fixtures/knowledge_library_contract.json"),
-            ),
-        ];
-
-        for (manifest_json, contract_json) in cases {
-            let manifest: PluginManifest = serde_json::from_str(manifest_json).unwrap();
-            let contract: Value = serde_json::from_str(contract_json).unwrap();
-            validate_manifest(&manifest).unwrap();
-            validate_contract(&contract).unwrap();
-            validate_provided_service_methods(&manifest, &contract).unwrap();
-        }
     }
 
     #[test]

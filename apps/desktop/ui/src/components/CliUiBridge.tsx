@@ -8,18 +8,20 @@ import type { ThemeSettings } from '@wonderland/core-bindings'
 import { buildContributionRegistry } from '../plugins/contributions'
 import { pluginApi } from '../plugins/api'
 import {
-  MAX_OPEN_ACTIVITY_SURFACES,
+  applyWorkspaceAction,
   readWorkspaceLayout,
   writeWorkspaceLayout,
-  type WorkspaceLayoutState,
 } from '../plugins/workspaceLayout'
-import { requestPluginUiCommand, CliPluginUiCommandError } from '../plugins/cliUiCommandBus'
+import { closeWorkspaceActivity, type WorkspaceAction } from '../plugins/workspaceActions'
+import { requestPluginUiCommand, cancelPluginUiCommand, closePluginUiCommands, CliPluginUiCommandError } from '../plugins/cliUiCommandBus'
+import { validateUiTimeout } from '../plugins/uiDeadline'
 import { useTheme } from '../theme/ThemeProvider'
 import { themeApi } from '../theme/api'
 
 interface CliUiRequest {
   requestId: string
   args: string[]
+  timeoutMs?: number
 }
 
 interface CliUiError {
@@ -51,11 +53,21 @@ export function CliUiBridge() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
+    let unlistenCancel: (() => void) | undefined
     let live = true
+    const activeRequests = new Map<string, AbortController>()
+    const cancelledBeforeDispatch = new Set<string>()
     void listen<CliUiRequest>('cli:ui-request', ({ payload }) => {
+      if (!live) return
+      if (cancelledBeforeDispatch.delete(payload.requestId)) {
+        void invoke('cli_ui_ack', { requestId: payload.requestId, result: null, error: { code: 'CANCELLED', message: 'The CLI UI request was cancelled before dispatch.' } }).catch(() => undefined)
+        return
+      }
+      const controller = new AbortController()
+      activeRequests.set(payload.requestId, controller)
       void handleRequest(payload, {
         ...contextRef.current,
-      }).then(
+      }, controller.signal).then(
         (result) => invoke('cli_ui_ack', { requestId: payload.requestId, result, error: null }),
         (cause: unknown) => {
           const error: CliUiError = cause instanceof CliUiFailure || cause instanceof CliPluginUiCommandError
@@ -63,7 +75,9 @@ export function CliUiBridge() {
             : { code: 'UI_COMMAND_FAILED', message: errorText(cause) }
           return invoke('cli_ui_ack', { requestId: payload.requestId, result: null, error })
         },
-      ).catch(() => undefined)
+      ).catch(() => undefined).finally(() => {
+        if (activeRequests.get(payload.requestId) === controller) activeRequests.delete(payload.requestId)
+      })
     }).then((stop) => {
       if (live) {
         unlisten = stop
@@ -71,9 +85,27 @@ export function CliUiBridge() {
       }
       else stop()
     })
+    void listen<{ requestId: string }>('cli:ui-cancel', ({ payload }) => {
+      const request = activeRequests.get(payload.requestId)
+      if (request) request.abort()
+      else {
+        cancelledBeforeDispatch.add(payload.requestId)
+        // Retain more than the host's bounded concurrent queue without accumulating old IDs forever.
+        while (cancelledBeforeDispatch.size > 512) cancelledBeforeDispatch.delete(cancelledBeforeDispatch.values().next().value!)
+      }
+      cancelPluginUiCommand(payload.requestId)
+    }).then((stop) => {
+      if (live) unlistenCancel = stop
+      else stop()
+    })
     return () => {
       live = false
       unlisten?.()
+      unlistenCancel?.()
+      for (const request of activeRequests.values()) request.abort()
+      activeRequests.clear()
+      cancelledBeforeDispatch.clear()
+      closePluginUiCommands()
     }
   }, [])
 
@@ -88,9 +120,14 @@ async function handleRequest(
     themeSettings: ThemeSettings
     setTheme: (settings: ThemeSettings) => Promise<void>
   },
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const [group, command, ...args] = request.args
   const states = await pluginApi.states().catch(() => null)
+  const checkCancelled = () => {
+    if (signal?.aborted) throw new CliUiFailure('CANCELLED', 'The CLI UI request was cancelled.')
+  }
+  checkCancelled()
   const registry = buildContributionRegistry(states ?? [])
   const layout = readWorkspaceLayout()
 
@@ -154,22 +191,21 @@ async function handleRequest(
     if (action === 'open' || action === 'activate') {
       if (args.length !== 2) throw new CliUiFailure('INVALID_REQUEST', `Activity ${action} takes one contribution ID.`)
       if (contribution.status !== 'ready') throw new CliUiFailure('CONTRIBUTION_UNAVAILABLE', `Activity '${id}' is not ready.`)
-      updateLayout((current) => ({
-        ...current,
-        openContributionIds: [...current.openContributionIds.filter((item) => item !== id), id].slice(-MAX_OPEN_ACTIVITY_SURFACES),
-        activeContributionId: id,
-      }))
+      applyWorkspaceAction({ type: 'openActivity', id })
       context.navigate(contribution.href)
       await nextFrame()
       return { opened: id, route: window.location.hash.slice(1) }
     }
     if (action === 'close') {
       if (args.length !== 2) throw new CliUiFailure('INVALID_REQUEST', 'Activity close takes one contribution ID.')
-      const next = layout.openContributionIds.filter((item) => item !== id)
-      const active = layout.activeContributionId === id ? next.at(-1) ?? null : layout.activeContributionId
-      updateLayout((current) => ({ ...current, openContributionIds: next, activeContributionId: active }))
-      const nextContribution = activities.find((item) => item.id === active)
-      context.navigate(nextContribution?.href ?? '/workspace')
+      const routeActiveId = activities.find((item) => item.href === context.route.split('?')[0])?.id ?? null
+      const closed = closeWorkspaceActivity(readWorkspaceLayout(), id, routeActiveId, activities.map((item) => item.id))
+      writeWorkspaceLayout(closed.layout)
+      const active = closed.layout.activeContributionId
+      if (closed.routeChanged) {
+        const nextContribution = activities.find((item) => item.id === active)
+        context.navigate(nextContribution?.href ?? '/workspace')
+      }
       await nextFrame()
       return { closed: id, activeActivity: active }
     }
@@ -191,6 +227,8 @@ async function handleRequest(
     if (!declaredCommand) throw new CliUiFailure('UI_COMMAND_NOT_FOUND', `Command '${commandId}' is not declared by '${contributionId}'.`)
     let inputJson: string | undefined
     let confirmed = false
+    let timeoutMs = validateUiTimeout(request.timeoutMs)
+    let timeoutSpecified = false
     for (let index = 0; index < options.length; index += 1) {
       if (options[index] === '--yes') {
         if (confirmed) throw new CliUiFailure('INVALID_REQUEST', '--yes may be specified once.')
@@ -200,6 +238,12 @@ async function handleRequest(
         if (inputJson !== undefined) throw new CliUiFailure('INVALID_REQUEST', '--input-json may be specified once.')
         inputJson = options[index + 1]
         if (inputJson === undefined) throw new CliUiFailure('INVALID_REQUEST', '--input-json requires a JSON value.')
+        index += 1
+      } else if (options[index] === '--timeout-ms') {
+        if (timeoutSpecified || !options[index + 1] || !/^\d+$/.test(options[index + 1])) throw new CliUiFailure('INVALID_REQUEST', '--timeout-ms requires one positive integer.')
+        try { timeoutMs = validateUiTimeout(Number(options[index + 1])) }
+        catch { throw new CliUiFailure('INVALID_REQUEST', '--timeout-ms requires one positive safe integer.') }
+        timeoutSpecified = true
         index += 1
       } else {
         throw new CliUiFailure('INVALID_REQUEST', `Unknown UI command option '${options[index]}'.`)
@@ -216,22 +260,20 @@ async function handleRequest(
       throw new CliUiFailure('INVALID_REQUEST', '--input-json must contain valid JSON.')
     }
     if (contribution.kind === 'view') {
-      updateLayout((current) => ({ ...current, activeSidebarContributionId: contributionId }))
+      applyWorkspaceAction({ type: 'sidebar', id: contributionId })
       context.navigate('/workspace')
     } else {
-      updateLayout((current) => ({
-        ...current,
-        openContributionIds: [...current.openContributionIds.filter((item) => item !== contributionId), contributionId].slice(-MAX_OPEN_ACTIVITY_SURFACES),
-        activeContributionId: contributionId,
-      }))
+      applyWorkspaceAction({ type: 'openActivity', id: contributionId })
       context.navigate(contribution.href)
     }
     await nextFrame()
+    checkCancelled()
     return requestPluginUiCommand({
       requestId: request.requestId,
       contributionId,
       commandId,
       input,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
     })
   }
 
@@ -242,12 +284,12 @@ async function handleRequest(
     }
     if (action === 'collapse' || action === 'expand') {
       if (args.length !== 1) throw new CliUiFailure('INVALID_REQUEST', `Sidebar ${action} takes no contribution ID.`)
-      updateLayout((current) => ({ ...current, collapsed: action === 'collapse' }))
+      applyWorkspaceAction({ type: 'collapse', value: action === 'collapse' })
       await nextFrame()
       return { collapsed: action === 'collapse' }
     }
     if (action === 'close' && args.length === 1) {
-      updateLayout((current) => ({ ...current, activeSidebarContributionId: null }))
+      applyWorkspaceAction({ type: 'sidebar', id: null })
       context.navigate('/workspace')
       await nextFrame()
       return { active: null }
@@ -257,7 +299,7 @@ async function handleRequest(
       const view = registry.find((item) => item.id === id && item.kind === 'view')
       if (!view) throw new CliUiFailure('CONTRIBUTION_NOT_FOUND', `Sidebar View '${id}' is not registered.`)
       if (view.status !== 'ready') throw new CliUiFailure('CONTRIBUTION_UNAVAILABLE', `Sidebar View '${id}' is not ready.`)
-      updateLayout((current) => ({ ...current, activeSidebarContributionId: id }))
+      applyWorkspaceAction({ type: 'sidebar', id })
       context.navigate('/workspace')
       await nextFrame()
       return { active: id }
@@ -312,29 +354,28 @@ function applyLayoutCommand(args: string[], contributionIds: string[]) {
   const current = readWorkspaceLayout()
   if (action === 'get' && args.length === 1) return current
   if (action === 'reset' && args.length === 1) {
-    writeWorkspaceLayout(emptyLayout())
-    return readWorkspaceLayout()
+    return applyWorkspaceAction({ type: 'reset' })
   }
   if (!id || !contributionIds.includes(id)) {
     throw new CliUiFailure('CONTRIBUTION_NOT_FOUND', `Contribution '${id ?? ''}' is not registered.`)
   }
-  let next: WorkspaceLayoutState
+  let next: WorkspaceAction
   switch (action) {
     case 'pin':
       if (options.length !== 0) throw new CliUiFailure('INVALID_REQUEST', 'Pin takes one contribution ID.')
-      next = { ...current, pinnedIds: unique([...current.pinnedIds, id]), hiddenIds: current.hiddenIds.filter((item) => item !== id) }
+      next = { type: 'pin', id, value: true }
       break
     case 'unpin':
       if (options.length !== 0) throw new CliUiFailure('INVALID_REQUEST', 'Unpin takes one contribution ID.')
-      next = { ...current, pinnedIds: current.pinnedIds.filter((item) => item !== id) }
+      next = { type: 'pin', id, value: false }
       break
     case 'hide':
       if (options.length !== 0) throw new CliUiFailure('INVALID_REQUEST', 'Hide takes one contribution ID.')
-      next = { ...current, hiddenIds: unique([...current.hiddenIds, id]), pinnedIds: current.pinnedIds.filter((item) => item !== id) }
+      next = { type: 'hide', id, value: true }
       break
     case 'show':
       if (options.length !== 0) throw new CliUiFailure('INVALID_REQUEST', 'Show takes one contribution ID.')
-      next = { ...current, hiddenIds: current.hiddenIds.filter((item) => item !== id) }
+      next = { type: 'hide', id, value: false }
       break
     case 'move': {
       const beforeIndex = options.indexOf('--before')
@@ -342,20 +383,13 @@ function applyLayoutCommand(args: string[], contributionIds: string[]) {
       if (beforeIndex !== 0 || options.length !== 2 || !before || !contributionIds.includes(before)) {
         throw new CliUiFailure('INVALID_REQUEST', '`move` requires --before <registered-contribution>.')
       }
-      const ids = current.pinnedIds.includes(id) ? [...current.orderIds] : [...current.activityOrderIds]
-      const ordered = ids.filter((item) => item !== id)
-      const index = ordered.indexOf(before)
-      ordered.splice(index < 0 ? ordered.length : index, 0, id)
-      next = current.pinnedIds.includes(id)
-        ? { ...current, orderIds: ordered }
-        : { ...current, activityOrderIds: ordered }
+      next = { type: 'moveBefore', id, before }
       break
     }
     default:
       throw new CliUiFailure('INVALID_REQUEST', 'Expected get, reset, pin, unpin, hide, show, or move.')
   }
-  writeWorkspaceLayout(next)
-  return readWorkspaceLayout()
+  return applyWorkspaceAction(next)
 }
 
 function parseThemeOptions(args: string[], current: ThemeSettings): ThemeSettings {
@@ -383,28 +417,6 @@ function parseThemeOptions(args: string[], current: ThemeSettings): ThemeSetting
     }
   }
   return { mode, background, background_opacity: opacity }
-}
-
-function updateLayout(change: (current: WorkspaceLayoutState) => WorkspaceLayoutState) {
-  writeWorkspaceLayout(change(readWorkspaceLayout()))
-}
-
-function emptyLayout(): WorkspaceLayoutState {
-  return {
-    version: 1,
-    collapsed: false,
-    pinnedIds: [],
-    hiddenIds: [],
-    orderIds: [],
-    activityOrderIds: [],
-    openContributionIds: [],
-    activeContributionId: null,
-    activeSidebarContributionId: null,
-  }
-}
-
-function unique(values: string[]) {
-  return [...new Set(values)]
 }
 
 function nextFrame() {

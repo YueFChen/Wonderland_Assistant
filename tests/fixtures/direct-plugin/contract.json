@@ -1,0 +1,230 @@
+{
+  "schemaVersion": 1,
+  "methods": {
+    "echo": {
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        }
+      },
+      "result": {
+        "type": "string",
+        "maxLength": 1024
+      },
+      "timeoutMs": 5000
+    },
+    "health": {
+      "params": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "string"
+      },
+      "timeoutMs": 5000
+    },
+    "large": {
+      "params": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 2097152
+          }
+        }
+      },
+      "result": {
+        "type": "string"
+      },
+      "timeoutMs": 1000
+    },
+    "pick": {
+      "params": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "result": true,
+      "timeoutMs": 5000
+    },
+    "browser": {
+      "params": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "result": true,
+      "timeoutMs": 5000
+    },
+    "browser_session_probe": {
+      "params": {
+        "type": "object",
+        "required": ["url"],
+        "additionalProperties": false,
+        "properties": { "url": { "type": "string" } }
+      },
+      "result": true,
+      "localOnly": true,
+      "timeoutMs": 45000
+    },
+    "delay": {
+      "params": {
+        "type": "object",
+        "required": [
+          "milliseconds"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "milliseconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000
+          }
+        }
+      },
+      "result": {
+        "type": "string"
+      },
+      "timeoutMs": 15000
+    },
+    "bad_result": {
+      "params": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "string"
+      },
+      "timeoutMs": 5000
+    },
+    "direct": {
+      "params": {
+        "type": "object",
+        "required": [
+          "pluginId",
+          "method",
+          "params"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "pluginId": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "params": true,
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400000
+          }
+        }
+      },
+      "result": true,
+      "timeoutMs": 15000
+    },
+    "loop": {
+      "params": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "string"
+      },
+      "timeoutMs": 5000
+    },
+    "restore": {
+      "params": {
+        "type": "object",
+        "required": [
+          "required"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "required": {
+            "type": "boolean"
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "required": [
+          "required"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "required": {
+            "type": "boolean"
+          }
+        }
+      },
+      "localOnly": true
+    },
+    "start_task": {
+      "params": {
+        "type": "object",
+        "required": [
+          "milliseconds"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "milliseconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "required": [
+          "started"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "started": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "defer_task": {
+      "params": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "result": {
+        "type": "object",
+        "required": [
+          "queued"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "queued": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  },
+  "events": {}
+}

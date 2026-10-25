@@ -12,7 +12,8 @@
     ".": "./src/index.ts",
     "./i18n": "./src/i18n/index.ts",
     "./theme.css": "./src/theme.css",
-    "./plugin-theme.css": "./src/plugin-theme.css"
+    "./plugin-theme.css": "./src/plugin-theme.css",
+    "./plugin.css": "./src/plugin.css"
   },
   "peerDependencies": {
     "react": "19.3.0",

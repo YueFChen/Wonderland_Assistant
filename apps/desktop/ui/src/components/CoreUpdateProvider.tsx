@@ -2,7 +2,8 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { getVersion } from '@tauri-apps/api/app'
 import { isTauri } from '@tauri-apps/api/core'
 import { relaunch } from '@tauri-apps/plugin-process'
-import { Download, X } from 'lucide-react'
+import { Download } from 'lucide-react'
+import { Dialog, DialogButton } from '@wonderland/ui'
 
 import { t } from '../i18n'
 import { createUpdateCheckGate, UPDATE_CHECK_INTERVAL_MS, UPDATE_WAKE_COOLDOWN_MS } from '../core/updateChecks'
@@ -36,6 +37,7 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
   const [installing, setInstalling] = useState(false)
   const [progress, setProgress] = useState<number | null>(null)
   const [message, setMessage] = useState('')
+  const [promptFailure, setPromptFailure] = useState('')
   const [promptOpen, setPromptOpen] = useState(false)
   const [hasUpdate, setHasUpdate] = useState(false)
   const startupCheckStarted = useRef(false)
@@ -51,6 +53,7 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
       const next = await networkApi.updateCheck()
       if (requestGeneration !== generation.current) return null
       setUpdate(next)
+      setPromptFailure('')
       if (!next) {
         setHasUpdate(false)
         clearHomeNotifications(HOME_NOTICE_PREFIX)
@@ -100,6 +103,7 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
     if (!update || !gate.current.beginInstall()) return
     setInstalling(true)
     setProgress(null)
+    setPromptFailure('')
     setMessage(t('settings.update.downloading'))
     try {
       await networkApi.updateInstall(update.updateId)
@@ -109,6 +113,7 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
     } catch (cause) {
       const failure = t('settings.update.installFailed', { reason: errorText(cause) })
       setMessage(failure)
+      setPromptFailure(failure)
       notify(failure, { tone: 'error', durationMs: 7000 })
       setInstalling(false)
       setProgress(null)
@@ -123,7 +128,9 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
     try {
       localStorage.setItem(IGNORED_VERSIONS_KEY, JSON.stringify([...ignored].slice(-32)))
     } catch {
-      notify(t('settings.update.ignoreSaveFailed'), { tone: 'error' })
+      const failure = t('settings.update.ignoreSaveFailed')
+      setPromptFailure(failure)
+      notify(failure, { tone: 'error' })
       return
     }
     dismissHomeNotification(`${HOME_NOTICE_PREFIX}${update.version}`)
@@ -215,6 +222,7 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
           currentVersion={version}
           installing={installing}
           progress={progress}
+          failure={promptFailure}
           onInstall={() => void installUpdate()}
           onIgnore={ignoreCurrentVersion}
           onLater={() => setPromptOpen(false)}
@@ -230,11 +238,12 @@ export function useCoreUpdate() {
   return value
 }
 
-function CoreUpdateDialog({
+export function CoreUpdateDialog({
   update,
   currentVersion,
   installing,
   progress,
+  failure,
   onInstall,
   onIgnore,
   onLater,
@@ -243,46 +252,24 @@ function CoreUpdateDialog({
   currentVersion: string
   installing: boolean
   progress: number | null
+  failure: string
   onInstall: () => void
   onIgnore: () => void
   onLater: () => void
 }) {
-  useEffect(() => {
-    if (installing) return
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onLater()
-    }
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [installing, onLater])
-
-  return (
-    <div className="fixed inset-0 z-[140] grid place-items-center bg-slate-950/45 p-5 backdrop-blur-sm" role="presentation">
-      <section role="dialog" aria-modal="true" aria-labelledby="core-update-title" className="glass-card w-full max-w-xl rounded-2xl border border-glass-line p-6 shadow-2xl">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-brand-400">Wonderland Assistant</p>
-            <h2 id="core-update-title" className="mt-2 text-xl font-bold text-ink">{t('update.prompt.title')}</h2>
-          </div>
-          {!installing && <button type="button" onClick={onLater} className="rounded-lg p-2 text-ink-faint hover:bg-glass-hover hover:text-ink" aria-label={t('update.prompt.later')}><X className="h-4 w-4" aria-hidden /></button>}
-        </div>
-        <p className="mt-3 text-sm text-ink-muted">{t('update.prompt.versions', { current: currentVersion || '—', next: update.version })}</p>
-        {update.date && <p className="mt-1 text-xs text-ink-faint">{update.date}</p>}
-        {update.body && <p className="mt-4 max-h-56 overflow-y-auto whitespace-pre-wrap rounded-xl border border-glass-line bg-glass/60 p-4 text-sm leading-6 text-ink-muted">{update.body}</p>}
-        {installing && (
-          <div className="mt-5" role="status">
-            <div className="flex justify-between text-xs text-ink-muted"><span>{progress === null ? t('settings.update.downloading') : t('settings.update.progress', { progress })}</span>{progress !== null && <span>{progress}%</span>}</div>
-            <div className="mt-2 h-2 overflow-hidden rounded-full bg-glass-line"><div className="h-full bg-brand-500 transition-[width]" style={{ width: `${progress ?? 18}%` }} /></div>
-          </div>
-        )}
-        <div className="mt-6 flex flex-wrap justify-end gap-2">
-          <button type="button" disabled={installing} onClick={onIgnore} className="rounded-lg border border-glass-line px-4 py-2 text-sm text-ink-muted hover:bg-glass-hover disabled:opacity-50">{t('update.prompt.ignore')}</button>
-          <button type="button" disabled={installing} onClick={onLater} className="rounded-lg border border-glass-line px-4 py-2 text-sm text-ink hover:bg-glass-hover disabled:opacity-50">{t('update.prompt.later')}</button>
-          <button type="button" disabled={installing} onClick={onInstall} className="inline-flex items-center gap-2 rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-500 disabled:opacity-50"><Download className="h-4 w-4" aria-hidden />{t('update.prompt.install')}</button>
-        </div>
-      </section>
-    </div>
-  )
+  return <Dialog open title={t('update.prompt.title')} closeLabel={t('common.close')} size="md" dismissible={!installing} onClose={onLater} footer={<>
+    <DialogButton className="mr-auto" variant="quiet" disabled={installing} onClick={onIgnore}>{t('update.prompt.ignore')}</DialogButton>
+    <DialogButton data-dialog-autofocus disabled={installing} onClick={onLater}>{t('update.prompt.later')}</DialogButton>
+    <DialogButton variant="primary" disabled={installing} onClick={onInstall}><Download className="h-3.5 w-3.5" aria-hidden />{t('update.prompt.install')}</DialogButton>
+  </>}>
+    <p className="app-dialog-description">{t('update.prompt.versions', { current: currentVersion || '—', next: update.version })}</p>
+    {update.body && <p className="mt-4 whitespace-pre-wrap text-sm leading-6 text-ink-muted">{update.body}</p>}
+    {failure && <p role="alert" className="app-dialog-notice mt-4" data-tone="danger">{failure}</p>}
+    {installing && <div className="mt-4" role="status">
+      <p className="text-xs text-ink-muted">{progress === null ? t('settings.update.downloading') : t('settings.update.progress', { progress })}</p>
+      <div className="app-progress mt-2" role="progressbar" aria-label={t('settings.update.downloading')} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress ?? undefined} aria-busy={progress === null}><span style={progress === null ? undefined : { width: `${progress}%` }} /></div>
+    </div>}
+  </Dialog>
 }
 
 function readIgnoredVersions(): string[] {

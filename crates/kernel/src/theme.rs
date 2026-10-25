@@ -10,9 +10,9 @@ pub enum ThemeMode {
     /// 浅色。
     Light,
     /// 深色。
-    #[default]
     Dark,
     /// 跟随系统，在浅色与深色之间切换。
+    #[default]
     System,
     /// 自定义背景（背景图或纯色）。
     Custom,

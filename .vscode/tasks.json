@@ -1,55 +1,118 @@
 {
   "version": "2.0.0",
+  "options": {
+    "cwd": "${workspaceFolder}"
+  },
+  "presentation": {
+    "reveal": "always",
+    "focus": false,
+    "panel": "dedicated"
+  },
   "tasks": [
     {
-      "label": "dev: Vite（Core UI）",
+      "label": "Core: dev:ui",
       "type": "shell",
-      "command": "pnpm --filter @wonderland/desktop-ui run dev",
-      "options": { "cwd": "${workspaceFolder}" },
+      "command": "pnpm",
       "isBackground": true,
       "problemMatcher": {
         "owner": "vite",
-        "fileLocation": ["relative", "${workspaceFolder}"],
-        "pattern": [{
+        "fileLocation": [
+          "relative",
+          "${workspaceFolder}/apps/desktop/ui"
+        ],
+        "pattern": {
           "regexp": "^(.*?):(\\d+):(\\d+):\\s+(error|warning):\\s+(.*)$",
           "file": 1,
           "line": 2,
           "column": 3,
           "severity": 4,
           "message": 5
-        }],
+        },
         "background": {
           "activeOnStart": true,
-          "beginsPattern": "VITE",
-          "endsPattern": "ready in"
+          "beginsPattern": "\\bVITE\\b",
+          "endsPattern": "\\bready in\\b"
         }
       },
-      "presentation": {
-        "reveal": "always",
-        "focus": false,
-        "panel": "dedicated"
+      "args": [
+        "run",
+        "dev:ui"
+      ],
+      "runOptions": {
+        "instanceLimit": 1
       }
     },
     {
-      "label": "prepare: Core Rust 调试",
-      "dependsOn": ["dev: Vite（Core UI）"],
-      "dependsOrder": "sequence",
-      "problemMatcher": []
+      "label": "Core: build",
+      "type": "shell",
+      "command": "pnpm",
+      "args": [
+        "run",
+        "build"
+      ],
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
     },
     {
-      "label": "build: Core 安装包",
+      "label": "Core: build:ui",
       "type": "shell",
-      "command": "pnpm build",
-      "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "CARGO_HOME": "${workspaceFolder}\\.cargo-home",
-          "RUSTUP_HOME": "${workspaceFolder}\\.cargo-home\\rustup",
-          "npm_config_cache": "${workspaceFolder}\\.npm-cache"
-        }
-      },
+      "command": "pnpm",
+      "args": [
+        "run",
+        "build:ui"
+      ],
       "problemMatcher": [],
-      "group": { "kind": "build", "isDefault": true }
+      "group": "build"
+    },
+    {
+      "label": "Core: build:cli",
+      "type": "shell",
+      "command": "pnpm",
+      "args": [
+        "run",
+        "build:cli"
+      ],
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Core: check",
+      "type": "shell",
+      "command": "pnpm",
+      "args": [
+        "run",
+        "check"
+      ],
+      "problemMatcher": [],
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "Core: check:frontend",
+      "type": "shell",
+      "command": "pnpm",
+      "args": [
+        "run",
+        "check:frontend"
+      ],
+      "problemMatcher": [],
+      "group": "test"
+    },
+    {
+      "label": "Core: check:rust",
+      "type": "shell",
+      "command": "pnpm",
+      "args": [
+        "run",
+        "check:rust"
+      ],
+      "problemMatcher": [],
+      "group": "test"
     }
   ]
 }

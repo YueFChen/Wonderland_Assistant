@@ -1,6 +1,6 @@
 {
   "name": "wonderland-assistant",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "private": true,
   "license": "Apache-2.0",
   "packageManager": "pnpm@11.27.0",
@@ -10,8 +10,20 @@
   },
   "scripts": {
     "dev": "pnpm --filter @wonderland/desktop run dev",
+    "dev:ui": "pnpm --filter @wonderland/desktop-ui run dev",
+    "dev:cli": "cargo run --locked --package wonderland-desktop --bin wla --",
     "build": "pnpm --filter @wonderland/desktop run build",
+    "build:ui": "pnpm --filter @wonderland/desktop-ui run build",
+    "build:cli": "cargo build --locked --release --package wonderland-desktop --bin wla",
+    "build:ci": "pnpm --filter @wonderland/desktop run build:ci",
+    "check": "pnpm run check:frontend && pnpm run check:rust && pnpm run check:bindings",
+    "check:frontend": "pnpm run typecheck && pnpm run test && pnpm run build:ui",
+    "check:rust": "cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo test --workspace --locked",
+    "check:bindings": "cargo run --locked -p wonderland-kernel --example generate_core_bindings --features bindings -- --check && cargo run --locked -p wonderland-plugin-protocol --example generate_bindings --features bindings -- --check",
+    "check:docs": "node scripts/check-core-doc-links.mjs",
+    "release:status": "node scripts/check-core-release.mjs --status",
     "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
     "create:plugin": "node scripts/create-plugin.mjs"
   }
 }

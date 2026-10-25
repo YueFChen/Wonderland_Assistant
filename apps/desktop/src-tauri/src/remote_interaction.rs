@@ -1,17 +1,18 @@
 //! Device-local interactions for a single remote plugin invocation.
 //! No filesystem paths supplied by a browser are ever opened on the host.
-use axum::body::Bytes;
+use crate::byte_streams::TemporaryFile;
+use crate::host_services::HostInvocation;
 use base64::Engine as _;
+use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
-use wonderland_plugin_protocol::PluginError;
+use wonderland_plugin_protocol::{FileResult, PluginError, RemoteFileState};
 
 const TTL: Duration = Duration::from_secs(300);
-const WAIT: Duration = Duration::from_secs(45);
-const MAX_BYTES: usize = 64 * 1024 * 1024;
 const CHUNK: u64 = 1024 * 1024;
 
 fn error(code: &str, message: &str) -> PluginError {
@@ -33,23 +34,123 @@ fn safe_selected_name(name: &str) -> bool {
 
 struct Action {
     owner: String,
+    root_plugin: String,
     plugin: String,
     kind: String,
     payload: Value,
     expires: Instant,
     reply: Option<mpsc::SyncSender<Result<Value, PluginError>>>,
-    bytes: Option<Bytes>,
+    file: Option<Arc<TemporaryFile>>,
+    delivered: bool,
+    transfers: HashSet<String>,
+    selection_lifetime: Weak<AtomicBool>,
 }
+
+struct SelectedReference {
+    root_plugin: String,
+    plugin: String,
+    lifetime: Weak<AtomicBool>,
+}
+
+pub(crate) struct DownloadTransfer {
+    pub(crate) file: Arc<TemporaryFile>,
+    pub(crate) size: u64,
+    pub(crate) transfer_id: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum InteractionNotification {
+    Interaction {
+        id: String,
+        state: NotificationState,
+        root_plugin_id: String,
+        plugin_id: String,
+    },
+    Download {
+        id: String,
+        state: NotificationState,
+        root_plugin_id: String,
+        plugin_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NotificationState {
+    Ready,
+    Replied,
+    Delivered,
+    Transferring,
+    Dismissed,
+    Expired,
+    Cancelled,
+}
+
+type Notify = Arc<dyn Fn(&str, &str, InteractionNotification) + Send + Sync>;
 
 #[derive(Default)]
 pub(crate) struct RemoteBroker {
     closed: AtomicBool,
     actions: Mutex<HashMap<String, Action>>,
+    selected: Mutex<HashMap<(String, String), SelectedReference>>,
+    notify: Option<Notify>,
 }
 
 impl RemoteBroker {
-    fn prune(actions: &mut HashMap<String, Action>) {
-        actions.retain(|_, action| action.expires > Instant::now());
+    pub(crate) fn with_notify(notify: Notify) -> Self {
+        Self {
+            notify: Some(notify),
+            ..Self::default()
+        }
+    }
+
+    fn changed(&self, id: &str, action: &Action, state: NotificationState) {
+        if let Some(notify) = &self.notify {
+            let notification = if action.kind == "download" {
+                InteractionNotification::Download {
+                    id: id.into(),
+                    state,
+                    root_plugin_id: action.root_plugin.clone(),
+                    plugin_id: action.plugin.clone(),
+                }
+            } else {
+                InteractionNotification::Interaction {
+                    id: id.into(),
+                    state,
+                    root_plugin_id: action.root_plugin.clone(),
+                    plugin_id: action.plugin.clone(),
+                }
+            };
+            notify(&action.owner, &action.root_plugin, notification);
+        }
+    }
+
+    fn prune(&self, actions: &mut HashMap<String, Action>) {
+        actions.retain(|id, action| {
+            let live = action.reply.is_some()
+                || !action.transfers.is_empty()
+                || (action.kind == "download" && !action.delivered)
+                || action.expires > Instant::now();
+            if !live {
+                self.changed(id, action, NotificationState::Expired);
+            }
+            live
+        });
+    }
+
+    pub(crate) fn expire(&self) {
+        self.prune(&mut self.actions.lock().unwrap());
+    }
+
+    fn remove(&self, id: &str, state: NotificationState) {
+        if let Some(action) = self.actions.lock().unwrap().remove(id) {
+            self.changed(id, &action, state);
+        }
     }
 
     fn insert(&self, action: Action) -> Result<String, PluginError> {
@@ -57,12 +158,8 @@ impl RemoteBroker {
         if self.closed.load(Ordering::Acquire) {
             return Err(error("CANCELLED", "远程连接已关闭。"));
         }
-        Self::prune(&mut actions);
-        let bytes: usize = actions
-            .values()
-            .map(|a| a.bytes.as_ref().map_or(0, |b| b.len()))
-            .sum();
-        if actions.len() >= 64 || bytes + action.bytes.as_ref().map_or(0, |b| b.len()) > MAX_BYTES {
+        self.prune(&mut actions);
+        if actions.len() >= 64 {
             return Err(error(
                 "RESOURCE_LIMIT",
                 "待处理的远程文件过多，请先下载或清除文件。",
@@ -70,19 +167,21 @@ impl RemoteBroker {
         }
         let id =
             crate::web_access::random_key().map_err(|_| error("INTERNAL", "无法生成交互标识。"))?;
+        self.changed(&id, &action, NotificationState::Ready);
         actions.insert(id.clone(), action);
         Ok(id)
     }
 
     pub(crate) fn list(&self, owner: &str) -> Value {
         let mut actions = self.actions.lock().unwrap();
-        Self::prune(&mut actions);
+        self.prune(&mut actions);
         json!(
             actions
                 .iter()
                 .filter(|(_, a)| a.owner == owner)
                 .map(|(id, a)| json!({
-                    "id": id, "pluginId": a.plugin, "kind": a.kind, "payload": a.payload,
+                    "id": id, "rootPluginId": a.root_plugin, "pluginId": a.plugin, "kind": a.kind, "payload": a.payload,
+                    "state": if !a.transfers.is_empty() { "transferring" } else if a.delivered { "delivered" } else { "ready" },
                 }))
                 .collect::<Vec<_>>()
         )
@@ -90,11 +189,44 @@ impl RemoteBroker {
 
     pub(crate) fn reply(&self, owner: &str, id: &str, value: Value) -> Result<(), PluginError> {
         let mut actions = self.actions.lock().unwrap();
-        Self::prune(&mut actions);
+        self.prune(&mut actions);
         if !actions.get(id).is_some_and(|a| a.owner == owner) {
             return Err(error("UNAUTHORIZED", "交互已过期或不属于当前设备。"));
         }
+        if value.get("cancelled").and_then(Value::as_bool) != Some(true)
+            && actions
+                .get(id)
+                .is_some_and(|action| !action.transfers.is_empty())
+        {
+            return Err(error("DOWNLOAD_BUSY", "文件正在交付，请等待结束后移除。"));
+        }
         let action = actions.remove(id).unwrap();
+        if action.kind == "pick" && value.get("cancelled").and_then(Value::as_bool) != Some(true) {
+            let extensions =
+                serde_json::from_value::<Vec<String>>(action.payload["extensions"].clone())
+                    .unwrap_or_default();
+            let limit = action.payload["maxBytes"].as_u64().unwrap_or(u64::MAX);
+            if let Ok((handle, _)) = selected_file(&value, &extensions, limit) {
+                // Register before replying: the browser may synchronize immediately after its POST.
+                self.selected.lock().unwrap().insert(
+                    (owner.into(), handle),
+                    SelectedReference {
+                        root_plugin: action.root_plugin.clone(),
+                        plugin: action.plugin.clone(),
+                        lifetime: action.selection_lifetime.clone(),
+                    },
+                );
+            }
+        }
+        self.changed(
+            id,
+            &action,
+            if action.kind == "download" {
+                NotificationState::Dismissed
+            } else {
+                NotificationState::Replied
+            },
+        );
         if let Some(sender) = action.reply {
             let result = if value.get("cancelled").and_then(Value::as_bool) == Some(true)
                 && action.kind != "pick"
@@ -108,28 +240,238 @@ impl RemoteBroker {
         Ok(())
     }
 
-    pub(crate) fn download(&self, owner: &str, id: &str) -> Result<Bytes, PluginError> {
+    pub(crate) fn download(&self, owner: &str, id: &str) -> Result<DownloadTransfer, PluginError> {
         let mut actions = self.actions.lock().unwrap();
-        Self::prune(&mut actions);
-        actions
-            .get(id)
+        self.prune(&mut actions);
+        let action = actions
+            .get_mut(id)
             .filter(|a| a.owner == owner)
-            .and_then(|a| a.bytes.clone())
-            .ok_or_else(|| error("UNAUTHORIZED", "下载已过期或不属于当前设备。"))
+            .ok_or_else(|| error("UNAUTHORIZED", "下载已过期或不属于当前设备。"))?;
+        let file = action
+            .file
+            .clone()
+            .ok_or_else(|| error("UNAUTHORIZED", "此交互没有下载内容。"))?;
+        if action.transfers.len() >= 4 {
+            return Err(error("RESOURCE_LIMIT", "同一文件已有过多下载正在传输。"));
+        }
+        let transfer_id = crate::web_access::random_key()
+            .map_err(|_| error("INTERNAL", "无法生成下载交付标识。"))?;
+        action.transfers.insert(transfer_id.clone());
+        self.changed(id, action, NotificationState::Transferring);
+        Ok(DownloadTransfer {
+            file,
+            size: action.payload["size"].as_u64().unwrap_or(0),
+            transfer_id,
+        })
     }
 
-    pub(crate) fn plugin(&self, owner: &str, id: &str) -> Option<String> {
+    pub(crate) fn delivery(
+        &self,
+        owner: &str,
+        id: &str,
+        transfer_id: &str,
+        received: bool,
+    ) -> Result<(), PluginError> {
         let mut actions = self.actions.lock().unwrap();
-        Self::prune(&mut actions);
+        self.prune(&mut actions);
+        let action = actions
+            .get_mut(id)
+            .filter(|action| action.owner == owner)
+            .ok_or_else(|| error("UNAUTHORIZED", "下载已过期或不属于当前设备。"))?;
+        if !action.transfers.remove(transfer_id) {
+            return Err(error("INVALID_INPUT", "下载交付标识已失效。"));
+        }
+        action.delivered |= received;
+        // Stream EOF confirms transport completion, never a saved disk path.
+        let state = if !action.transfers.is_empty() {
+            NotificationState::Transferring
+        } else if action.delivered {
+            NotificationState::Delivered
+        } else {
+            NotificationState::Ready
+        };
+        self.changed(id, action, state);
+        Ok(())
+    }
+
+    pub(crate) fn transfer_active(&self, owner: &str, id: &str, transfer: &str) -> bool {
+        self.actions.lock().is_ok_and(|actions| {
+            actions
+                .get(id)
+                .is_some_and(|action| action.owner == owner && action.transfers.contains(transfer))
+        })
+    }
+
+    /// Local host administration only; browser reads remain scoped to their owner.
+    pub(crate) fn admin_downloads(&self) -> Result<Value, PluginError> {
+        let mut actions = self
+            .actions
+            .lock()
+            .map_err(|_| error("INTERNAL", "Remote download state is unavailable."))?;
+        self.prune(&mut actions);
+        let mut downloads = actions.iter().filter(|(_, action)| {
+            action.kind == "download" && (!action.delivered || !action.transfers.is_empty())
+        }).map(|(id, action)| json!({
+            "id":id,"owner":action.owner,"rootPluginId":action.root_plugin,"pluginId":action.plugin,
+            "name":action.payload["name"],"size":action.payload["size"],
+            "state":if action.transfers.is_empty() { "ready" } else { "transferring" },
+            "activeTransfers":action.transfers.len(),
+        })).collect::<Vec<_>>();
+        downloads.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+        Ok(json!(downloads))
+    }
+
+    pub(crate) fn discard_download(&self, id: &str) -> Result<String, PluginError> {
+        let mut actions = self
+            .actions
+            .lock()
+            .map_err(|_| error("INTERNAL", "Remote download state is unavailable."))?;
+        if !actions
+            .get(id)
+            .is_some_and(|action| action.kind == "download")
+        {
+            return Err(error("NOT_FOUND", "Download does not exist."));
+        }
+        let action = actions.remove(id).unwrap();
+        self.changed(
+            id,
+            &action,
+            if action.transfers.is_empty() {
+                NotificationState::Dismissed
+            } else {
+                NotificationState::Cancelled
+            },
+        );
+        Ok(action.owner)
+    }
+
+    fn selection_released(&self, owner: &str, handle: &str, reference: &SelectedReference) {
+        if let Some(notify) = &self.notify {
+            notify(
+                owner,
+                &reference.root_plugin,
+                InteractionNotification::Interaction {
+                    id: handle.into(),
+                    state: NotificationState::Cancelled,
+                    root_plugin_id: reference.root_plugin.clone(),
+                    plugin_id: reference.plugin.clone(),
+                },
+            );
+        }
+    }
+
+    fn release_dead_selected(&self) {
+        self.selected
+            .lock()
+            .unwrap()
+            .retain(|(owner, handle), reference| {
+                let live = reference
+                    .lifetime
+                    .upgrade()
+                    .is_some_and(|cancelled| !cancelled.load(Ordering::Acquire));
+                if !live {
+                    self.selection_released(owner, handle, reference);
+                }
+                live
+            });
+    }
+
+    fn release_selected(&self, owner: &str, handle: &str) {
+        if let Some(reference) = self
+            .selected
+            .lock()
+            .unwrap()
+            .remove(&(owner.into(), handle.into()))
+        {
+            self.selection_released(owner, handle, &reference);
+        }
+    }
+
+    pub(crate) fn selected_handles(&self, owner: &str) -> Vec<String> {
+        self.release_dead_selected();
+        self.selected
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(device, _)| device == owner)
+            .map(|(_, handle)| handle.clone())
+            .collect()
+    }
+
+    pub(crate) fn upgrade_blockers(&self) -> Vec<String> {
+        let Ok(mut actions) = self.actions.lock() else {
+            return vec!["远程文件状态不可用，暂不能安装更新。".into()];
+        };
+        self.prune(&mut actions);
+        Self::blockers(&actions)
+    }
+
+    fn blockers(actions: &HashMap<String, Action>) -> Vec<String> {
+        let pending = actions
+            .values()
+            .filter(|action| {
+                matches!(action.kind.as_str(), "pick" | "read") && action.reply.is_some()
+            })
+            .count();
+        let ready = actions
+            .values()
+            .filter(|action| {
+                action.kind == "download" && !action.delivered && action.transfers.is_empty()
+            })
+            .count();
+        let transferring = actions
+            .values()
+            .filter(|action| !action.transfers.is_empty())
+            .count();
+        let mut blockers = Vec::new();
+        if pending > 0 {
+            blockers.push(format!("还有 {pending} 个远程文件交互等待处理。"));
+        }
+        if ready > 0 {
+            blockers.push(format!("还有 {ready} 个远程导出文件等待领取或移除。"));
+        }
+        if transferring > 0 {
+            blockers.push(format!("还有 {transferring} 个远程文件正在传输。"));
+        }
+        blockers
+    }
+
+    /// Admission and the final pending-file check share the action-table lock.
+    pub(crate) fn close_if_idle(&self) -> Result<(), Vec<String>> {
+        let Ok(mut actions) = self.actions.lock() else {
+            return Err(vec!["远程文件状态不可用，暂不能停止分享。".into()]);
+        };
+        self.prune(&mut actions);
+        let blockers = Self::blockers(&actions);
+        if !blockers.is_empty() {
+            return Err(blockers);
+        }
+        self.closed.store(true, Ordering::Release);
+        for (id, action) in actions.iter() {
+            self.changed(id, action, NotificationState::Cancelled);
+        }
+        actions.clear();
+        self.selected.lock().unwrap().clear();
+        Ok(())
+    }
+
+    pub(crate) fn identity(&self, owner: &str, id: &str) -> Option<(String, String, String)> {
+        let mut actions = self.actions.lock().unwrap();
+        self.prune(&mut actions);
         actions
             .get(id)
             .filter(|a| a.owner == owner)
-            .map(|a| a.plugin.clone())
+            .map(|a| (a.root_plugin.clone(), a.plugin.clone(), a.kind.clone()))
     }
 
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
-        self.actions.lock().unwrap().clear();
+        let mut actions = self.actions.lock().unwrap();
+        for (id, action) in actions.iter() {
+            self.changed(id, action, NotificationState::Cancelled);
+        }
+        actions.clear();
+        self.selected.lock().unwrap().clear();
     }
 }
 
@@ -139,11 +481,54 @@ struct SelectedFile {
     mime: String,
 }
 
+fn selected_file(
+    result: &Value,
+    extensions: &[String],
+    limit: u64,
+) -> Result<(String, SelectedFile), PluginError> {
+    let handle = result
+        .get("handle")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty() && v.len() <= 128)
+        .ok_or_else(|| error("INVALID_INPUT", "文件标识无效。"))?;
+    let name = result
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|v| safe_selected_name(v))
+        .ok_or_else(|| error("INVALID_INPUT", "文件名无效。"))?;
+    let size = result
+        .get("size")
+        .and_then(Value::as_u64)
+        .filter(|v| *v <= limit)
+        .ok_or_else(|| error("RESOURCE_LIMIT", "文件超过允许的大小。"))?;
+    let extension = name
+        .rsplit_once('.')
+        .map_or("", |(_, ext)| ext)
+        .to_ascii_lowercase();
+    if !extensions.is_empty()
+        && !extensions
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case(&extension))
+    {
+        return Err(error("INVALID_INPUT", "文件类型与插件要求不符。"));
+    }
+    Ok((
+        handle.into(),
+        SelectedFile {
+            name: name.into(),
+            size,
+            mime: crate::host_services::file_mime_type(&extension).into(),
+        },
+    ))
+}
+
 pub(crate) struct RemoteContext {
     broker: Arc<RemoteBroker>,
     owner: String,
+    root_plugin: String,
     plugin: String,
-    cancelled: AtomicBool,
+    depth: usize,
+    cancelled: Arc<AtomicBool>,
     files: Mutex<HashMap<String, SelectedFile>>,
     waiting: Mutex<Vec<String>>,
     children: Mutex<Vec<Weak<RemoteContext>>>,
@@ -151,11 +536,10 @@ pub(crate) struct RemoteContext {
 
 impl RemoteContext {
     pub(crate) fn for_plugin(&self, plugin: &str) -> Arc<Self> {
-        let child = Arc::new(Self::new(
-            self.broker.clone(),
-            self.owner.clone(),
-            plugin.into(),
-        ));
+        let mut context = Self::new(self.broker.clone(), self.owner.clone(), plugin.into());
+        context.root_plugin = self.root_plugin.clone();
+        context.depth = self.depth + 1;
+        let child = Arc::new(context);
         let mut children = self.children.lock().unwrap();
         if self.cancelled.load(Ordering::Acquire) {
             child.cancel();
@@ -169,25 +553,40 @@ impl RemoteContext {
         Self {
             broker,
             owner,
+            root_plugin: plugin.clone(),
             plugin,
-            cancelled: AtomicBool::new(false),
+            depth: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
             files: Mutex::new(HashMap::new()),
             waiting: Mutex::new(Vec::new()),
             children: Mutex::new(Vec::new()),
         }
     }
 
+    pub(crate) fn root_plugin_id(&self) -> &str {
+        &self.root_plugin
+    }
+
+    pub(crate) fn invocation_depth(&self) -> usize {
+        self.depth
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.files.lock().unwrap().clear();
+        self.broker.release_dead_selected();
         for child in self.children.lock().unwrap().drain(..) {
             if let Some(child) = child.upgrade() {
                 child.cancel();
             }
         }
         let ids = self.waiting.lock().unwrap();
-        let mut actions = self.broker.actions.lock().unwrap();
         for id in ids.iter() {
-            actions.remove(id);
+            self.broker.remove(id, NotificationState::Cancelled);
         }
     }
 
@@ -195,7 +594,7 @@ impl RemoteContext {
         &self,
         kind: &str,
         payload: Value,
-        bytes: Option<Vec<u8>>,
+        file: Option<Arc<TemporaryFile>>,
         reply: Option<mpsc::SyncSender<Result<Value, PluginError>>>,
     ) -> Result<String, PluginError> {
         // Lock order matches cancel(), including the cancellation check and insertion.
@@ -206,12 +605,16 @@ impl RemoteContext {
         let is_waiting = reply.is_some();
         let id = self.broker.insert(Action {
             owner: self.owner.clone(),
+            root_plugin: self.root_plugin_id().to_owned(),
             plugin: self.plugin.clone(),
             kind: kind.into(),
             payload,
-            expires: Instant::now() + if is_waiting { WAIT } else { TTL },
+            expires: Instant::now() + TTL,
             reply,
-            bytes: bytes.map(Bytes::from),
+            file,
+            delivered: false,
+            transfers: HashSet::new(),
+            selection_lifetime: Arc::downgrade(&self.cancelled),
         })?;
         if is_waiting {
             waiting.push(id.clone());
@@ -219,47 +622,101 @@ impl RemoteContext {
         Ok(id)
     }
 
-    fn ask(&self, kind: &str, payload: Value) -> Result<Value, PluginError> {
+    fn ask(
+        &self,
+        kind: &str,
+        payload: Value,
+        invocation: &HostInvocation,
+    ) -> Result<Value, PluginError> {
         let (tx, rx) = mpsc::sync_channel(1);
         let id = self.action(kind, payload, None, Some(tx))?;
-        let result = rx
-            .recv_timeout(WAIT)
-            .map_err(|_| error("CANCELLED", "远程文件操作已取消、超时或连接已关闭。"));
+        let result = loop {
+            if let Err(error) = invocation.check() {
+                break Err(error);
+            }
+            if self.is_cancelled() {
+                break Err(error("CANCELLED", "Remote invocation has ended."));
+            }
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(error("CANCELLED", "Remote connection has ended."));
+                }
+            }
+        };
         self.waiting.lock().unwrap().retain(|item| item != &id);
-        self.broker.actions.lock().unwrap().remove(&id);
-        result?
+        self.broker.remove(&id, NotificationState::Cancelled);
+        result
+    }
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.root_plugin == other.root_plugin
+            && Arc::ptr_eq(&self.broker, &other.broker)
+    }
+    pub(crate) fn download_file(
+        &self,
+        name: String,
+        file: Arc<TemporaryFile>,
+        size: u64,
+    ) -> Result<Value, PluginError> {
+        let id = self.action(
+            "download",
+            json!({"name":name,"size":size}),
+            Some(file),
+            None,
+        )?;
+        serde_json::to_value(FileResult::Remote {
+            state: RemoteFileState::Ready,
+            name,
+            size,
+            download_id: id,
+            expires_at: None,
+        })
+        .map_err(|_| error("INTERNAL", "Cannot describe downloaded file."))
     }
 
+    #[cfg(test)]
     pub(crate) fn service(&self, method: &str, params: &Value) -> Result<Value, PluginError> {
+        self.service_with_invocation(method, params, &HostInvocation::default())
+    }
+    pub(crate) fn service_with_invocation(
+        &self,
+        method: &str,
+        params: &Value,
+        invocation: &HostInvocation,
+    ) -> Result<Value, PluginError> {
         match method {
-            "core.files.pick" => self.pick(params),
-            "core.files.read" => self.read(params),
+            "core.files.pick" => self.pick(params, invocation),
+            "core.files.read" => self.read(params, invocation),
             "core.files.export" => {
                 let name = params
                     .get("name")
                     .and_then(Value::as_str)
-                    .filter(|name| crate::plugin_runtime::safe_export_name(name))
+                    .filter(|name| crate::host_services::safe_export_name(name))
                     .ok_or_else(|| error("INVALID_INPUT", "导出文件名无效。"))?;
                 let encoded = params
                     .get("contentBase64")
                     .and_then(Value::as_str)
-                    .filter(|v| v.len() <= 28 * 1024 * 1024)
-                    .ok_or_else(|| error("RESOURCE_LIMIT", "导出文件不能超过 20 MiB。"))?;
+                    .ok_or_else(|| error("INVALID_INPUT", "Export bytes are missing."))?;
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(encoded)
-                    .map_err(|_| error("INVALID_INPUT", "导出内容无效。"))?;
-                if bytes.len() > 20 * 1024 * 1024 {
-                    return Err(error("RESOURCE_LIMIT", "导出文件不能超过 20 MiB。"));
-                }
-                self.action(
-                    "download",
-                    json!({"name": name, "size": bytes.len()}),
-                    Some(bytes),
-                    None,
-                )?;
-                Ok(json!({"path": format!("浏览器下载/{name}")}))
+                    .map_err(|_| error("INVALID_INPUT", "Export base64 is invalid."))?;
+                let parent = std::env::temp_dir().join("wonderland-transfers");
+                std::fs::create_dir_all(&parent)
+                    .map_err(|_| error("FILE_ERROR", "Cannot prepare transfer directory."))?;
+                let (file, mut writer) = TemporaryFile::create(&parent)?;
+                writer
+                    .write_all(&bytes)
+                    .and_then(|()| writer.sync_all())
+                    .map_err(|_| error("FILE_ERROR", "Cannot prepare export."))?;
+                drop(writer);
+                self.download_file(name.into(), file, bytes.len() as u64)
             }
-            "core.files.export_dir" => Ok(json!({"path":"浏览器下载"})),
+            "core.files.export_dir" => Err(error(
+                "DIRECTORY_UNAVAILABLE",
+                "当前访问环境没有可打开的本地导出目录，请在远程文件面板下载文件。",
+            )),
             "core.files.reveal_own"
                 if params.get("scope").and_then(Value::as_str) == Some("exports") =>
             {
@@ -270,8 +727,8 @@ impl RemoteContext {
                 "REMOTE_UNSUPPORTED",
                 "远程设备无法打开宿主机数据目录，请在宿主机本地操作。",
             )),
-            "core.browser.open" | "core.browser.open_official" => {
-                let url = crate::plugin_runtime::browser_url(params)?;
+            "core.browser.open" => {
+                let url = crate::host_services::browser_url(params)?;
                 self.action("open_url", json!({"url":url}), None, None)?;
                 Ok(json!({"ok":true}))
             }
@@ -279,7 +736,7 @@ impl RemoteContext {
         }
     }
 
-    fn pick(&self, params: &Value) -> Result<Value, PluginError> {
+    fn pick(&self, params: &Value, invocation: &HostInvocation) -> Result<Value, PluginError> {
         let extensions: Vec<String> = serde_json::from_value(
             params
                 .get("extensions")
@@ -295,59 +752,28 @@ impl RemoteContext {
             return Err(error("INVALID_INPUT", "文件类型无效。"));
         }
         let limit = match params.get("maxBytes") {
-            None => 128 * 1024 * 1024,
+            None => u64::MAX,
             Some(value) => value
                 .as_u64()
                 .filter(|v| *v > 0)
-                .ok_or_else(|| error("INVALID_INPUT", "文件大小限制无效。"))?
-                .min(128 * 1024 * 1024),
+                .ok_or_else(|| error("INVALID_INPUT", "文件大小限制无效。"))?,
         };
         if self.files.lock().unwrap().len() >= 8 {
             return Err(error("RESOURCE_LIMIT", "一次调用最多选择 8 个文件。"));
         }
-        let result = self.ask("pick", json!({"extensions":extensions,"maxBytes":limit}))?;
+        let result = self.ask("pick", json!({"extensions":extensions,"maxBytes":if limit == u64::MAX { None } else { Some(limit) }}), invocation)?;
         if result.get("cancelled").and_then(Value::as_bool) == Some(true) {
             return Ok(json!({"cancelled":true}));
         }
-        let handle = result
-            .get("handle")
-            .and_then(Value::as_str)
-            .filter(|v| !v.is_empty() && v.len() <= 128)
-            .ok_or_else(|| error("INVALID_INPUT", "文件标识无效。"))?;
-        let name = result
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|v| safe_selected_name(v))
-            .ok_or_else(|| error("INVALID_INPUT", "文件名无效。"))?;
-        let size = result
-            .get("size")
-            .and_then(Value::as_u64)
-            .filter(|v| *v <= limit)
-            .ok_or_else(|| error("RESOURCE_LIMIT", "文件超过允许的大小。"))?;
-        let extension = name
-            .rsplit_once('.')
-            .map_or("", |(_, ext)| ext)
-            .to_ascii_lowercase();
-        if !extensions.is_empty()
-            && !extensions
-                .iter()
-                .any(|v| v.eq_ignore_ascii_case(&extension))
-        {
-            return Err(error("INVALID_INPUT", "文件类型与插件要求不符。"));
-        }
-        let mime = crate::plugin_runtime::file_mime_type(&extension).to_owned();
-        self.files.lock().unwrap().insert(
-            handle.into(),
-            SelectedFile {
-                name: name.into(),
-                size,
-                mime: mime.clone(),
-            },
-        );
+        let (handle, selected) = selected_file(&result, &extensions, limit)?;
+        let name = selected.name.clone();
+        let size = selected.size;
+        let mime = selected.mime.clone();
+        self.files.lock().unwrap().insert(handle.clone(), selected);
         Ok(json!({"cancelled":false,"handle":handle,"name":name,"size":size,"mimeType":mime}))
     }
 
-    fn read(&self, params: &Value) -> Result<Value, PluginError> {
+    fn read(&self, params: &Value, invocation: &HostInvocation) -> Result<Value, PluginError> {
         let handle = params
             .get("handle")
             .and_then(Value::as_str)
@@ -373,7 +799,7 @@ impl RemoteContext {
                 .ok_or_else(|| error("INVALID_INPUT", "文件分块大小无效。"))?;
             (offset, count.min(size - offset))
         } else {
-            if size > 20 * 1024 * 1024 {
+            if size > (32 * 1024 * 1024 - 64 * 1024) / 4 * 3 {
                 return Err(error("RESOURCE_LIMIT", "较大文件需要插件分块读取。"));
             }
             (0, size)
@@ -384,6 +810,7 @@ impl RemoteContext {
             let result = self.ask(
                 "read",
                 json!({"handle":handle,"offset":offset + bytes.len() as u64,"length":length}),
+                invocation,
             )?;
             let encoded = result
                 .get("contentBase64")
@@ -401,6 +828,7 @@ impl RemoteContext {
         let eof = offset + count == size;
         if eof {
             self.files.lock().unwrap().remove(handle);
+            self.broker.release_selected(&self.owner, handle);
         }
         let mut result = json!({"name":name,"mimeType":mime,"contentBase64":base64::engine::general_purpose::STANDARD.encode(bytes)});
         if chunked {
@@ -408,6 +836,12 @@ impl RemoteContext {
             result["eof"] = json!(eof);
         }
         Ok(result)
+    }
+}
+
+impl Drop for RemoteContext {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -438,6 +872,143 @@ mod tests {
     }
 
     #[test]
+    fn hidden_transitive_providers_keep_root_device_and_file_interactions() {
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let observed = notifications.clone();
+        let broker = Arc::new(RemoteBroker::with_notify(Arc::new(
+            move |owner, root, notification| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(json!({"owner":owner,"root":root,"event":notification}));
+            },
+        )));
+        let root = Arc::new(RemoteContext::new(
+            broker.clone(),
+            "device-a".into(),
+            "a".into(),
+        ));
+        let b = root.for_plugin("b");
+        let c = b.for_plugin("c");
+        assert_eq!(c.root_plugin_id(), "a");
+        assert_eq!(c.invocation_depth(), 2);
+
+        let picking = b.clone();
+        let task = thread::spawn(move || {
+            picking.service(
+                "core.files.pick",
+                &json!({"extensions":["json"],"maxBytes":10}),
+            )
+        });
+        let action = next(&broker);
+        let pick_id = action["id"].as_str().unwrap();
+        assert_eq!(
+            broker.identity("device-a", pick_id),
+            Some(("a".into(), "b".into(), "pick".into()))
+        );
+        assert_eq!(broker.identity("device-b", pick_id), None);
+        broker
+            .reply(
+                "device-a",
+                pick_id,
+                json!({"handle":"picked","name":"source.json","size":3}),
+            )
+            .unwrap();
+        assert_eq!(task.join().unwrap().unwrap()["handle"], "picked");
+        let reading = b.clone();
+        let task =
+            thread::spawn(move || reading.service("core.files.read", &json!({"handle":"picked"})));
+        let action = next(&broker);
+        assert_eq!(action["rootPluginId"], "a");
+        assert_eq!(action["pluginId"], "b");
+        broker
+            .reply(
+                "device-a",
+                action["id"].as_str().unwrap(),
+                json!({"contentBase64":"YWJj"}),
+            )
+            .unwrap();
+        assert_eq!(task.join().unwrap().unwrap()["contentBase64"], "YWJj");
+
+        let result = c
+            .service(
+                "core.files.export",
+                &json!({"name":"result.json","contentBase64":"YWJj"}),
+            )
+            .unwrap();
+        let id = result["downloadId"].as_str().unwrap();
+        assert_eq!(
+            broker.identity("device-a", id),
+            Some(("a".into(), "c".into(), "download".into()))
+        );
+        assert!(broker.download("device-b", id).is_err());
+        let transfer = broker.download("device-a", id).unwrap();
+        assert_eq!(
+            std::fs::read(&transfer.file.path).unwrap().as_slice(),
+            b"abc"
+        );
+        assert_eq!(broker.list("device-a")[0]["state"], "transferring");
+        broker
+            .delivery("device-a", id, &transfer.transfer_id, true)
+            .unwrap();
+        assert_eq!(broker.list("device-a")[0]["state"], "delivered");
+        broker.reply("device-a", id, Value::Null).unwrap();
+        let events = notifications.lock().unwrap();
+        let downloads: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"]["kind"] == "download")
+            .collect();
+        assert_eq!(
+            downloads
+                .iter()
+                .map(|event| event["event"]["state"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["ready", "transferring", "delivered", "dismissed"]
+        );
+        assert!(downloads.iter().all(|event| event["owner"] == "device-a"
+            && event["event"]["rootPluginId"] == "a"
+            && event["event"]["pluginId"] == "c"));
+        drop(events);
+        root.cancel();
+        assert!(b.is_cancelled());
+        assert!(c.is_cancelled());
+    }
+
+    #[test]
+    fn completed_result_idle_expiry_enters_notifications_and_directories_never_return_fake_paths() {
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let observed = notifications.clone();
+        let broker = Arc::new(RemoteBroker::with_notify(Arc::new(
+            move |_, _, notification| observed.lock().unwrap().push(json!(notification)),
+        )));
+        let context = RemoteContext::new(broker.clone(), "device-a".into(), "a".into());
+        let result = context
+            .service(
+                "core.files.export",
+                &json!({"name":"x.json","contentBase64":""}),
+            )
+            .unwrap();
+        let id = result["downloadId"].as_str().unwrap();
+        broker.actions.lock().unwrap().get_mut(id).unwrap().expires = Instant::now();
+        broker.expire();
+        assert_eq!(notifications.lock().unwrap().len(), 1);
+        let transfer = broker.download("device-a", id).unwrap();
+        broker
+            .delivery("device-a", id, &transfer.transfer_id, true)
+            .unwrap();
+        broker.expire();
+        assert_eq!(notifications.lock().unwrap()[3]["state"], "expired");
+        assert!(broker.download("device-a", id).is_err());
+        assert_eq!(
+            context
+                .service("core.files.export_dir", &json!({}))
+                .unwrap_err()
+                .code,
+            "DIRECTORY_UNAVAILABLE"
+        );
+    }
+
+    #[test]
     fn exports_are_device_bound_and_never_write_to_the_host() {
         let (broker, context) = setup();
         let result = context
@@ -446,15 +1017,53 @@ mod tests {
                 &json!({"name":"result.csv","contentBase64":"YWJj"}),
             )
             .unwrap();
-        assert_eq!(result["path"], "浏览器下载/result.csv");
+        assert_eq!(result["kind"], "remote");
+        assert_eq!(result["state"], "ready");
+        assert_eq!(result["name"], "result.csv");
+        assert_eq!(result["size"], 3);
+        assert!(result.get("path").is_none());
         let action = next(&broker);
         let id = action["id"].as_str().unwrap();
+        assert_eq!(result["downloadId"], id);
+        assert!(result.get("expiresAt").is_none_or(Value::is_null));
         assert_eq!(broker.list("device-b"), json!([]));
         assert!(broker.download("device-b", id).is_err());
         assert!(broker.reply("device-b", id, Value::Null).is_err());
-        assert_eq!(broker.download("device-a", id).unwrap().as_ref(), b"abc");
+        assert_eq!(broker.upgrade_blockers().len(), 1);
+        let transfer = broker.download("device-a", id).unwrap();
+        assert_eq!(
+            std::fs::read(&transfer.file.path).unwrap().as_slice(),
+            b"abc"
+        );
+        assert!(
+            broker
+                .delivery("device-b", id, &transfer.transfer_id, true)
+                .is_err()
+        );
+        assert!(broker.reply("device-a", id, Value::Null).is_err());
+        let parallel = broker.download("device-a", id).unwrap();
+        broker
+            .delivery("device-a", id, &transfer.transfer_id, true)
+            .unwrap();
+        assert!(broker.upgrade_blockers()[0].contains("正在传输"));
+        broker
+            .delivery("device-a", id, &parallel.transfer_id, false)
+            .unwrap();
+        assert!(broker.upgrade_blockers().is_empty());
+        assert!(
+            broker
+                .delivery("device-a", id, &parallel.transfer_id, true)
+                .is_err()
+        );
         context.cancel(); // Completed calls must leave downloadable files available.
-        assert_eq!(broker.download("device-a", id).unwrap().as_ref(), b"abc");
+        let transfer = broker.download("device-a", id).unwrap();
+        assert_eq!(
+            std::fs::read(&transfer.file.path).unwrap().as_slice(),
+            b"abc"
+        );
+        broker
+            .delivery("device-a", id, &transfer.transfer_id, true)
+            .unwrap();
         broker.close();
         assert!(broker.download("device-a", id).is_err());
         assert!(
@@ -515,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_unblocks_waiters_and_expiry_revokes_downloads() {
+    fn cancellation_unblocks_waiters_and_unclaimed_downloads_survive_idle_expiry() {
         let (broker, context) = setup();
         let worker = context.clone();
         let task = thread::spawn(move || worker.service("core.files.pick", &json!({})));
@@ -542,10 +1151,145 @@ mod tests {
             .get_mut(action["id"].as_str().unwrap())
             .unwrap()
             .expires = Instant::now();
-        assert!(
+        let id = action["id"].as_str().unwrap();
+        broker.expire();
+        assert_eq!(broker.list("device-a").as_array().unwrap().len(), 1);
+        assert!(!broker.upgrade_blockers().is_empty());
+        let transfer = broker.download("device-a", id).unwrap();
+        broker
+            .delivery("device-a", id, &transfer.transfer_id, false)
+            .unwrap();
+        assert!(!broker.upgrade_blockers().is_empty());
+        broker.reply("device-a", id, Value::Null).unwrap();
+        assert!(broker.download("device-a", id).is_err());
+        assert!(broker.upgrade_blockers().is_empty());
+    }
+
+    #[test]
+    fn selector_waiting_uses_the_call_deadline_and_not_idle_expiry() {
+        let (broker, context) = setup();
+        let worker = context.clone();
+        let task = thread::spawn(move || worker.service("core.files.pick", &json!({})));
+        let action = next(&broker);
+        let id = action["id"].as_str().unwrap();
+        broker.actions.lock().unwrap().get_mut(id).unwrap().expires = Instant::now();
+        broker.expire();
+        assert_eq!(broker.list("device-a").as_array().unwrap().len(), 1);
+        assert!(broker.close_if_idle().is_err());
+        broker
+            .reply("device-a", id, json!({"cancelled":true}))
+            .unwrap();
+        assert_eq!(task.join().unwrap().unwrap()["cancelled"], true);
+        let worker = context.clone();
+        let invocation = HostInvocation::for_call(None, Some(30), None).unwrap();
+        let task = thread::spawn(move || {
+            worker.service_with_invocation("core.files.pick", &json!({}), &invocation)
+        });
+        assert_eq!(task.join().unwrap().unwrap_err().code, "TIMEOUT");
+        assert_eq!(broker.list("device-a"), json!([]));
+    }
+
+    #[test]
+    fn selected_device_handles_follow_partial_read_cancellation_drop_and_eof() {
+        fn choose(broker: &Arc<RemoteBroker>, context: &Arc<RemoteContext>, handle: &str) {
+            let worker = context.clone();
+            let task = thread::spawn(move || worker.service("core.files.pick", &json!({})));
+            let action = next(broker);
             broker
-                .download("device-a", action["id"].as_str().unwrap())
-                .is_err()
+                .reply(
+                    "device-a",
+                    action["id"].as_str().unwrap(),
+                    json!({"handle":handle,"name":"data.bin","size":3}),
+                )
+                .unwrap();
+            assert!(
+                broker
+                    .selected_handles("device-a")
+                    .contains(&handle.to_owned())
+            );
+            assert!(broker.selected_handles("device-b").is_empty());
+            assert_eq!(task.join().unwrap().unwrap()["handle"], handle);
+        }
+        let (broker, context) = setup();
+        choose(&broker, &context, "partial");
+        let worker = context.clone();
+        let task = thread::spawn(move || {
+            worker.service(
+                "core.files.read",
+                &json!({"handle":"partial","offset":0,"chunkBytes":1}),
+            )
+        });
+        let action = next(&broker);
+        broker
+            .reply(
+                "device-a",
+                action["id"].as_str().unwrap(),
+                json!({"contentBase64":"YQ=="}),
+            )
+            .unwrap();
+        assert_eq!(task.join().unwrap().unwrap()["eof"], false);
+        assert_eq!(broker.selected_handles("device-a"), ["partial"]);
+        context.cancel();
+        assert!(broker.selected_handles("device-a").is_empty());
+        let context = Arc::new(RemoteContext::new(
+            broker.clone(),
+            "device-a".into(),
+            "editor".into(),
+        ));
+        choose(&broker, &context, "unread");
+        drop(context);
+        assert!(broker.selected_handles("device-a").is_empty());
+        let context = Arc::new(RemoteContext::new(
+            broker.clone(),
+            "device-a".into(),
+            "editor".into(),
+        ));
+        choose(&broker, &context, "complete");
+        let worker = context.clone();
+        let task = thread::spawn(move || {
+            worker.service(
+                "core.files.read",
+                &json!({"handle":"complete","offset":0,"chunkBytes":3}),
+            )
+        });
+        let action = next(&broker);
+        broker
+            .reply(
+                "device-a",
+                action["id"].as_str().unwrap(),
+                json!({"contentBase64":"YWJj"}),
+            )
+            .unwrap();
+        assert_eq!(task.join().unwrap().unwrap()["eof"], true);
+        assert!(broker.selected_handles("device-a").is_empty());
+    }
+
+    #[test]
+    fn stopping_is_atomic_with_download_admission_and_requires_pending_results_to_be_handled() {
+        let (broker, context) = setup();
+        let result = context
+            .service(
+                "core.files.export",
+                &json!({"name":"result.anything","contentBase64":""}),
+            )
+            .unwrap();
+        let id = result["downloadId"].as_str().unwrap();
+        assert!(broker.close_if_idle().is_err());
+        let transfer = broker.download("device-a", id).unwrap();
+        assert!(broker.close_if_idle().is_err());
+        broker
+            .delivery("device-a", id, &transfer.transfer_id, true)
+            .unwrap();
+        broker.close_if_idle().unwrap();
+        assert_eq!(
+            context
+                .service(
+                    "core.files.export",
+                    &json!({"name":"new.bin","contentBase64":""})
+                )
+                .unwrap_err()
+                .code,
+            "CANCELLED"
         );
     }
 

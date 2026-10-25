@@ -1,0 +1,18 @@
+@layer components {
+  .app-drawer { position: fixed; inset: 0 0 0 auto; z-index: 61; display: flex; flex-direction: column; max-width: calc(100vw - 16px); min-width: 0; color: var(--app-ink); background: var(--app-sidebar-surface, var(--app-dialog-surface)); border-left: 1px solid var(--app-glass-line-strong); box-shadow: var(--app-sidebar-shadow); animation: app-drawer-enter var(--app-time-dialog) var(--app-ease) both; }
+  .app-drawer::before { content: ''; position: absolute; top: 0; left: 24px; right: 24px; height: 1px; background: linear-gradient(90deg, transparent, var(--app-ornament), transparent); opacity: var(--app-ornament-opacity); pointer-events: none; }
+  .app-drawer-header { display: flex; flex: 0 0 auto; align-items: center; gap: 16px; min-height: 64px; padding: 14px 24px; border-bottom: 1px solid var(--app-glass-line); }
+  .app-drawer-header > h2 { flex: 1; min-width: 0; margin: 0; font-size: 16px; font-weight: 600; line-height: 24px; overflow-wrap: anywhere; }
+  .app-drawer-close { display: grid; flex: 0 0 auto; place-items: center; width: 36px; height: 36px; padding: 0; border: 0; border-radius: var(--app-radius-control); color: var(--app-ink-muted); background: transparent; cursor: pointer; }
+  .app-drawer-close:hover:not(:disabled) { color: var(--app-ink); background: var(--app-glass-hover); }
+  .app-drawer-close:disabled { opacity: .4; cursor: default; }
+  .app-drawer-body { flex: 1; min-height: 0; min-width: 0; padding: 20px 24px; overflow: auto; overscroll-behavior: contain; font-size: 14px; line-height: 22px; }
+  .app-drawer-footer { display: flex; flex: 0 0 auto; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 12px; padding: 16px 24px; border-top: 1px solid var(--app-glass-line); }
+  .app-drawer-resizer { position: absolute; inset: 0 auto 0 -3px; width: 6px; cursor: col-resize; touch-action: none; }
+  .app-drawer-resizer:hover, .app-drawer-resizer:active { background: var(--app-accent-line); }
+  .app-drawer :is(.app-drawer-close, .app-drawer-resizer):focus-visible { outline: 2px solid var(--app-accent); outline-offset: var(--app-focus-offset); }
+  @media (max-width: 480px) { .app-drawer-header { padding: 12px 16px; } .app-drawer-body { padding: 16px; } .app-drawer-footer { padding: 14px 16px; } }
+  @media (prefers-reduced-motion: reduce) { .app-drawer { animation: none; } }
+  :root[data-effects='off'] .app-drawer { animation: none; }
+}
+@keyframes app-drawer-enter { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }

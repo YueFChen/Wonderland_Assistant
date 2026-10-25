@@ -12,8 +12,7 @@ export function AppBackdrop() {
   if (image) {
     return (
       <div aria-hidden className="pointer-events-none fixed inset-0 -z-10" style={{ opacity: 'var(--app-background-opacity, 1)' }}>
-        <img src={image} alt="" className="h-full w-full object-cover" />
-        <div className="app-backdrop-scrim absolute inset-0" />
+        <img data-app-background-image src={image} alt="" className="h-full w-full object-cover" />
       </div>
     )
   }
@@ -28,7 +27,6 @@ export function AppBackdrop() {
         className="app-backdrop h-full w-full"
         style={color ? { backgroundImage: 'none', backgroundColor: color } : undefined}
       />
-      {color ? <div className="app-backdrop-scrim absolute inset-0" /> : null}
     </div>
   )
 }

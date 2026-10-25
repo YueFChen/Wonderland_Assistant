@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { ArrowLeft, ArrowUpRight, CheckCircle2, LayoutGrid, LogOut, Monitor, Moon, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Search, ShieldCheck, Smartphone, Sun, Wifi } from 'lucide-react'
+import { ArrowLeft, ArrowUpRight, LayoutGrid, LogOut, Monitor, Moon, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Search, Sun, Wifi } from 'lucide-react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { connectWeb, disconnectWeb } from '../core/transport'
 import { usePlugins } from '../plugins/api'
-import { buildContributionRegistry, type WorkspaceContribution } from '../plugins/contributions'
+import { buildContributionRegistry, canOpenContribution, type WorkspaceContribution } from '../plugins/contributions'
 import { primaryPluginEntries } from '../plugins/pluginEntries'
 import { PluginIcon } from '../plugins/icons'
 import { PluginSurface } from '../pages/PluginPage'
@@ -47,35 +47,21 @@ export function MobileApp({ initialConnection = null, initialToken = '' }: { ini
   }
   return <div className="mobile-app" data-connected={Boolean(version)}>
     <header className={`mobile-header${version ? ' remote-desktop-only' : ''}`}>
-      <a href="#/" className="mobile-brand"><img src={brand} alt="" /><span>Wonderland<small>{t('webClient.subtitle')}</small></span></a>
+      <a href="#/" className="mobile-brand"><img src={brand} alt="" /><span>Wonderland</span></a>
       <div className="remote-header-actions">
         {version && <span className="remote-desktop-only remote-session"><Monitor size={15} aria-hidden /> CORE {version}</span>}
         <button className="mobile-icon" onClick={() => setDark(!dark)} aria-label={t(dark ? 'mobile.light' : 'mobile.dark')}>{dark ? <Sun size={20} /> : <Moon size={20} />}</button>
       </div>
     </header>
     {version ? <Workspace version={version} dark={dark} onToggleTheme={() => setDark(!dark)} /> : <div className="remote-login-layout">
-      <aside className="remote-login-brand remote-desktop-only" aria-label="Wonderland Assistant">
-        <img src={brand} alt="" />
-        <p className="mobile-kicker">WONDERLAND ASSISTANT</p>
-        <h1>{t('webClient.welcome')}</h1>
-        <p className="mobile-intro">{t('webClient.intro')}</p>
-        <div className="remote-login-features"><span><Monitor size={18} aria-hidden />{t('webClient.desktopLayout')}</span><span><ShieldCheck size={18} aria-hidden />{t('webClient.sharedOnly')}</span></div>
-      </aside>
       <main className="mobile-login">
-      <div className="remote-mobile-only">
-      <div className="mobile-kicker"><Smartphone size={16} /> {t('mobile.kicker')}</div>
-      <h1>{t('mobile.welcome')}</h1>
-      <p className="mobile-intro">{t('mobile.intro')}</p>
-      </div>
       <form className="glass-card mobile-connect" onSubmit={(event) => void connect(event)}>
-        <div className="mobile-connect-title"><Wifi size={22} /><h2>{t('mobile.connect')}</h2></div>
-        <p>{t('mobile.connectHint')}</p>
+        <div className="mobile-connect-title"><Wifi size={22} /><h1>{t('mobile.connect')}</h1></div>
         <label htmlFor="access-key">{t('webAccess.key')}</label>
         <input id="access-key" type="password" autoComplete="off" maxLength={1024} spellCheck={false} value={token} onChange={(e) => setToken(e.target.value)} placeholder={t('mobile.keyPlaceholder')} />
         <button className="mobile-primary" disabled={busy}>{t(busy ? 'mobile.connecting' : 'mobile.enter')}<ArrowUpRight size={18} /></button>
         {error && <p role="alert" className="mobile-error">{error}</p>}
       </form>
-      <p className="mobile-security"><ShieldCheck size={18} />{t('mobile.keyPrivacy')}</p>
     </main></div>}
   </div>
 }
@@ -141,21 +127,18 @@ function Workspace({ version, dark, onToggleTheme }: { version: string; dark: bo
     {connection === 'reconnecting' && <p role="status" className="mobile-banner">{t('mobile.reconnecting')}</p>}
     {missed && <p role="alert" className="mobile-banner">{t('mobile.eventsMissed')}<button onClick={() => { setMissed(false); navigate('/') }}>{t('mobile.back')}</button></p>}
     {active ? <main className="mobile-tool">
-      <div className="mobile-tool-bar remote-desktop-only"><button className="mobile-icon" onClick={() => navigate('/')} aria-label={t('mobile.back')}><ArrowLeft size={20} /></button><h1>{active.title}</h1><span>{active.state.manifest.name}</span></div>
+      <div className="mobile-tool-bar remote-desktop-only"><button className="mobile-icon" onClick={() => navigate('/')} aria-label={t('mobile.back')}><ArrowLeft size={20} /></button><h1>{active.title}</h1>{active.state.manifest.name !== active.title && <span>{active.state.manifest.name}</span>}</div>
       <RemotePluginWorkspace key={active.pluginId} active={active} contributions={contributions} dark={dark} onOpen={open} />
     </main> : <main className="mobile-workspace">
-      <div className="mobile-kicker remote-desktop-only"><CheckCircle2 size={15} /> CORE {version} · {t(connection === 'reconnecting' ? 'webClient.reconnecting' : 'mobile.connected')}</div>
-      <div className="remote-workspace-heading"><div><h1>{t('mobile.workspace')}</h1><p className="mobile-intro">{t('mobile.workspaceHint')}</p></div><span className="remote-desktop-only remote-tool-count">{t('webClient.toolCount', { count: allEntries.length })}</span></div>
+      <div className="remote-workspace-heading"><h1>{t('mobile.workspace')}</h1><span className="remote-desktop-only remote-tool-count">{t('webClient.toolCount', { count: allEntries.length })}</span></div>
       <label className="mobile-search"><Search size={19} /><input aria-label={t('mobile.search')} placeholder={t('mobile.search')} value={search} onChange={(e) => setSearch(e.target.value)} /></label>
       {error && <p role="alert" className="mobile-error">{t(error)}</p>}
       {!states && <p role="status" className="mobile-empty">{t('pluginPage.loading')}</p>}
       {states && entries.length === 0 && <div className="glass-card mobile-empty"><LayoutGrid size={28} /><p>{t(search ? 'mobile.noResults' : 'mobile.noTools')}</p></div>}
       <div className="mobile-tools">{entries.map((item) => <button key={item.id} className="glass-card mobile-tool-card" onClick={() => open(item.id)}>
         <div className="mobile-tool-glyph"><PluginIcon icon={item.icon} className="remote-card-icon" /></div><ArrowUpRight size={18} className="mobile-tool-arrow" />
-        <strong>{item.state.manifest.name}</strong><span>{item.state.manifest.description}</span><small data-ready={item.status === 'ready'}>{t(item.status === 'ready' ? 'mobile.ready' : 'mobile.unavailableShort')}</small>
+        <strong>{item.state.manifest.name}</strong><span>{item.state.manifest.description}</span>{item.status !== 'ready' && <small data-ready="false">{t('mobile.unavailableShort')}</small>}
       </button>)}</div>
-      <p className="mobile-note remote-mobile-only">{t('mobile.pluginHint')}</p>
-      <p className="mobile-note remote-desktop-only">{t('webClient.pluginHint')}</p>
     </main>}
     </div>
   </div>
@@ -206,7 +189,7 @@ function RemotePluginWorkspace({ active, contributions, dark, onOpen }: {
       <nav className="remote-page-tabs remote-desktop-only" aria-label={t('mobile.pluginPage')}>{contributions.map((item) => <button key={item.id} onClick={() => onOpen(item.id)} aria-current={item.id === active.id ? 'page' : undefined}>{item.title}</button>)}</nav>
     }
     <div className="mobile-surface">
-      {visibleSurfaces.map((item) => item.status === 'ready'
+      {visibleSurfaces.map((item) => canOpenContribution(item)
         ? <PluginSurface key={item.id} contribution={item} active={item.id === active.id} resolvedTheme={dark ? 'dark' : 'light'} surface={item.kind} onOpenView={onOpen} />
         : item.id === active.id && <p key={item.id} role="status" className="mobile-empty">{t('mobile.unavailable')}</p>)}
     </div>

@@ -33,7 +33,7 @@ export function TitleBar() {
       <div className="app-titlebar-drag" data-tauri-drag-region />
       <div className="app-titlebar-controls">
         <button type="button" aria-label={t('window.minimize')} title={t('window.minimize')} onClick={() => { if (windowHandle) void windowHandle.minimize() }}>
-          <Minus aria-hidden />
+          <Minus className="app-background-copy" aria-hidden />
         </button>
         <button
           type="button"
@@ -41,10 +41,10 @@ export function TitleBar() {
           title={maximized ? t('window.restore') : t('window.maximize')}
           onClick={() => { if (windowHandle) void windowHandle.toggleMaximize().then(() => windowHandle.isMaximized()).then(setMaximized) }}
         >
-          {maximized ? <Copy aria-hidden /> : <Square aria-hidden />}
+          {maximized ? <Copy className="app-background-copy" aria-hidden /> : <Square className="app-background-copy" aria-hidden />}
         </button>
         <button type="button" className="app-titlebar-close" aria-label={t('window.close')} title={t('window.close')} onClick={() => { if (windowHandle) void windowHandle.close() }}>
-          <X aria-hidden />
+          <X className="app-background-copy" aria-hidden />
         </button>
       </div>
     </header>

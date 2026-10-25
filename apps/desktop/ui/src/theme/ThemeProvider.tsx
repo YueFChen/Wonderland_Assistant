@@ -10,9 +10,12 @@ import {
   type ReactNode,
 } from 'react'
 import type { BackgroundAsset, ThemeMode, ThemeSettings, ThemeState } from '@wonderland/core-bindings'
+import { useUiEffects } from '@wonderland/ui'
+import { HOST_THEME_VARIABLES, type HostTheme } from '@wonderland/plugin-ui-sdk'
 
 import { themeApi } from './api'
 import { paletteFromColor, paletteFromImage, type AutoPalette } from './autoPalette'
+import { useBackgroundContrast } from './useBackgroundContrast'
 import { t } from '../i18n'
 
 /** Resolved light or dark theme. */
@@ -21,10 +24,13 @@ export type ResolvedTheme = 'light' | 'dark'
 interface ThemeContextValue {
   settings: ThemeSettings
   resolved: ResolvedTheme
+  componentVariables: HostTheme['variables']
   /** 当前背景图的 data URL；档位不是自定义或未选择图片时为 null。 */
   backgroundUrl: string | null
   /** 后端主题是否已读回；此前先使用本地缓存预设网页底色。 */
   ready: boolean
+  effectsEnabled: boolean
+  setEffectsEnabled: (enabled: boolean) => void
   /** 背景库清单，最近导入的在前。 */
   backgrounds: BackgroundAsset[]
   /** 背景库缩略图缓存（id → data URL），按需加载。 */
@@ -41,8 +47,9 @@ interface ThemeContextValue {
 const ThemeContext = createContext<ThemeContextValue | null>(null)
 
 /** Default theme settings. */
-const INITIAL: ThemeSettings = { mode: 'dark', background: null, background_opacity: 100 }
+const INITIAL: ThemeSettings = { mode: 'system', background: null, background_opacity: 100 }
 const THEME_CACHE_KEY = 'wonderland.theme.mode'
+const EFFECTS_CACHE_KEY = 'wonderland.ui.effects'
 
 function cachedMode(): ThemeMode {
   try {
@@ -63,6 +70,15 @@ const MAX_BACKGROUND_BYTES = 20 * 1024 * 1024
 
 /** Applies the selected theme and manages the background library cache. */
 export function ThemeProvider({ children }: { children: ReactNode }) {
+  const [effectsEnabled, updateEffectsEnabled] = useState(() => {
+    try { return localStorage.getItem(EFFECTS_CACHE_KEY) !== 'off' } catch { return true }
+  })
+  const setEffectsEnabled = useCallback((enabled: boolean) => {
+    updateEffectsEnabled(enabled)
+    try { localStorage.setItem(EFFECTS_CACHE_KEY, enabled ? 'standard' : 'off') } catch { /* Device preference can remain in memory. */ }
+  }, [])
+  useUiEffects(effectsEnabled)
+  const appliedBackgroundVariables = useRef<string[]>([])
   const [state, setState] = useState<ThemeState>(() => ({ settings: { ...INITIAL, mode: cachedMode() }, background_url: null }))
   const [backgrounds, setBackgrounds] = useState<BackgroundAsset[]>([])
   const [customPalette, setCustomPalette] = useState<AutoPalette | null>(null)
@@ -108,6 +124,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       ? `color:${settings.background.hex}`
       : 'none'
   const activeCustomPalette = customPalette?.sourceKey === customSourceKey ? customPalette : null
+  // Keep the previous palette while the next background is decoding, avoiding a dark flash.
+  const effectivePalette = settings.mode === 'custom' ? activeCustomPalette ?? customPalette : null
 
   useEffect(() => {
     if (settings.mode !== 'custom') {
@@ -120,19 +138,19 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         return
       }
       let live = true
-      setCustomPalette(null)
-      void paletteFromImage(customSourceKey, backgroundUrl)
+      void paletteFromImage(customSourceKey, backgroundUrl, { fallbackMode: systemDark ? 'dark' : 'light', opacity: settings.background_opacity / 100 })
         .then((palette) => { if (live) setCustomPalette(palette) })
         .catch(() => {
-          if (live) setCustomPalette(paletteFromColor(customSourceKey, '#302744'))
+          if (live) setCustomPalette(paletteFromColor(customSourceKey, systemDark ? '#171b28' : '#f3f2fa'))
         })
       return () => { live = false }
     }
     setCustomPalette(paletteFromColor(
       customSourceKey,
-      settings.background?.kind === 'color' ? settings.background.hex : '#1b1830',
+      settings.background?.kind === 'color' ? settings.background.hex : systemDark ? '#171b28' : '#f3f2fa',
+      settings.background_opacity / 100,
     ))
-  }, [settings.mode, customSourceKey, backgroundUrl])
+  }, [settings.mode, customSourceKey, backgroundUrl, settings.background_opacity, systemDark])
 
   const resolved: ResolvedTheme =
     settings.mode === 'light'
@@ -140,7 +158,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       : settings.mode === 'system' && !systemDark
         ? 'light'
         : settings.mode === 'custom'
-          ? activeCustomPalette?.mode ?? 'dark'
+          ? effectivePalette?.mode ?? (systemDark ? 'dark' : 'light')
           : 'dark'
 
   useLayoutEffect(() => {
@@ -150,15 +168,32 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       '--app-background-opacity',
       String(Math.min(100, Math.max(0, settings.background_opacity)) / 100),
     )
-    for (const property of Object.keys(customPalette?.variables ?? {})) {
+    for (const property of appliedBackgroundVariables.current) {
       root.style.removeProperty(property)
     }
-    if (settings.mode === 'custom' && activeCustomPalette) {
-      for (const [property, value] of Object.entries(activeCustomPalette.variables)) {
+    appliedBackgroundVariables.current = []
+    if (effectivePalette) {
+      for (const [property, value] of Object.entries(effectivePalette.variables)) {
         root.style.setProperty(property, value)
+        appliedBackgroundVariables.current.push(property)
       }
     }
-  }, [resolved, settings.mode, settings.background_opacity, customPalette, activeCustomPalette])
+    return () => {
+      for (const property of appliedBackgroundVariables.current) root.style.removeProperty(property)
+      appliedBackgroundVariables.current = []
+    }
+  }, [resolved, settings.background_opacity, effectivePalette])
+
+  useBackgroundContrast({
+    imageUrl: ready && settings.mode === 'custom' && settings.background?.kind === 'image' ? backgroundUrl : null,
+    color: ready && settings.mode === 'custom' && settings.background?.kind === 'color' ? settings.background.hex : null,
+    opacity: settings.background_opacity / 100,
+    pageColor: effectivePalette?.variables['--app-page'],
+  })
+
+  const componentVariables = useMemo<HostTheme['variables']>(() => effectivePalette
+    ? Object.fromEntries(HOST_THEME_VARIABLES.map(property => [property, effectivePalette.variables[property]]).filter(([, value]) => value !== undefined))
+    : undefined, [effectivePalette])
 
   useEffect(() => {
     if (settings.mode !== 'custom' || settings.background?.kind !== 'image') return
@@ -226,8 +261,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     () => ({
       settings,
       resolved,
+      componentVariables,
       backgroundUrl,
       ready,
+      effectsEnabled,
+      setEffectsEnabled,
       backgrounds,
       thumbnails,
       ensureThumbnail,
@@ -239,8 +277,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     [
       settings,
       resolved,
+      componentVariables,
       backgroundUrl,
       ready,
+      effectsEnabled,
+      setEffectsEnabled,
       backgrounds,
       thumbnails,
       ensureThumbnail,

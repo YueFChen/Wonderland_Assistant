@@ -1,5 +1,10 @@
 import './shell/sidebar.css'
 
+export { Dialog, DialogButton, type DialogProps } from './overlay/Dialog.tsx'
+export { Drawer, type DrawerProps } from './overlay/Drawer.tsx'
+export { confirmDialog, type ConfirmDialogOptions } from './overlay/confirmDialog.tsx'
+export { useUiEffects } from './effects/useUiEffects.ts'
+
 export {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
