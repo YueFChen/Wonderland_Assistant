@@ -65,7 +65,12 @@ impl Logging {
 ///
 /// 安装全局 subscriber；重复安装或初始化失败时返回 [`KernelError`]。
 pub fn init(settings: LogSettings, app_data_dir: &Path) -> Result<Logging, KernelError> {
-    init_with(settings, app_data_dir, filter::rust_log())
+    init_with(settings, app_data_dir, filter::rust_log(), true)
+}
+
+/// Keep CLI stdout/stderr reserved for command envelopes, while retaining file diagnostics.
+pub fn init_file_only(settings: LogSettings, app_data_dir: &Path) -> Result<Logging, KernelError> {
+    init_with(settings, app_data_dir, filter::rust_log(), false)
 }
 
 /// 使用指定的 `RUST_LOG` 值初始化日志系统；`None` 表示未设置。
@@ -73,6 +78,7 @@ fn init_with(
     settings: LogSettings,
     app_data_dir: &Path,
     rust_log: Option<String>,
+    console: bool,
 ) -> Result<Logging, KernelError> {
     let dir = log_dir(app_data_dir);
     fs::create_dir_all(&dir).map_err(|error| init_error(&dir, error))?;
@@ -96,12 +102,14 @@ fn init_with(
     let subscriber = registry().with(filter_layer).with(file_layer);
 
     #[cfg(debug_assertions)]
-    let subscriber = subscriber.with(
+    let subscriber = subscriber.with(console.then(|| {
         fmt::layer()
             .with_ansi(true)
             .with_target(true)
-            .with_writer(redact::RedactingMakeWriter::new(std::io::stderr)),
-    );
+            .with_writer(redact::RedactingMakeWriter::new(std::io::stderr))
+    }));
+    #[cfg(not(debug_assertions))]
+    let _ = console;
 
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|error| KernelError::Other(format!("日志系统已初始化过：{error}")))?;
@@ -280,6 +288,7 @@ mod tests {
             },
             &root,
             None,
+            false,
         )
         .unwrap();
 

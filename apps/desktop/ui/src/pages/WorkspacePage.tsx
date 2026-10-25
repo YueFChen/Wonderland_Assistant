@@ -1,12 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
-import { ArrowRight, ArrowLeftRight, ArrowUp, ArrowDown, GripVertical, Pin, Search, Puzzle, RotateCcw, Eye, EyeOff } from 'lucide-react'
+import { ArrowRight, ArrowLeftRight, ArrowUp, ArrowDown, GripVertical, Pin, Search, Puzzle, RotateCcw } from 'lucide-react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 
 import { PluginIcon } from '../plugins/icons'
 import { buildContributionRegistry, openContribution } from '../plugins/contributions'
 import { primaryPluginEntries } from '../plugins/pluginEntries'
 import { orderContributions, useWorkspaceLayout } from '../plugins/workspaceLayout'
-import { pluginApi, usePlugins } from '../plugins/api'
+import { usePlugins } from '../plugins/api'
 import { PluginManagement } from './PluginManagement'
 import { t } from '../i18n'
 import './WorkspacePage.css'
@@ -18,8 +18,7 @@ export function WorkspacePage() {
   const [searchParams] = useSearchParams()
   const managingPlugins = searchParams.get('view') === 'plugins'
   const { states, error, setStates } = usePlugins()
-  const { layout, togglePinned, toggleHidden, move, reorderActivities, reset } = useWorkspaceLayout()
-  const [pluginAuthors, setPluginAuthors] = useState<Record<string, string>>({})
+  const { layout, togglePinned, move, reorderActivities, reset } = useWorkspaceLayout()
   const [recoveryNotice, setRecoveryNotice] = useState('')
   const [draggedActivityId, setDraggedActivityId] = useState<string | null>(null)
   const [dropTargetId, setDropTargetId] = useState<string | null>(null)
@@ -33,20 +32,11 @@ export function WorkspacePage() {
   } | null>(null)
   const workspaceRef = useRef<HTMLElement | null>(null)
   const dragPreviewRef = useRef<HTMLDivElement | null>(null)
-  useEffect(() => {
-    if (managingPlugins) return
-    let live = true
-    void pluginApi.catalog()
-      .then((snapshot) => {
-        if (live) {
-          setPluginAuthors(Object.fromEntries(snapshot.plugins.map(({ registration }) => [registration.id, registration.author])))
-        }
-      })
-      .catch(() => {
-        // Local or unlisted plugins remain visible with the unknown-author fallback.
-      })
-    return () => { live = false }
-  }, [managingPlugins])
+  useLayoutEffect(() => {
+    if ((location.state as { focusWorkspaceHeading?: boolean } | null)?.focusWorkspaceHeading) {
+      workspaceRef.current?.querySelector('h1')?.focus()
+    }
+  }, [location.key, location.state])
   useEffect(() => {
     const routeState = location.state as {
       pluginPageRecovery?: { pluginId?: unknown; contributionId?: unknown }
@@ -176,35 +166,32 @@ export function WorkspacePage() {
   return (
     <section
       ref={workspaceRef}
-      className="mx-auto w-full max-w-7xl space-y-10"
+      className="mx-auto w-full max-w-7xl space-y-8"
       onPointerMove={moveActivityDrag}
       onPointerUp={finishActivityDrag}
       onPointerCancel={cancelActivityDrag}
       onLostPointerCapture={cancelActivityDrag}
     >
-      <header className="mb-9 flex flex-wrap items-end justify-between gap-4">
+      <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
         <div>
-          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-brand-400">Wonderland</p>
-          <h1 className="text-3xl font-bold tracking-tight text-ink">{t('workspace.title')}</h1>
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-ink-muted">
-            {states ? t('workspace.launcherHint') : t('workspace.loading')}
-          </p>
+          <h1 tabIndex={-1} className="app-background-copy text-3xl font-bold tracking-tight text-ink">{t('workspace.title')}</h1>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
             onClick={() => window.dispatchEvent(new Event('wonderland:open-command-palette'))}
-            className="glass-card inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-ink transition hover:bg-glass-hover"
+            className="app-button"
+            aria-keyshortcuts="Control+Shift+P Meta+Shift+P"
+            title={`${t('workspace.search')} · Ctrl+Shift+P`}
           >
             <Search className="h-4 w-4" aria-hidden />
             {t('workspace.search')}
-            <kbd className="ml-1 rounded border border-glass-line px-1.5 py-0.5 text-[10px] text-ink-faint">Ctrl⇧P</kbd>
           </button>
           <button
             type="button"
             aria-pressed={managingPlugins}
             onClick={() => navigate(managingPlugins ? '/workspace' : '/workspace?view=plugins')}
-            className={`glass-card inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition hover:bg-glass-hover ${managingPlugins ? 'border-brand-500/30 text-brand-400' : 'border-glass-line text-ink'}`}
+            className="app-button"
           >
             <Puzzle className="h-4 w-4" aria-hidden />
             {managingPlugins ? t('workspace.backToActivities') : t('workspace.pluginManagement')}
@@ -212,7 +199,7 @@ export function WorkspacePage() {
           <button
             type="button"
             onClick={reset}
-            className="glass-card inline-flex items-center gap-2 rounded-lg border border-glass-line px-3 py-2 text-sm text-ink-muted transition hover:bg-glass-hover hover:text-ink"
+            className="app-button inline-flex items-center"
           >
             <RotateCcw className="h-3.5 w-3.5" aria-hidden />
             {t('workspace.resetLayout')}
@@ -224,7 +211,7 @@ export function WorkspacePage() {
       {recoveryNotice && !managingPlugins && (
         <div role="status" className="mb-5 flex flex-wrap items-center gap-3 rounded-lg border border-glass-line bg-glass px-4 py-3 text-sm text-ink-muted">
           <p className="min-w-0 flex-1">{recoveryNotice}</p>
-          <button type="button" onClick={() => setRecoveryNotice('')} className="shrink-0 rounded-md px-2 py-1 text-ink hover:bg-glass-hover">{t('common.dismiss')}</button>
+          <button type="button" onClick={() => setRecoveryNotice('')} className="app-button app-button-quiet shrink-0">{t('common.dismiss')}</button>
         </div>
       )}
 
@@ -234,19 +221,19 @@ export function WorkspacePage() {
         <>
       {pinned.length > 0 && (
         <section className="mb-10">
-          <h2 className="mb-3 text-xs font-bold uppercase tracking-[0.16em] text-ink-faint">{t('workspace.pinned')}</h2>
+          <h2 className="app-background-copy mb-3 text-xs font-bold uppercase tracking-[0.16em] text-ink-faint">{t('workspace.pinned')}</h2>
           <div className="flex flex-wrap gap-2">
             {pinned.map((item, index) => {
               return (
                 <div key={item.id} className="glass-card flex items-center gap-1 rounded-xl p-1.5">
-                  <button type="button" onClick={() => open(item.id)} className="inline-flex max-w-64 items-center gap-2 rounded-lg px-2 py-1.5 text-sm text-ink hover:bg-glass-hover" title={item.id}>
+                  <button type="button" onClick={() => open(item.id)} className="app-button app-button-quiet inline-flex max-w-64 items-center" title={item.id}>
                     <PluginIcon icon={item.icon} pluginId={item.pluginId} className="h-4 w-4 shrink-0 text-brand-400" />
                     <span className="truncate">{item.title}</span>
                   </button>
-                  <button type="button" disabled={index === 0} onClick={() => move(item.id, -1)} className="rounded-md p-1 text-ink-faint hover:bg-glass-hover hover:text-ink disabled:opacity-30" aria-label={t('workspace.moveUp')} title={t('workspace.moveUp')}>
+                  <button type="button" disabled={index === 0} onClick={() => move(item.id, -1)} className="app-icon-button" aria-label={t('workspace.moveUp')} title={t('workspace.moveUp')}>
                     <ArrowUp className="h-3.5 w-3.5" aria-hidden />
                   </button>
-                  <button type="button" disabled={index === pinned.length - 1} onClick={() => move(item.id, 1)} className="rounded-md p-1 text-ink-faint hover:bg-glass-hover hover:text-ink disabled:opacity-30" aria-label={t('workspace.moveDown')} title={t('workspace.moveDown')}>
+                  <button type="button" disabled={index === pinned.length - 1} onClick={() => move(item.id, 1)} className="app-icon-button" aria-label={t('workspace.moveDown')} title={t('workspace.moveDown')}>
                     <ArrowDown className="h-3.5 w-3.5" aria-hidden />
                   </button>
                 </div>
@@ -257,12 +244,12 @@ export function WorkspacePage() {
       )}
 
       {continueActivity && (
-        <section className="mb-9 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-brand-500/20 bg-brand-600/5 px-5 py-4">
+        <section className="glass-card mb-9 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-brand-500/20 px-5 py-4">
           <div className="min-w-0">
-            <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-brand-400">{t('workspace.continue')}</p>
+            <p className="text-xs font-bold uppercase tracking-[0.16em] text-brand-400">{t('workspace.continue')}</p>
             <p className="mt-1 truncate text-sm font-semibold text-ink">{continueActivity.title}</p>
           </div>
-          <button type="button" onClick={() => open(continueActivity.id)} className="rounded-lg bg-brand-600 px-4 py-2 text-xs font-semibold text-white hover:bg-brand-500">
+          <button type="button" onClick={() => open(continueActivity.id)} className="app-button app-button-primary">
             {t('workspace.resumeActivity')}
           </button>
         </section>
@@ -270,8 +257,7 @@ export function WorkspacePage() {
 
       <section>
         <div className="mb-4 flex items-center justify-between gap-3">
-          <h2 className="text-xs font-bold uppercase tracking-[0.16em] text-ink-faint">{t('workspace.activities')}</h2>
-          <span className="text-xs text-ink-faint">{activities.length}</span>
+          <h2 className="app-background-copy text-xs font-bold uppercase tracking-[0.16em] text-ink-faint">{t('workspace.activities')}</h2>
         </div>
         {!states ? (
           <p role="status" className="glass-card rounded-xl px-5 py-8 text-center text-sm text-ink-muted">{t('workspace.loading')}</p>
@@ -283,7 +269,6 @@ export function WorkspacePage() {
           <div className="grid gap-2.5 md:grid-cols-2 2xl:grid-cols-3">
             {previewActivities.map((item) => {
               const pinnedItem = layout.pinnedIds.includes(item.id)
-              const hiddenItem = layout.hiddenIds.includes(item.id)
               const isDragging = draggedActivityId === item.id
               return (
                 <article
@@ -291,7 +276,7 @@ export function WorkspacePage() {
                   data-activity-id={item.id}
                   data-drop-target={dropTargetId === item.id ? 'true' : undefined}
                   style={isDragging && dragPreview ? { height: dragPreview.height } : undefined}
-                  className={`activity-card glass-card flex min-h-44 flex-col rounded-xl p-3 transition ${
+                  className={`activity-card glass-card flex min-h-40 flex-col rounded-xl p-3 transition ${
                     isDragging ? 'activity-card-dragging' : ''
                   }`}
                 >
@@ -304,14 +289,13 @@ export function WorkspacePage() {
                       </span>
                       <span className="min-w-0">
                         <span className="block truncate font-semibold text-ink">{item.title}</span>
-                        <span className="mt-1 block truncate text-xs text-ink-faint">{item.state.manifest.name} · {item.id}</span>
-                        <span className="mt-0.5 block truncate text-[11px] text-ink-faint">{t('workspace.author', { author: pluginAuthors[item.state.manifest.id] ?? t('workspace.authorUnknown') })}</span>
+                        {item.state.manifest.name !== item.title && <span className="mt-1 block truncate text-xs text-ink-faint">{item.state.manifest.name}</span>}
                       </span>
                     </button>
                     <div className="flex shrink-0 items-center gap-2">
-                      <span className="rounded-full border border-glass-line px-2 py-1 text-[10px] text-ink-muted">
+                      {item.status !== 'ready' && <span className="rounded-md border border-glass-line px-2 py-1 text-xs text-ink-muted">
                         {t(`workspace.contributionStatus.${item.status}`)}
-                      </span>
+                      </span>}
                       <button
                         type="button"
                         onPointerDown={(event) => startActivityDrag(event, item.id)}
@@ -331,15 +315,9 @@ export function WorkspacePage() {
                       {item.status === 'ready' ? t('workspace.openActivity') : t('workspace.viewStatus')}
                       <ArrowRight className="h-3.5 w-3.5" aria-hidden />
                     </button>
-                    <div className="flex items-center gap-1">
-                      {hiddenItem && <span className="mr-1 text-[10px] text-ink-faint">{t('workspace.hidden')}</span>}
-                      <button type="button" onClick={() => togglePinned(item.id)} className={`rounded-md p-1.5 transition hover:bg-glass-hover ${pinnedItem ? 'text-brand-400' : 'text-ink-faint'}`} aria-label={pinnedItem ? t('workspace.unpin') : t('workspace.pin')} title={pinnedItem ? t('workspace.unpin') : t('workspace.pin')}>
-                        <Pin className="h-4 w-4" aria-hidden />
-                      </button>
-                      <button type="button" onClick={() => toggleHidden(item.id)} className="rounded-md p-1.5 text-ink-faint transition hover:bg-glass-hover hover:text-ink" aria-label={hiddenItem ? t('workspace.show') : t('workspace.hide')} title={hiddenItem ? t('workspace.show') : t('workspace.hide')}>
-                        {hiddenItem ? <Eye className="h-4 w-4" aria-hidden /> : <EyeOff className="h-4 w-4" aria-hidden />}
-                      </button>
-                    </div>
+                    <button type="button" onClick={() => togglePinned(item.id)} className="app-icon-button" aria-pressed={pinnedItem} aria-label={pinnedItem ? t('workspace.unpin') : t('workspace.pin')} title={pinnedItem ? t('workspace.unpin') : t('workspace.pin')}>
+                      <Pin className={`h-4 w-4${pinnedItem ? ' fill-current' : ''}`} aria-hidden />
+                    </button>
                   </div>
                   </>}
                 </article>
@@ -349,7 +327,7 @@ export function WorkspacePage() {
         )}
       </section>
       {dragPreview && dragPreviewActivity && (
-        <div ref={dragPreviewRef} className="activity-drag-preview glass-card flex min-h-44 flex-col rounded-xl p-3" aria-hidden="true">
+        <div ref={dragPreviewRef} className="activity-drag-preview glass-card flex min-h-40 flex-col rounded-xl p-3" aria-hidden="true">
           <div className="flex items-start justify-between gap-3">
             <div className="flex min-w-0 items-start gap-3">
               <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-brand-600/15 text-brand-400">
@@ -357,13 +335,12 @@ export function WorkspacePage() {
               </span>
               <span className="min-w-0">
                 <span className="block truncate font-semibold text-ink">{dragPreviewActivity.title}</span>
-                <span className="mt-1 block truncate text-xs text-ink-faint">{dragPreviewActivity.state.manifest.name} · {dragPreviewActivity.id}</span>
-                <span className="mt-0.5 block truncate text-[11px] text-ink-faint">{t('workspace.author', { author: pluginAuthors[dragPreviewActivity.state.manifest.id] ?? t('workspace.authorUnknown') })}</span>
+                {dragPreviewActivity.state.manifest.name !== dragPreviewActivity.title && <span className="mt-1 block truncate text-xs text-ink-faint">{dragPreviewActivity.state.manifest.name}</span>}
               </span>
             </div>
-            <span className="shrink-0 rounded-full border border-glass-line px-2 py-1 text-[10px] text-ink-muted">
+            {dragPreviewActivity.status !== 'ready' && <span className="shrink-0 rounded-md border border-glass-line px-2 py-1 text-xs text-ink-muted">
               {t(`workspace.contributionStatus.${dragPreviewActivity.status}`)}
-            </span>
+            </span>}
           </div>
           <p className="mt-3 line-clamp-2 flex-1 text-xs leading-5 text-ink-muted">
             {dragPreviewActivity.state.manifest.description ?? dragPreviewActivity.state.manifest.version}

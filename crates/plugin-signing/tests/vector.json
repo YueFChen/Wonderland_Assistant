@@ -1,0 +1,7 @@
+{
+  "checksums": "{\"algorithm\":\"sha256\",\"files\":[]}\n",
+  "schemaVersion": 1,
+  "algorithm": "ed25519",
+  "publicKey": "197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61",
+  "signature": "4df3185cda04dd000e5b2d0bb0692da3ecc47b1e39841525f301d08ffcbd9c6867c94c5308f58ec55601a6da99adae96931f42b09ea5d23c0ec1d260c946b701"
+}

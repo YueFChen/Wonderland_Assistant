@@ -4,6 +4,10 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+mod host;
+pub use host::*;
+mod lifecycle;
+pub use lifecycle::*;
 #[cfg(feature = "bindings")]
 use ts_rs::TS;
 
@@ -18,8 +22,7 @@ pub const UI_BRIDGE_VERSION: &str = "1.1.0";
 /// List every bridge version this host still implements, in ascending order.
 /// Keep the list explicit: a version bump must not silently remove old plugin compatibility.
 pub const UI_BRIDGE_SUPPORTED_VERSIONS: &[&str] = &["1.0.0", "1.1.0"];
-/// Host services advertised to every plugin without a permission grant.
-pub const IMPLICIT_CAPABILITIES: &[&str] = &["network.public", "network.model"];
+pub const MANIFEST_VERSION: u32 = 3;
 
 /// Icons are decorative metadata. Invalid icon values must not make an otherwise valid plugin fail to load.
 fn deserialize_optional_icon<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -40,6 +43,12 @@ pub struct PluginManifest {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
     /// A legacy built-in icon key or a local package asset such as `asset:ui/icons/logo.svg`.
     #[serde(
         default,
@@ -53,17 +62,11 @@ pub struct PluginManifest {
     pub ui: Option<PluginUi>,
     pub backend: PluginBackend,
     pub contract: String,
-    pub capabilities: Vec<String>,
     /// Explicit opt-in to remote workspaces; absent or false means local only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_access: Option<bool>,
-    /// Legacy metadata, retained for old packages and signed manifests; does not restrict networking.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub network_public_hosts: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub provides: Vec<PluginService>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requires: Vec<PluginServiceRequirement>,
+    pub dependencies: Vec<PluginDependency>,
 }
 
 impl PluginManifest {
@@ -72,50 +75,79 @@ impl PluginManifest {
     }
 }
 
-/// Legacy network declarations remain readable but no longer need user approval.
-pub fn requires_capability_approval(capability: &str) -> bool {
-    !IMPLICIT_CAPABILITIES.contains(&capability)
-}
-
-/// A versioned service contract offered to other plugins through a future Core broker.
+/// An expected plugin dependency, used for diagnostics and best-effort startup ordering.
+/// Version and method expectations never act as a runtime call allowlist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
-pub struct PluginService {
-    pub id: String,
-    pub version: String,
-    pub methods: Vec<String>,
-}
-
-/// A service contract range required by this plugin. `optional` lets the plugin report
-/// reduced functionality without preventing its backend from starting.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "bindings", derive(TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-#[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
-pub struct PluginServiceRequirement {
-    pub id: String,
-    pub min_version: String,
-    pub max_version_exclusive: String,
+pub struct PluginDependency {
+    pub plugin_id: String,
+    /// A semver::VersionReq expression evaluated against the target plugin package version.
+    pub version_req: String,
     pub optional: bool,
-    /// Empty means a legacy manifest declared only a service ID and version range.
-    /// Such a requirement resolves no callable methods until the plugin declares them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[cfg_attr(feature = "bindings", ts(as = "Option<Vec<String>>", optional))]
     pub methods: Vec<String>,
 }
 
-/// Result of resolving a declared plugin service requirement to its unique active provider.
+/// Parameters of the direct core.plugins.call host method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
-pub struct PluginServiceResolution {
-    pub service_id: String,
-    pub provider_id: String,
-    pub version: String,
-    pub methods: Vec<String>,
+pub struct PluginCallParams {
+    pub plugin_id: String,
+    pub method: String,
+    #[cfg_attr(feature = "bindings", ts(type = "unknown"))]
+    pub params: Value,
+    /// Optional deadline that can only shorten already declared ancestor/target deadlines.
+    /// Missing or null does not add a deadline. Positive values have no policy upper bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "bindings", ts(as = "Option<f64>", optional))]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", ts(rename_all = "snake_case"))]
+pub enum LocalFileState {
+    Saved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "bindings", ts(rename_all = "snake_case"))]
+pub enum RemoteFileState {
+    Ready,
+}
+
+/// File delivery is completed locally or ready for the Core's remote download flow.
+/// A remote result never asserts that the visiting device has saved a local path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "bindings", ts(rename_all = "snake_case"))]
+pub enum FileResult {
+    Local {
+        state: LocalFileState,
+        name: String,
+        #[cfg_attr(feature = "bindings", ts(type = "number"))]
+        size: u64,
+        path: String,
+    },
+    Remote {
+        state: RemoteFileState,
+        name: String,
+        #[cfg_attr(feature = "bindings", ts(type = "number"))]
+        size: u64,
+        #[serde(rename = "downloadId")]
+        download_id: String,
+        /// Optional RFC 3339 timestamp at which the Core download reference expires.
+        #[serde(default, rename = "expiresAt", skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "bindings", ts(optional))]
+        expires_at: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +253,9 @@ pub struct PluginBackend {
     /// Backend echoes Core-issued serviceContext on nested host calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_service_context: Option<bool>,
+    /// Missing preserves legacy startup behavior; new plugins explicitly use on_demand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<PluginActivationPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +307,27 @@ pub struct PluginInstallSource {
 /// Diagnostics from validating an installed plugin package.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "bindings", derive(TS))]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
+pub struct PluginSignatureState {
+    pub state: String,
+    pub public_key: Option<String>,
+    pub expected_public_key: Option<String>,
+}
+
+impl Default for PluginSignatureState {
+    fn default() -> Self {
+        Self {
+            state: "unsigned".into(),
+            public_key: None,
+            expected_public_key: None,
+        }
+    }
+}
+
+/// Diagnostics from validating an installed plugin package.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
 pub struct PluginScanDiagnostic {
@@ -291,20 +347,23 @@ pub struct PluginScanDiagnostic {
 #[cfg_attr(feature = "bindings", ts(rename_all = "camelCase"))]
 pub struct PluginRuntimeState {
     pub manifest: PluginManifest,
+    #[serde(default)]
+    pub signature: PluginSignatureState,
     pub installation: InstallationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_diagnostic: Option<PluginScanDiagnostic>,
     pub enabled: bool,
     pub runtime: RuntimeState,
     pub last_error: Option<PluginFailure>,
-    pub granted_capabilities: Vec<String>,
     #[serde(default)]
     pub installation_source: Option<PluginInstallSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub service_dependency_issues: Vec<String>,
+    pub dependency_issues: Vec<String>,
     /// Expected per-plugin persistent data directory managed by Core.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_data_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<PluginLifecycleState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,7 +390,6 @@ pub struct HostHello {
     pub role: String,
     pub plugin_id: String,
     pub core_version: String,
-    pub granted_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +425,10 @@ pub struct PluginRequest {
     /// Opaque Core-issued invocation context, echoed by SDK host-service calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_context: Option<String>,
+    /// Optional explicit deadline for this host-service request; absent/null is unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "bindings", ts(as = "Option<f64>", optional))]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,4 +502,117 @@ pub enum PluginMessage {
     Error(PluginErrorMessage),
     Event(PluginEvent),
     Cancel(PluginCancel),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn manifest() -> Value {
+        json!({
+            "manifestVersion": 3,
+            "id": "consumer",
+            "name": "Consumer",
+            "version": "0.1.0",
+            "hostCompatibility": {
+                "minCoreVersion": "0.1.9",
+                "maxCoreVersionExclusive": "1.0.0",
+                "protocol": { "minVersion": "1.0.0", "maxVersionExclusive": "2.0.0" }
+            },
+            "platform": { "os": "windows", "architecture": "x86_64", "abi": "msvc" },
+            "backend": { "entry": "backend/plugin.exe", "transport": "stdio-ndjson-v1" },
+            "contract": "contract.json"
+        })
+    }
+
+    #[test]
+    fn current_manifest_rejects_removed_policy_and_service_fields() {
+        let current: PluginManifest = serde_json::from_value(manifest()).unwrap();
+        assert!(current.dependencies.is_empty());
+        for field in ["capabilities", "networkPublicHosts", "provides", "requires"] {
+            let mut legacy = manifest();
+            legacy[field] = json!([]);
+            assert!(serde_json::from_value::<PluginManifest>(legacy).is_err());
+        }
+    }
+
+    #[test]
+    fn dependency_metadata_keeps_the_target_plugin_and_required_field_shape() {
+        let dependency = json!({
+            "pluginId": "provider",
+            "versionReq": ">=0.1.3, <1.0.0",
+            "optional": true,
+            "methods": []
+        });
+        let parsed: PluginDependency = serde_json::from_value(dependency.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), dependency);
+        for field in ["pluginId", "versionReq", "optional", "methods"] {
+            let mut missing = dependency.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<PluginDependency>(missing).is_err());
+        }
+    }
+
+    #[test]
+    fn direct_calls_do_not_accept_the_removed_service_id() {
+        let request = json!({ "pluginId": "provider", "method": "read", "params": {} });
+        let parsed: PluginCallParams = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+        let mut legacy = request;
+        legacy["serviceId"] = json!("wonderland.archive");
+        assert!(serde_json::from_value::<PluginCallParams>(legacy).is_err());
+    }
+
+    #[test]
+    fn service_requests_keep_optional_deadlines_out_of_legacy_frames() {
+        let base = json!({"protocol":PROTOCOL_ID,"version":PROTOCOL_VERSION,"type":"request", "id":"p-1","method":"core.network.request","params":{}});
+        for timeout in [None, Some(Value::Null), Some(json!(172_800_000_u64))] {
+            let mut value = base.clone();
+            if let Some(timeout) = timeout {
+                value["timeoutMs"] = timeout;
+            }
+            let parsed: PluginRequest = serde_json::from_value(value).unwrap();
+            if parsed.timeout_ms.is_none() {
+                assert_eq!(serde_json::to_value(parsed).unwrap(), base);
+            } else {
+                assert_eq!(parsed.timeout_ms, Some(172_800_000));
+            }
+        }
+    }
+
+    #[test]
+    fn file_delivery_states_and_fields_cannot_be_mixed() {
+        let local = json!({
+            "kind": "local", "state": "saved", "name": "report.csv", "size": 128,
+            "path": "D:\\Exports\\report.csv"
+        });
+        let remote = json!({
+            "kind": "remote", "state": "ready", "name": "report.csv", "size": 128,
+            "downloadId": "opaque-id"
+        });
+        for value in [local.clone(), remote.clone()] {
+            let parsed: FileResult = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        }
+        let mut wrong_state = local;
+        wrong_state["state"] = json!("ready");
+        assert!(serde_json::from_value::<FileResult>(wrong_state).is_err());
+        let mut remote_path = remote;
+        remote_path["path"] = json!("D:\\remote.csv");
+        assert!(serde_json::from_value::<FileResult>(remote_path).is_err());
+    }
+
+    #[test]
+    fn host_hello_has_no_grant_negotiation() {
+        let hello = json!({
+            "protocol": PROTOCOL_ID, "version": PROTOCOL_VERSION, "type": "hello",
+            "role": "host", "pluginId": "consumer", "coreVersion": "0.1.9"
+        });
+        let parsed: HostHello = serde_json::from_value(hello.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), hello);
+        let mut legacy = hello;
+        legacy["grantedCapabilities"] = json!([]);
+        assert!(serde_json::from_value::<HostHello>(legacy).is_err());
+    }
 }

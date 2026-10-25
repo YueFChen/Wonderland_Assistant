@@ -1,413 +1,482 @@
-//! HTTP clients for plugin requests, Core accounts and signed package downloads.
+//! Shared HTTP transport, proxy configuration and signed package downloads.
 
 use std::fmt;
 use std::sync::{Arc, RwLock};
+#[cfg(test)]
 use std::time::Duration;
 
-use serde::de::DeserializeOwned;
+pub use reqwest::Url;
 use wonderland_kernel::KernelError;
-use wonderland_kernel::logging::{debug, warn};
 
+pub mod distribution;
 pub mod proxy;
+pub use distribution::{DistributionClient, DistributionHttpError, DistributionSource};
 pub use proxy::{
     ProxyConfiguration, ProxyCredentials, ProxyEnvironmentVariable, ProxyError, ProxyMode,
     ProxySettings,
 };
 
-/// 出站请求超时。
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// Keep Core-mediated plugin responses below the plugin protocol's 32 MiB frame limit after
-/// base64 encoding, while bounding memory use before serialization.
-const MAX_HTTP_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
-const PLUGIN_CATALOG_URL: &str =
-    "https://yuefchen.github.io/Wonderland_Plugin_Catalog/catalog/v2/index.json";
-const PLUGIN_CATALOG_MAX_BYTES: usize = 2 * 1024 * 1024;
-const PLUGIN_UPDATE_MANIFEST_MAX_BYTES: usize = 1024 * 1024;
-const PLUGIN_PACKAGE_MAX_BYTES: usize = 100 * 1024 * 1024;
+/// An HTTP header value is bytes: legal repeated fields and non-UTF-8 values are retained.
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: Vec<u8>,
+}
 
-/// 固定 UA：米哈游接口对 UA 敏感，不使用随机值以免触发风控。
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
-
-/// Core account/platform requests keep their own fixed destinations.
-///
-/// 精确匹配主机名，不接受子域。
-const CORE_PLATFORM_HOSTS: &[&str] = &[
-    "api-takumi.mihoyo.com",
-    "api-micreator.mihoyo.com",
-    "bbs-api.miyoushe.com",
-    "act-webstatic.mihoyo.com",
-];
-
-/// Parse once so the checked host is the same host reqwest will contact.
-fn ensure_allowed(raw: &str, platform_only: bool) -> Result<reqwest::Url, KernelError> {
-    let url = reqwest::Url::parse(raw).map_err(|_| KernelError::InvalidInput)?;
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let destination_allowed = if !platform_only {
-        matches!(url.scheme(), "http" | "https") && !host.is_empty()
-    } else {
-        url.scheme() == "https"
-            && url.port().is_none()
-            && CORE_PLATFORM_HOSTS.contains(&host.as_str())
-    };
-    if destination_allowed
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.fragment().is_none()
-    {
-        Ok(url)
-    } else {
-        warn!(host = %host, "出站主机或 URL 不符合白名单策略");
-        Err(KernelError::InvalidInput)
+impl fmt::Debug for HttpHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpHeader")
+            .field("name", &self.name)
+            .field("value_bytes", &self.value.len())
+            .finish()
     }
 }
 
-/// 出站 HTTP 客户端。
-#[derive(Clone)]
-pub struct HttpClient {
-    cached: Arc<RwLock<Option<(u64, reqwest::Client)>>>,
-    platform_only: bool,
+/// Request-specific redirects. No policy is inferred from the request's business purpose.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HttpRedirectPolicy {
+    #[default]
+    None,
+    /// `None` follows an acyclic chain without an artificial hop limit.
+    Follow { max_redirects: Option<usize> },
 }
 
-impl HttpClient {
-    pub fn new() -> Result<Self, KernelError> {
-        let client = Self {
-            platform_only: true,
-            ..Self::unrestricted()
-        };
-        client.inner()?;
-        Ok(client)
-    }
+/// Files are consumed from their current position, with backpressure from the HTTP transport.
+/// A file stream cannot be replayed automatically: a 307/308 requiring replay is returned
+/// intact, even when redirects are enabled. The caller may explicitly reopen its source.
+#[derive(Default)]
+pub enum HttpRequestBody {
+    #[default]
+    Empty,
+    Bytes(Vec<u8>),
+    File(tokio::fs::File),
+}
 
-    /// Plugin networking is a convenience service, not a process sandbox.
-    pub fn unrestricted() -> Self {
+impl fmt::Debug for HttpRequestBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("Empty"),
+            Self::Bytes(bytes) => f.debug_tuple("Bytes").field(&bytes.len()).finish(),
+            Self::File(_) => f.write_str("File(<stream>)"),
+        }
+    }
+}
+
+/// The host resolves credentials and owned file resources before entering this transport.
+/// No account cookie, plugin key, distribution code or business retry is added here.
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<HttpHeader>,
+    /// Host-injected credential headers survive same-origin redirects only. These are
+    /// names, not values, so client caching never contains a request's credentials.
+    pub credential_header_names: Vec<String>,
+    pub query: Vec<(String, String)>,
+    pub body: HttpRequestBody,
+    /// A single absolute deadline covers sending, redirects and all subsequent body reads.
+    pub deadline: Option<tokio::time::Instant>,
+    pub redirects: HttpRedirectPolicy,
+}
+
+impl HttpRequest {
+    pub fn new(method: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
-            cached: Arc::new(RwLock::new(None)),
-            platform_only: false,
+            method: method.into(),
+            url: url.into(),
+            headers: Vec::new(),
+            credential_header_names: Vec::new(),
+            query: Vec::new(),
+            body: HttpRequestBody::Empty,
+            deadline: None,
+            redirects: HttpRedirectPolicy::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpFailureStage {
+    Prepare,
+    Send,
+    Body,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpFailureKind {
+    InvalidUrl,
+    InvalidMethod,
+    InvalidHeader,
+    ClientUnavailable,
+    DeadlineExceeded,
+    Connection,
+    Timeout,
+    Redirect,
+    RequestFailed,
+    BodyInterrupted,
+}
+
+/// Safe transport diagnostics; they contain no URL, header value, credential or body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpTransportError {
+    pub stage: HttpFailureStage,
+    pub kind: HttpFailureKind,
+    /// `true` means Core cannot establish whether the upstream processed the operation.
+    pub outcome_unknown: bool,
+}
+
+impl HttpTransportError {
+    fn prepare(kind: HttpFailureKind) -> Self {
+        Self {
+            stage: HttpFailureStage::Prepare,
+            kind,
+            outcome_unknown: false,
         }
     }
 
-    fn inner(&self) -> Result<reqwest::Client, KernelError> {
-        let snapshot = proxy::current_proxy()
-            .map_err(|_| KernelError::Transport("代理设置暂不可用".to_owned()))?;
-        if let Some((revision, client)) = self
-            .cached
-            .read()
-            .map_err(|_| KernelError::Transport("HTTP 客户端暂不可用".to_owned()))?
-            .as_ref()
+    fn deadline(stage: HttpFailureStage) -> Self {
+        Self {
+            stage,
+            kind: HttpFailureKind::DeadlineExceeded,
+            outcome_unknown: stage != HttpFailureStage::Prepare,
+        }
+    }
+
+    fn send(error: reqwest::Error, followed_response: bool) -> Self {
+        let kind = if error.is_connect() {
+            HttpFailureKind::Connection
+        } else if error.is_timeout() {
+            HttpFailureKind::Timeout
+        } else if error.is_redirect() {
+            HttpFailureKind::Redirect
+        } else {
+            HttpFailureKind::RequestFailed
+        };
+        // A failed connection to the original URL has not sent an HTTP request. A failure
+        // on a redirect may follow already-processed requests, so its outcome remains unknown.
+        let outcome_unknown = !error.is_connect() || followed_response;
+        Self {
+            stage: HttpFailureStage::Send,
+            kind,
+            outcome_unknown,
+        }
+    }
+}
+
+impl fmt::Display for HttpTransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.kind {
+            HttpFailureKind::InvalidUrl => "HTTP URL is invalid",
+            HttpFailureKind::InvalidMethod => "HTTP method is invalid",
+            HttpFailureKind::InvalidHeader => "HTTP header is invalid",
+            HttpFailureKind::ClientUnavailable => "HTTP transport or proxy is unavailable",
+            HttpFailureKind::DeadlineExceeded => "The requested HTTP deadline expired",
+            HttpFailureKind::Connection => "HTTP connection failed",
+            HttpFailureKind::Timeout => "HTTP transport reported a timeout",
+            HttpFailureKind::Redirect => "HTTP redirect failed",
+            HttpFailureKind::RequestFailed => "HTTP request failed",
+            HttpFailureKind::BodyInterrupted => "HTTP response body was interrupted",
+        })?;
+        if self.outcome_unknown {
+            f.write_str("; the upstream outcome is unknown")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HttpTransportError {}
+
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<HttpHeader>,
+    pub final_url: String,
+    pub content_length: Option<u64>,
+    pub body: HttpResponseBody,
+}
+
+impl fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("header_count", &self.headers.len())
+            .field("content_length", &self.content_length)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Dropping or closing the body releases its response; chunks are read only on demand.
+pub struct HttpResponseBody {
+    response: Option<reqwest::Response>,
+    deadline: Option<tokio::time::Instant>,
+    failure: Option<HttpTransportError>,
+}
+
+impl HttpResponseBody {
+    pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>, HttpTransportError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let Some(response) = self.response.as_mut() else {
+            return Ok(None);
+        };
+        let result = match self.deadline {
+            Some(deadline) if deadline <= tokio::time::Instant::now() => {
+                Err(HttpTransportError::deadline(HttpFailureStage::Body))
+            }
+            Some(deadline) => match tokio::time::timeout_at(deadline, response.chunk()).await {
+                Ok(result) => result.map_err(|_| HttpTransportError {
+                    stage: HttpFailureStage::Body,
+                    kind: HttpFailureKind::BodyInterrupted,
+                    outcome_unknown: true,
+                }),
+                Err(_) => Err(HttpTransportError::deadline(HttpFailureStage::Body)),
+            },
+            None => response.chunk().await.map_err(|_| HttpTransportError {
+                stage: HttpFailureStage::Body,
+                kind: HttpFailureKind::BodyInterrupted,
+                outcome_unknown: true,
+            }),
+        };
+        match result {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            Ok(None) => {
+                self.response.take();
+                Ok(None)
+            }
+            Err(error) => {
+                self.response.take();
+                self.failure = Some(error);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn close(&mut self) {
+        self.response.take();
+        self.failure = None;
+    }
+}
+
+type CachedHttpTransport = Option<(u64, HttpRedirectPolicy, reqwest::Client)>;
+
+/// General plugin HTTP transport. Distribution requests retain separate policy.
+#[derive(Clone, Default)]
+pub struct HttpTransport {
+    cached: Arc<RwLock<CachedHttpTransport>>,
+}
+
+impl HttpTransport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn inner(&self, redirects: HttpRedirectPolicy) -> Result<reqwest::Client, HttpTransportError> {
+        let unavailable = || HttpTransportError::prepare(HttpFailureKind::ClientUnavailable);
+        let snapshot = proxy::current_proxy().map_err(|_| unavailable())?;
+        let mut cached = self.cached.write().map_err(|_| unavailable())?;
+        if let Some((revision, policy, client)) = cached.as_ref()
             && *revision == snapshot.revision
+            && *policy == redirects
         {
             return Ok(client.clone());
         }
-
         let builder = reqwest::Client::builder()
-            .redirect(if !self.platform_only {
-                reqwest::redirect::Policy::limited(10)
-            } else {
-                reqwest::redirect::Policy::none()
-            })
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent(USER_AGENT);
+            // Follow redirects here so arbitrary host-injected credential names are
+            // stripped on origin changes, rather than reqwest's fixed list alone.
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            // Keep bytes and HTTP headers intact even if another workspace consumer enables
+            // a reqwest automatic-decompression feature.
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd();
+        // Reqwest otherwise installs its own 30-second unacknowledged-send limit on Linux.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        let builder = builder.tcp_user_timeout(None);
         let client = snapshot
             .configuration
             .apply_to(builder)
             .build()
-            .map_err(|_| KernelError::Transport("HTTP 客户端初始化失败".to_owned()))?;
-        *self
-            .cached
-            .write()
-            .map_err(|_| KernelError::Transport("HTTP 客户端暂不可用".to_owned()))? =
-            Some((snapshot.revision, client.clone()));
+            .map_err(|_| unavailable())?;
+        *cached = Some((snapshot.revision, redirects, client.clone()));
         Ok(client)
     }
 
-    /// GET with bounded retries for transient read-only failures.
-    pub async fn get_bytes(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-        query: &[(String, String)],
-    ) -> Result<Vec<u8>, KernelError> {
-        self.request_bytes("GET", url, headers, query, None).await
-    }
-
-    /// Account JSON requests retain their single-attempt behavior and error format.
-    pub async fn get_json<T: DeserializeOwned>(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-    ) -> Result<T, KernelError> {
-        let url = ensure_allowed(url, self.platform_only)?;
-        let response = self
-            .request_builder(reqwest::Method::GET, url, headers, &[], None)?
-            .send()
-            .await
-            .map_err(classify)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(KernelError::Transport(format!("HTTP 状态码 {status}")));
+    pub async fn send(&self, request: HttpRequest) -> Result<HttpResponse, HttpTransportError> {
+        if request
+            .deadline
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+        {
+            return Err(HttpTransportError::deadline(HttpFailureStage::Prepare));
         }
-        let body = read_limited_body(response, MAX_HTTP_RESPONSE_BYTES).await?;
-        serde_json::from_slice(&body)
-            .map_err(|error| KernelError::Transport(format!("响应解析失败：{error}")))
-    }
-
-    fn request_builder(
-        &self,
-        method: reqwest::Method,
-        url: reqwest::Url,
-        headers: &[(&str, &str)],
-        query: &[(String, String)],
-        body: Option<&str>,
-    ) -> Result<reqwest::RequestBuilder, KernelError> {
-        let post_json = method == reqwest::Method::POST
-            && body.is_some()
-            && !headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
-        let mut request = self.inner()?.request(method, url).query(query);
-        if post_json {
-            request = request.header(reqwest::header::CONTENT_TYPE, "application/json");
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|_| HttpTransportError::prepare(HttpFailureKind::InvalidMethod))?;
+        let url = reqwest::Url::parse(&request.url)
+            .map_err(|_| HttpTransportError::prepare(HttpFailureKind::InvalidUrl))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(HttpTransportError::prepare(HttpFailureKind::InvalidUrl));
         }
-        for (name, value) in headers {
-            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| KernelError::InvalidInput)?;
-            let value = reqwest::header::HeaderValue::from_str(value)
-                .map_err(|_| KernelError::InvalidInput)?;
-            request = request.header(name, value);
-        }
-        if let Some(body) = body {
-            request = request.body(body.to_owned());
-        }
-        Ok(request)
-    }
-
-    /// Only a GET without a request body is retried; mutations are sent once.
-    pub async fn request_bytes(
-        &self,
-        method: &str,
-        url: &str,
-        headers: &[(&str, &str)],
-        query: &[(String, String)],
-        body: Option<&str>,
-    ) -> Result<Vec<u8>, KernelError> {
-        let method = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|_| KernelError::InvalidInput)?;
-        let url = ensure_allowed(url, self.platform_only)?;
-        let attempts = if method == reqwest::Method::GET && body.is_none() {
-            3
-        } else {
-            1
-        };
-        for attempt in 0..attempts {
-            let request =
-                self.request_builder(method.clone(), url.clone(), headers, query, body)?;
-            let result = async {
-                let response = request.send().await.map_err(classify)?;
-                read_limited_response(response, MAX_HTTP_RESPONSE_BYTES).await
+        let credential_headers = request
+            .credential_header_names
+            .iter()
+            .map(|name| {
+                reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| HttpTransportError::prepare(HttpFailureKind::InvalidHeader))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut headers = Vec::with_capacity(request.headers.len());
+        for header in request.headers {
+            let name = reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
+                .map_err(|_| HttpTransportError::prepare(HttpFailureKind::InvalidHeader))?;
+            let mut value = reqwest::header::HeaderValue::from_bytes(&header.value)
+                .map_err(|_| HttpTransportError::prepare(HttpFailureKind::InvalidHeader))?;
+            if name == reqwest::header::AUTHORIZATION
+                || name == reqwest::header::COOKIE
+                || name == reqwest::header::PROXY_AUTHORIZATION
+                || credential_headers.contains(&name)
+            {
+                value.set_sensitive(true);
             }
-            .await;
-            let retry = matches!(
-                &result,
-                Err(KernelError::Timeout
-                    | KernelError::Connection
-                    | KernelError::Http(429 | 500 | 502 | 503 | 504))
-            );
-            if let Err(error) = &result {
-                if retry && attempt + 1 < attempts {
-                    debug!(
-                        code = error.code(),
-                        attempt = attempt + 1,
-                        "出站请求失败，退避后重试"
-                    );
+            headers.push((name, value));
+        }
+        let client = self.inner(request.redirects)?;
+        let mut builder = client.request(method, url).query(&request.query);
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        builder = match request.body {
+            HttpRequestBody::Empty => builder,
+            HttpRequestBody::Bytes(bytes) => builder.body(bytes),
+            HttpRequestBody::File(file) => builder.body(reqwest::Body::from(file)),
+        };
+        let mut outgoing = builder
+            .build()
+            .map_err(|_| HttpTransportError::prepare(HttpFailureKind::RequestFailed))?;
+        // Client construction and validation also spend the caller's original budget.
+        if request
+            .deadline
+            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+        {
+            return Err(HttpTransportError::deadline(HttpFailureStage::Prepare));
+        }
+        let mut previous = Vec::new();
+        let response = loop {
+            let current_url = outgoing.url().clone();
+            let method = outgoing.method().clone();
+            let headers = outgoing.headers().clone();
+            // Non-replayable file uploads intentionally cannot follow 307/308.
+            // 301/302 POST and 303 discard the payload and can create a GET/HEAD.
+            let replay = outgoing.try_clone();
+            let response = match request.deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, client.execute(outgoing))
+                    .await
+                    .map_err(|_| HttpTransportError::deadline(HttpFailureStage::Send))?
+                    .map_err(|error| HttpTransportError::send(error, !previous.is_empty()))?,
+                None => client
+                    .execute(outgoing)
+                    .await
+                    .map_err(|error| HttpTransportError::send(error, !previous.is_empty()))?,
+            };
+            let HttpRedirectPolicy::Follow { max_redirects } = request.redirects else {
+                break response;
+            };
+            let discard_payload = match response.status().as_u16() {
+                301 | 302 => method == reqwest::Method::POST,
+                303 => true,
+                307 | 308 => false,
+                _ => break response,
+            };
+            let next_request = if discard_payload {
+                let next_method = if method == reqwest::Method::HEAD {
+                    reqwest::Method::HEAD
                 } else {
-                    warn!(code = error.code(), attempts = attempt + 1, "出站请求失败");
+                    reqwest::Method::GET
+                };
+                let mut next = reqwest::Request::new(next_method, current_url.clone());
+                *next.headers_mut() = headers;
+                for name in [
+                    reqwest::header::CONTENT_TYPE,
+                    reqwest::header::CONTENT_LENGTH,
+                    reqwest::header::CONTENT_ENCODING,
+                    reqwest::header::TRANSFER_ENCODING,
+                ] {
+                    next.headers_mut().remove(name);
+                }
+                Some(next)
+            } else {
+                replay
+            };
+            let Some(mut next_request) = next_request else {
+                break response;
+            };
+            let next_url = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| current_url.join(location).ok());
+            let Some(next_url) = next_url else {
+                break response;
+            };
+            let mut current_resource = current_url.clone();
+            current_resource.set_fragment(None);
+            previous.push(current_resource);
+            let mut next_resource = next_url.clone();
+            next_resource.set_fragment(None);
+            if !matches!(next_url.scheme(), "http" | "https")
+                || previous.contains(&next_resource)
+                || max_redirects.is_some_and(|max| previous.len() > max)
+            {
+                return Err(HttpTransportError {
+                    stage: HttpFailureStage::Send,
+                    kind: HttpFailureKind::Redirect,
+                    outcome_unknown: true,
+                });
+            }
+            if current_url.origin() != next_url.origin() {
+                for name in [
+                    reqwest::header::AUTHORIZATION,
+                    reqwest::header::COOKIE,
+                    reqwest::header::PROXY_AUTHORIZATION,
+                    reqwest::header::WWW_AUTHENTICATE,
+                    reqwest::header::HOST,
+                ] {
+                    next_request.headers_mut().remove(name);
+                }
+                next_request.headers_mut().remove("cookie2");
+                for name in &credential_headers {
+                    next_request.headers_mut().remove(name);
                 }
             }
-            if !retry || attempt + 1 == attempts {
-                return result;
-            }
-            tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
-        }
-        unreachable!()
+            *next_request.url_mut() = next_url;
+            outgoing = next_request;
+            // Drop the intermediate response before sending the next hop; no whole-body
+            // aggregation or additional deadline is introduced by redirect processing.
+        };
+        Ok(HttpResponse {
+            status: response.status().as_u16(),
+            headers: response
+                .headers()
+                .iter()
+                .map(|(name, value)| HttpHeader {
+                    name: name.as_str().to_owned(),
+                    value: value.as_bytes().to_vec(),
+                })
+                .collect(),
+            final_url: response.url().to_string(),
+            content_length: response.content_length(),
+            body: HttpResponseBody {
+                response: Some(response),
+                deadline: request.deadline,
+                failure: None,
+            },
+        })
     }
 }
 
-/// Fixed-origin catalog and release downloader. Redirects are limited to GitHub's release
-/// asset hosts so catalog URLs cannot turn this client into an arbitrary network proxy.
-#[derive(Clone)]
-pub struct PluginCatalogClient {
-    index: reqwest::Client,
-    package: reqwest::Client,
-}
-
-impl PluginCatalogClient {
-    pub fn new() -> Result<Self, KernelError> {
-        let proxy = proxy::current_proxy()
-            .map_err(|_| KernelError::Transport("代理设置暂不可用".to_owned()))?;
-        let index = proxy
-            .configuration
-            .apply_to(
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .timeout(REQUEST_TIMEOUT)
-                    .user_agent("WonderlandAssistant/PluginCatalog"),
-            )
-            .build()
-            .map_err(|_| KernelError::Transport("HTTP 客户端初始化失败".to_owned()))?;
-        let package = proxy
-            .configuration
-            .apply_to(
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                        if attempt.previous().len() >= 5
-                            || !is_allowed_release_redirect(attempt.url())
-                        {
-                            attempt.stop()
-                        } else {
-                            attempt.follow()
-                        }
-                    }))
-                    .timeout(Duration::from_secs(120))
-                    .user_agent("WonderlandAssistant/PluginCatalog"),
-            )
-            .build()
-            .map_err(|_| KernelError::Transport("HTTP 客户端初始化失败".to_owned()))?;
-        Ok(Self { index, package })
-    }
-
-    pub async fn get_index(&self) -> Result<Vec<u8>, KernelError> {
-        let response = self
-            .index
-            .get(PLUGIN_CATALOG_URL)
-            .send()
-            .await
-            .map_err(classify)?;
-        read_limited_response(response, PLUGIN_CATALOG_MAX_BYTES).await
-    }
-
-    pub async fn download_package(&self, url: &str) -> Result<Vec<u8>, KernelError> {
-        if !is_valid_plugin_release_url(url) {
-            return Err(KernelError::InvalidInput);
-        }
-        let response = self.package.get(url).send().await.map_err(classify)?;
-        read_limited_response(response, PLUGIN_PACKAGE_MAX_BYTES).await
-    }
-
-    pub async fn get_update_manifest(&self, url: &str) -> Result<Vec<u8>, KernelError> {
-        if !is_valid_plugin_update_manifest_url(url) {
-            return Err(KernelError::InvalidInput);
-        }
-        let response = self.package.get(url).send().await.map_err(classify)?;
-        read_limited_response(response, PLUGIN_UPDATE_MANIFEST_MAX_BYTES).await
-    }
-}
-
-/// Only accept immutable versioned GitHub Release asset URLs, never arbitrary HTTPS URLs.
-pub fn is_valid_plugin_release_url(raw: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(raw) else {
-        return false;
-    };
-    if url.scheme() != "https"
-        || url.host_str() != Some("github.com")
-        || url.port().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return false;
-    }
-    let Some(parts) = url.path_segments() else {
-        return false;
-    };
-    let parts = parts.collect::<Vec<_>>();
-    parts.len() == 6
-        && parts[2] == "releases"
-        && parts[3] == "download"
-        && !parts[0].is_empty()
-        && !parts[1].is_empty()
-        && !parts[4].is_empty()
-        && parts[0]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        && parts[1]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-        && parts[4]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-        && parts[5].ends_with(".wplug")
-        && parts[5]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-}
-
-/// Only accept the stable latest-release manifest asset for a GitHub plugin repository.
-pub fn is_valid_plugin_update_manifest_url(raw: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(raw) else {
-        return false;
-    };
-    if url.scheme() != "https"
-        || url.host_str() != Some("github.com")
-        || url.port().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return false;
-    }
-    let Some(parts) = url.path_segments() else {
-        return false;
-    };
-    let parts = parts.collect::<Vec<_>>();
-    parts.len() == 6
-        && parts[2] == "releases"
-        && parts[3] == "latest"
-        && parts[4] == "download"
-        && !parts[0].is_empty()
-        && !parts[1].is_empty()
-        && parts[5].ends_with("-update.json")
-        && parts[0]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        && parts[1]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-        && parts[5]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-}
-
-fn is_allowed_release_redirect(url: &reqwest::Url) -> bool {
-    if url.scheme() != "https"
-        || url.port().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return false;
-    }
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    host == "github.com"
-        || host == "release-assets.githubusercontent.com"
-        || host == "objects.githubusercontent.com"
-        || (host.starts_with("github-production-release-asset-")
-            && host.ends_with(".s3.amazonaws.com"))
-}
-
-async fn read_limited_response(
-    response: reqwest::Response,
-    max_bytes: usize,
-) -> Result<Vec<u8>, KernelError> {
-    let status = response.status();
-    if !status.is_success() {
-        return Err(KernelError::Http(status.as_u16()));
-    }
-    read_limited_body(response, max_bytes).await
-}
-
+// A caller-supplied metadata/error budget, also used by signed distribution requests.
 async fn read_limited_body(
     mut response: reqwest::Response,
     max_bytes: usize,
@@ -418,653 +487,784 @@ async fn read_limited_body(
     {
         return Err(KernelError::ResourceLimit);
     }
-    let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                if body.len().saturating_add(chunk.len()) > max_bytes {
-                    return Err(KernelError::ResourceLimit);
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(None) => return Ok(body),
-            Err(error) => return Err(classify(error)),
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        if error.is_timeout() {
+            KernelError::Timeout
+        } else if error.is_connect() {
+            KernelError::Connection
+        } else {
+            KernelError::Transport("响应读取失败".into())
         }
-    }
-}
-
-/// 错误分类：区分超时、连接失败与其它，便于前端判别。
-fn classify(error: reqwest::Error) -> KernelError {
-    if error.is_timeout() {
-        KernelError::Timeout
-    } else if error.is_connect() {
-        KernelError::Connection
-    } else {
-        KernelError::Transport("请求失败".to_owned())
-    }
-}
-
-/// 模型生成远慢于普通接口，默认给足两分钟；按端点可覆盖。
-const MODEL_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// 默认响应体上限 4 MiB：正常对话响应远小于它，超限多半是异常端点。
-const MODEL_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-
-/// 模型出口错误。
-///
-/// 变体划分服务于调用方的两个决策：**要不要重试**与**要不要落状态**。
-/// `Transient` 可以直接重试；`Invalid` / `Config` 重试无意义；
-/// `Indeterminate` 表示"远端可能已经处理"，重试前需要业务侧去重。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelError {
-    /// 临时失败：超时、连接失败、HTTP 429 或 5xx。
-    ///
-    /// `retry_after` 在能解析到 `Retry-After`（整数秒）时给出，供调用方退避。
-    Transient {
-        status: Option<u16>,
-        retry_after: Option<Duration>,
-    },
-    /// 响应不可用：其它非 2xx、响应体超过大小上限、不是合法 HTTP 响应。
-    ///
-    /// `String` 是可读原因，**不含响应体正文与密钥**（正文可能回显用户的输入）。
-    Invalid(String),
-    /// 端点或配置不合法。
-    Config(String),
-    /// 请求已发出但无法确认远端是否处理（例如收到响应头后读取响应体中断）。
-    Indeterminate,
-}
-
-impl fmt::Display for ModelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transient {
-                status,
-                retry_after,
-            } => match status {
-                Some(status) => {
-                    write!(f, "模型端点暂时不可用（HTTP {status}），请稍后重试")?;
-                    if let Some(retry_after) = retry_after {
-                        write!(f, "，建议 {} 秒后重试", retry_after.as_secs())?;
-                    }
-                    Ok(())
-                }
-                None => write!(f, "模型端点连接失败或超时，请稍后重试"),
-            },
-            Self::Invalid(reason) => write!(f, "模型端点返回的响应无效：{reason}"),
-            Self::Config(reason) => write!(f, "模型端点配置无效：{reason}"),
-            Self::Indeterminate => write!(f, "模型请求结果未知，远端可能已处理，请勿直接重试"),
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(KernelError::ResourceLimit);
         }
+        bytes.extend_from_slice(&chunk);
     }
-}
-
-impl std::error::Error for ModelError {}
-
-/// 用户自配的 OpenAI 兼容模型端点。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelEndpoint {
-    /// 用户填写的基础地址，例如 `https://api.example.com/v1`。
-    pub base_url: String,
-    /// 单次请求超时。
-    pub timeout: Duration,
-    /// 响应体大小上限。
-    pub max_response_bytes: usize,
-}
-
-impl ModelEndpoint {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: base_url.into(),
-            timeout: MODEL_TIMEOUT,
-            max_response_bytes: MODEL_MAX_RESPONSE_BYTES,
-        }
-    }
-}
-
-/// 校验用户填写的模型端点地址，返回可直接用于拼接路径的 [`reqwest::Url`]。
-///
-/// Accept user-configured HTTP(S) endpoints, including LAN and loopback services.
-pub fn validate_endpoint(base_url: &str) -> Result<reqwest::Url, ModelError> {
-    let url = reqwest::Url::parse(base_url)
-        .map_err(|error| ModelError::Config(format!("地址无法解析：{error}")))?;
-
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(ModelError::Config("地址不得包含用户名或密码".to_owned()));
-    }
-
-    url.host_str()
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| ModelError::Config("地址缺少主机名".to_owned()))?;
-
-    match url.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(ModelError::Config(format!("不支持的协议：{other}")));
-        }
-    }
-
-    Ok(url)
-}
-
-/// 把相对路径拼到已校验的 base 上。
-///
-/// 拒绝路径遍历和协议相对路径，并验证结果仍位于 base origin。
-fn join_url(base: &reqwest::Url, path: &str) -> Result<reqwest::Url, ModelError> {
-    if !path.starts_with('/') || path.starts_with("//") {
-        return Err(ModelError::Config(
-            "请求路径必须是以 / 开头的绝对路径".to_owned(),
-        ));
-    }
-    if path.split('/').any(|segment| segment == "..") {
-        return Err(ModelError::Config("请求路径不得包含 ..".to_owned()));
-    }
-
-    let mut url = base.clone();
-    let prefix = base.path().trim_end_matches('/');
-    url.set_path(&format!("{prefix}{path}"));
-    url.set_query(None);
-    url.set_fragment(None);
-
-    if url.origin() != base.origin() {
-        return Err(ModelError::Config("请求地址与基础地址不同源".to_owned()));
-    }
-    Ok(url)
-}
-
-/// 受控模型出口客户端。
-///
-/// 与 [`HttpClient`] 并列但独立：不复用主机白名单，也不自动重试。
-#[derive(Clone)]
-pub struct ModelClient {
-    inner: reqwest::Client,
-    base: reqwest::Url,
-    max_response_bytes: usize,
-    origin: String,
-}
-
-impl ModelClient {
-    pub fn new(endpoint: ModelEndpoint) -> Result<Self, ModelError> {
-        let base = validate_endpoint(&endpoint.base_url)?;
-        let proxy = proxy::current_proxy()
-            .map_err(|_| ModelError::Config("代理设置暂不可用".to_owned()))?;
-        let inner = proxy
-            .configuration
-            .apply_to(
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .timeout(endpoint.timeout),
-            )
-            .build()
-            .map_err(|_| ModelError::Config("HTTP 客户端初始化失败".to_owned()))?;
-        let origin = base.origin().ascii_serialization();
-        Ok(Self {
-            inner,
-            base,
-            max_response_bytes: endpoint.max_response_bytes,
-            origin,
-        })
-    }
-
-    /// 端点 origin（`scheme://host[:port]`），供界面展示；不含路径与 userinfo。
-    pub fn origin(&self) -> &str {
-        &self.origin
-    }
-
-    /// 向 `base_url + path` 发送 JSON POST，响应体原样返回。
-    ///
-    /// 只设置内容类型与 `Authorization`；**不重试**（能否重放由调用方判断）。
-    /// 日志只记主机与状态码，绝不记密钥、请求体或响应体。
-    pub async fn post_json(
-        &self,
-        path: &str,
-        bearer: &str,
-        body: &str,
-    ) -> Result<Vec<u8>, ModelError> {
-        let url = join_url(&self.base, path)?;
-        let host = url.host_str().unwrap_or_default().to_owned();
-
-        let response = self
-            .inner
-            .post(url)
-            .header("content-type", "application/json")
-            .bearer_auth(bearer)
-            .body(body.to_owned())
-            .send()
-            .await
-            .map_err(|error| classify_model_error(error, &host))?;
-
-        let status = response.status();
-        if status.is_success() {
-            let body = read_body(response, self.max_response_bytes, &host).await?;
-            debug!(host = %host, status = status.as_u16(), "模型端点请求成功");
-            return Ok(body);
-        }
-
-        let code = status.as_u16();
-        if code == 429 || status.is_server_error() {
-            let retry_after = parse_retry_after(response.headers());
-            warn!(
-                host = %host,
-                status = code,
-                retry_after_secs = retry_after.map(|delay| delay.as_secs()),
-                "模型端点暂时不可用"
-            );
-            return Err(ModelError::Transient {
-                status: Some(code),
-                retry_after,
-            });
-        }
-
-        warn!(host = %host, status = code, "模型端点返回非 2xx");
-        Err(ModelError::Invalid(format!("服务返回 HTTP {code}")))
-    }
-}
-
-/// HTTP request send errors.
-///
-/// 超时与连接失败多为瞬时问题，可重试；其余原因（TLS 协商、请求构造等）
-/// 无法确认请求是否已被处理，保守归入 [`ModelError::Indeterminate`]。
-fn classify_model_error(error: reqwest::Error, host: &str) -> ModelError {
-    if error.is_timeout() {
-        warn!(host = %host, "模型端点请求超时");
-        ModelError::Transient {
-            status: None,
-            retry_after: None,
-        }
-    } else if error.is_connect() {
-        warn!(host = %host, "模型端点连接失败");
-        ModelError::Transient {
-            status: None,
-            retry_after: None,
-        }
-    } else {
-        warn!(host = %host, "模型端点请求失败，结果未知");
-        ModelError::Indeterminate
-    }
-}
-
-/// 读取响应体并施加大小上限。
-///
-/// 分块累加而不是先看 `Content-Length`：后者可能缺失（chunked）也可能被伪造，
-/// 只有实际收到的字节数才可靠。中途读取失败意味着已收到响应头却拿不全内容，
-/// 远端很可能已经处理了请求 → [`ModelError::Indeterminate`]。
-async fn read_body(
-    mut response: reqwest::Response,
-    max_response_bytes: usize,
-    host: &str,
-) -> Result<Vec<u8>, ModelError> {
-    let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                if body.len() + chunk.len() > max_response_bytes {
-                    warn!(host = %host, "模型端点响应体超过大小上限");
-                    return Err(ModelError::Invalid(format!(
-                        "响应体超过 {max_response_bytes} 字节上限"
-                    )));
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(None) => return Ok(body),
-            Err(_) => {
-                warn!(host = %host, "模型端点响应体读取中断");
-                return Err(ModelError::Indeterminate);
-            }
-        }
-    }
-}
-
-/// 解析 `Retry-After` 的整数秒形式；HTTP-date 形式不解析（调用方按默认退避处理）。
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    let seconds = value.trim().parse::<u64>().ok()?;
-    Some(Duration::from_secs(seconds))
+    Ok(bytes)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn account_requests_keep_fixed_https_destinations() {
-        let allowed = ensure_allowed("https://API-TAKUMI.MIHOYO.COM:443/path", true).unwrap();
-        assert_eq!(allowed.host_str(), Some("api-takumi.mihoyo.com"));
-        for host in CORE_PLATFORM_HOSTS {
-            assert!(ensure_allowed(&format!("https://{host}/"), true).is_ok());
-        }
-        for raw in [
-            r"https://evil.com\@api-takumi.mihoyo.com/path",
-            "http://api-takumi.mihoyo.com/path",
-            "https://user@api-takumi.mihoyo.com/path",
-            "https://api-takumi.mihoyo.com:8443/path",
-            "https://api-takumi.mihoyo.com/path#fragment",
-            "https://api.example.com/resource",
-        ] {
-            assert!(
-                matches!(ensure_allowed(raw, true), Err(KernelError::InvalidInput)),
-                "{raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn plugin_requests_allow_http_ips_and_ports_but_reject_non_http_urls() {
-        for url in [
-            "http://127.0.0.1:8080/",
-            "https://api.example.com:8443/path",
-        ] {
-            assert!(ensure_allowed(url, false).is_ok(), "{url}");
-        }
-        for url in [
-            "file:///C:/secret",
-            "ftp://example.com/file",
-            "https://user@example.com/",
-        ] {
-            assert!(ensure_allowed(url, false).is_err(), "{url}");
-        }
-    }
-
-    #[test]
-    fn update_manifest_url_is_limited_to_latest_github_release_assets() {
-        assert!(is_valid_plugin_update_manifest_url(
-            "https://github.com/YueFChen/my_wonderland/releases/latest/download/my_wonderland-update.json"
-        ));
-        for raw in [
-            "http://github.com/YueFChen/my_wonderland/releases/latest/download/my_wonderland-update.json",
-            "https://github.com.evil.example/YueFChen/my_wonderland/releases/latest/download/my_wonderland-update.json",
-            "https://github.com/YueFChen/my_wonderland/releases/download/v1/my_wonderland-update.json",
-            "https://github.com/YueFChen/my_wonderland/releases/latest/download/my_wonderland-update.json?redirect=evil",
-            "https://github.com/YueFChen/my_wonderland/releases/latest/download/update.json",
-        ] {
-            assert!(
-                !is_valid_plugin_update_manifest_url(raw),
-                "URL should be rejected: {raw}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn response_body_limit_is_enforced_without_content_length() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::thread;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0; 1024];
-            let _ = stream.read(&mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n",
-                )
-                .unwrap();
-        });
-
-        let response = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
-            .get(format!("http://{address}/"))
-            .send()
-            .await
-            .unwrap();
-        assert!(matches!(
-            read_limited_body(response, 5).await,
-            Err(KernelError::ResourceLimit)
-        ));
-        server.join().unwrap();
-    }
-
-    fn ok(base_url: &str) -> String {
-        validate_endpoint(base_url)
-            .expect("应当校验通过")
-            .to_string()
-    }
-
-    fn config_err(base_url: &str) -> String {
-        match validate_endpoint(base_url) {
-            Err(ModelError::Config(reason)) => reason,
-            other => panic!("期望 Config，实际为 {other:?}"),
-        }
-    }
-
-    #[test]
-    fn https_with_and_without_path_prefix_passes() {
-        assert_eq!(
-            ok("https://api.example.com/v1"),
-            "https://api.example.com/v1"
-        );
-        assert_eq!(ok("https://api.example.com"), "https://api.example.com/");
-    }
-
-    #[test]
-    fn user_model_endpoints_accept_http_ips_and_custom_ports_without_flags() {
-        for url in [
-            "http://api.example.com:8080/v1",
-            "http://192.168.1.10:11434/v1",
-            "http://127.0.0.1:8080/v1",
-            "http://localhost:1/v1",
-            "http://[::1]:8080/v1",
-            "https://api.example.com:8443/v1",
-        ] {
-            assert_eq!(ok(url), url);
-        }
-    }
-
-    #[test]
-    fn non_http_scheme_userinfo_and_missing_host_are_rejected() {
-        config_err("ftp://x/");
-        config_err("https://user:pw@api.example.com/v1");
-        config_err("");
-        config_err("https://");
-        config_err("file:///tmp/model");
-    }
-
-    #[test]
-    fn join_url_keeps_prefix_without_double_slash() {
-        let base = validate_endpoint("https://api.example.com/v1").unwrap();
-        let joined = join_url(&base, "/chat/completions").unwrap();
-        assert_eq!(
-            joined.as_str(),
-            "https://api.example.com/v1/chat/completions"
-        );
-        let bare = validate_endpoint("https://api.example.com").unwrap();
-        assert_eq!(
-            join_url(&bare, "/chat/completions").unwrap().as_str(),
-            "https://api.example.com/chat/completions"
-        );
-        let trailing = validate_endpoint("https://api.example.com/v1/").unwrap();
-        assert_eq!(
-            join_url(&trailing, "/chat/completions").unwrap().as_str(),
-            "https://api.example.com/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn join_url_rejects_traversal_and_scheme_relative_paths() {
-        let base = validate_endpoint("https://api.example.com/v1").unwrap();
-        assert!(matches!(
-            join_url(&base, "/../admin"),
-            Err(ModelError::Config(_))
-        ));
-        assert!(matches!(
-            join_url(&base, "//evil.example.com/x"),
-            Err(ModelError::Config(_))
-        ));
-        assert!(matches!(
-            join_url(&base, "chat/completions"),
-            Err(ModelError::Config(_))
-        ));
-    }
-
-    #[test]
-    fn origin_has_no_path_or_userinfo() {
-        let client = ModelClient::new(ModelEndpoint::new("https://api.example.com/v1")).unwrap();
-        assert_eq!(client.origin(), "https://api.example.com");
-        let endpoint = ModelEndpoint::new("http://127.0.0.1:8080/v1");
-        let client = ModelClient::new(endpoint).unwrap();
-        assert_eq!(client.origin(), "http://127.0.0.1:8080");
-    }
-}
-
-#[cfg(test)]
-mod plugin_http_tests {
+mod transport_tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
 
-    fn direct_client() -> HttpClient {
-        let client = HttpClient::unrestricted();
-        let revision = proxy::current_proxy().unwrap().revision;
-        // Loopback integration tests must not depend on the workstation's system proxy.
-        *client.cached.write().unwrap() = Some((
-            revision,
+    fn direct_transport(redirects: HttpRedirectPolicy) -> HttpTransport {
+        let transport = HttpTransport::new();
+        *transport.cached.write().unwrap() = Some((
+            proxy::current_proxy().unwrap().revision,
+            redirects,
             reqwest::Client::builder()
                 .no_proxy()
-                .redirect(reqwest::redirect::Policy::limited(10))
-                .timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .build()
                 .unwrap(),
         ));
-        client
+        transport
     }
 
-    fn read_request(stream: &mut std::net::TcpStream) -> (String, String) {
+    fn request_head(reader: &mut impl BufRead) -> (String, Vec<HttpHeader>) {
+        let mut first = String::new();
+        assert!(reader.read_line(&mut first).unwrap() > 0);
+        let mut headers = Vec::new();
+        loop {
+            let mut line = Vec::new();
+            assert!(reader.read_until(b'\n', &mut line).unwrap() > 0);
+            if line == b"\r\n" {
+                break;
+            }
+            let split = line.iter().position(|byte| *byte == b':').unwrap();
+            headers.push(HttpHeader {
+                name: String::from_utf8(line[..split].to_vec())
+                    .unwrap()
+                    .to_ascii_lowercase(),
+                value: line[split + 1..].trim_ascii().to_vec(),
+            });
+        }
+        (first.trim().to_owned(), headers)
+    }
+
+    fn values<'a>(headers: &'a [HttpHeader], name: &str) -> Vec<&'a [u8]> {
+        headers
+            .iter()
+            .filter(|header| header.name == name)
+            .map(|header| header.value.as_slice())
+            .collect()
+    }
+
+    fn prepare_stream(stream: &TcpStream) {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let mut reader = BufReader::new(stream);
-        let mut headers = String::new();
-        loop {
-            let mut line = String::new();
-            assert!(reader.read_line(&mut line).unwrap() > 0);
-            if line == "\r\n" {
-                break;
-            }
-            headers.push_str(&line);
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+    }
+
+    async fn collect(body: &mut HttpResponseBody) -> Vec<u8> {
+        let mut all = Vec::new();
+        while let Some(chunk) = body.chunk().await.unwrap() {
+            all.extend_from_slice(&chunk);
         }
-        let size = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
-            })
-            .unwrap_or(0);
-        let mut body = vec![0; size];
-        reader.read_exact(&mut body).unwrap();
-        (
-            headers.to_ascii_lowercase(),
-            String::from_utf8(body).unwrap(),
-        )
+        all
     }
 
     #[tokio::test]
-    async fn plugin_requests_support_auth_custom_headers_post_queries_and_redirects() {
+    async fn custom_method_binary_body_repeated_query_and_headers_keep_non_success_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/resource?existing=yes",
+            listener.local_addr().unwrap()
+        );
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            prepare_stream(&stream);
+            let mut reader = BufReader::new(&mut stream);
+            let (first, headers) = request_head(&mut reader);
+            assert_eq!(first, "REPORT /resource?existing=yes&q=one&q=two HTTP/1.1");
+            assert_eq!(
+                values(&headers, "x-repeat"),
+                [b"first".as_slice(), b"second"]
+            );
+            assert_eq!(values(&headers, "x-bytes"), [b"\xff".as_slice()]);
+            assert!(values(&headers, "authorization").is_empty());
+            assert!(values(&headers, "cookie").is_empty());
+            assert!(values(&headers, "content-type").is_empty());
+            let mut body = [0; 4];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(body, [0, 1, 0xff, 2]);
+            drop(reader);
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 7\r\nX-Repeat: first\r\nX-Repeat: second\r\nX-Bytes: \xff\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\0\x01\xff\x02").unwrap();
+        });
+        let transport = direct_transport(HttpRedirectPolicy::None);
+        let mut request = HttpRequest::new("REPORT", &url);
+        request.query = vec![("q".into(), "one".into()), ("q".into(), "two".into())];
+        request.headers = vec![
+            HttpHeader {
+                name: "X-Repeat".into(),
+                value: b"first".to_vec(),
+            },
+            HttpHeader {
+                name: "X-Repeat".into(),
+                value: b"second".to_vec(),
+            },
+            HttpHeader {
+                name: "X-Bytes".into(),
+                value: vec![0xff],
+            },
+        ];
+        request.body = HttpRequestBody::Bytes(vec![0, 1, 0xff, 2]);
+        let mut response = transport.send(request).await.unwrap();
+        assert_eq!(response.status, 503);
+        assert_eq!(values(&response.headers, "retry-after"), [b"7".as_slice()]);
+        assert_eq!(
+            values(&response.headers, "x-repeat"),
+            [b"first".as_slice(), b"second"]
+        );
+        assert_eq!(values(&response.headers, "x-bytes"), [b"\xff".as_slice()]);
+        assert_eq!(response.final_url, format!("{url}&q=one&q=two"));
+        assert_eq!(collect(&mut response.body).await, [0, 1, 0xff, 2]);
+        assert!(response.body.chunk().await.unwrap().is_none());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_authentication_is_not_inherited_by_the_next_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for authenticated in [true, false] {
+                let (mut stream, _) = listener.accept().unwrap();
+                prepare_stream(&stream);
+                let (_, headers) = request_head(&mut BufReader::new(&mut stream));
+                if authenticated {
+                    assert_eq!(
+                        values(&headers, "authorization"),
+                        [b"Bearer request-key".as_slice()]
+                    );
+                } else {
+                    assert!(values(&headers, "authorization").is_empty());
+                    assert!(values(&headers, "cookie").is_empty());
+                }
+                stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno").unwrap();
+            }
+        });
+        let transport = direct_transport(HttpRedirectPolicy::None);
+        for authenticated in [true, false] {
+            let mut request = HttpRequest::new("GET", &url);
+            if authenticated {
+                request.headers.push(HttpHeader {
+                    name: "Authorization".into(),
+                    value: b"Bearer request-key".to_vec(),
+                });
+            }
+            let mut response = transport.send(request).await.unwrap();
+            assert_eq!(response.status, 401);
+            assert_eq!(collect(&mut response.body).await, b"no");
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirect_none_returns_complete_response_and_unlimited_follow_passes_ten_hops() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            for path in ["/start?existing=1&q=two", "/next"] {
+            for expected in std::iter::once(0).chain(0..=12) {
                 let (mut stream, _) = listener.accept().unwrap();
-                let (headers, body) = read_request(&mut stream);
-                assert!(headers.starts_with(&format!("post {path} http/1.1")));
-                assert!(headers.contains("authorization: bearer plugin-key"));
-                assert!(headers.contains("x-plugin-custom: yes"));
-                assert!(headers.contains("content-type: text/plain"));
-                assert!(!headers.contains("application/json"));
-                assert_eq!(body, "payload");
-                let response = if path.starts_with("/start") {
-                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                prepare_stream(&stream);
+                let (first, _) = request_head(&mut BufReader::new(&mut stream));
+                assert_eq!(first, format!("GET /{expected} HTTP/1.1"));
+                let response = if expected == 12 {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nend"
+                        .to_owned()
                 } else {
-                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /{}\r\nContent-Length: 4\r\nConnection: close\r\n\r\nhere",
+                        expected + 1
+                    )
                 };
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });
-        let client = direct_client();
-        let bytes = client
-            .request_bytes(
-                "POST",
-                &format!("{base}/start?existing=1"),
-                &[
-                    ("Authorization", "Bearer plugin-key"),
-                    ("X-Plugin-Custom", "yes"),
-                    ("Content-Type", "text/plain"),
-                ],
-                &[("q".into(), "two".into())],
-                Some("payload"),
-            )
+        let mut response = direct_transport(HttpRedirectPolicy::None)
+            .send(HttpRequest::new("GET", format!("{base}/0")))
             .await
             .unwrap();
-        assert_eq!(bytes, b"ok");
+        assert_eq!(response.status, 302);
+        assert_eq!(response.final_url, format!("{base}/0"));
+        assert_eq!(collect(&mut response.body).await, b"here");
+        let follow = HttpRedirectPolicy::Follow {
+            max_redirects: None,
+        };
+        let mut request = HttpRequest::new("GET", format!("{base}/0"));
+        request.redirects = follow;
+        let mut response = direct_transport(follow).send(request).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.final_url, format!("{base}/12"));
+        assert_eq!(collect(&mut response.body).await, b"end");
         server.join().unwrap();
     }
 
     #[tokio::test]
-    async fn plugin_client_reuses_connections_for_put_patch_and_delete() {
+    async fn redirect_loop_is_diagnosed_without_a_default_hop_cap() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let url = format!("http://{}/a", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            // All three requests must arrive over the same accepted connection.
-            let (mut stream, _) = listener.accept().unwrap();
-            for method in ["put", "patch", "delete"] {
-                let (headers, _) = read_request(&mut stream);
-                assert!(headers.starts_with(&format!("{method} / http/1.1")));
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                    .unwrap();
+            for (path, next) in [("/a", "/b"), ("/b", "/a")] {
+                let (mut stream, _) = listener.accept().unwrap();
+                prepare_stream(&stream);
+                let (first, _) = request_head(&mut BufReader::new(&mut stream));
+                assert_eq!(first, format!("GET {path} HTTP/1.1"));
+                write!(stream, "HTTP/1.1 302 Found\r\nLocation: {next}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             }
         });
-        let client = direct_client();
-        for method in ["PUT", "PATCH", "DELETE"] {
-            assert_eq!(
-                client
-                    .request_bytes(method, &url, &[], &[], None)
-                    .await
-                    .unwrap(),
-                b"ok"
-            );
-        }
+        let follow = HttpRedirectPolicy::Follow {
+            max_redirects: None,
+        };
+        let mut request = HttpRequest::new("GET", url);
+        request.redirects = follow;
+        let error = direct_transport(follow).send(request).await.unwrap_err();
+        assert_eq!(error.kind, HttpFailureKind::Redirect);
+        assert_eq!(error.stage, HttpFailureStage::Send);
+        assert!(error.outcome_unknown);
         server.join().unwrap();
     }
 
     #[tokio::test]
-    async fn transient_failures_retry_only_get_without_a_body() {
+    async fn cross_origin_redirect_strips_auth_and_cookie_but_preserves_final_response() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let last_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/first", first_listener.local_addr().unwrap());
+        let final_url = format!("http://{}/last", last_listener.local_addr().unwrap());
+        let expected_final = final_url.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = first_listener.accept().unwrap();
+            prepare_stream(&stream);
+            let (_, headers) = request_head(&mut BufReader::new(&mut stream));
+            assert_eq!(
+                values(&headers, "authorization"),
+                [b"Bearer private-key".as_slice()]
+            );
+            assert_eq!(values(&headers, "cookie"), [b"session=private".as_slice()]);
+            write!(stream, "HTTP/1.1 302 Found\r\nLocation: {final_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            let (mut stream, _) = last_listener.accept().unwrap();
+            prepare_stream(&stream);
+            let (_, headers) = request_head(&mut BufReader::new(&mut stream));
+            assert!(values(&headers, "authorization").is_empty());
+            assert!(values(&headers, "cookie").is_empty());
+            stream.write_all(b"HTTP/1.1 418 Teapot\r\nX-Final: yes\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntea").unwrap();
+        });
+        let follow = HttpRedirectPolicy::Follow {
+            max_redirects: None,
+        };
+        let mut request = HttpRequest::new("GET", url);
+        request.redirects = follow;
+        request.headers = vec![
+            HttpHeader {
+                name: "Authorization".into(),
+                value: b"Bearer private-key".to_vec(),
+            },
+            HttpHeader {
+                name: "Cookie".into(),
+                value: b"session=private".to_vec(),
+            },
+        ];
+        let mut response = direct_transport(follow).send(request).await.unwrap();
+        assert_eq!(response.status, 418);
+        assert_eq!(response.final_url, expected_final);
+        assert_eq!(collect(&mut response.body).await, b"tea");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_secret_survives_same_origin_but_never_returns_after_cross_origin() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", first_listener.local_addr().unwrap());
+        let other = format!("http://{}/other", other_listener.local_addr().unwrap());
+        let initial = format!("{base}/first");
+        let expected_final = format!("{base}/final");
+        let server = thread::spawn(move || {
+            for (path, location) in [("/first", "/second"), ("/second", other.as_str())] {
+                let (mut stream, _) = first_listener.accept().unwrap();
+                prepare_stream(&stream);
+                let (first, headers) = request_head(&mut BufReader::new(&mut stream));
+                assert_eq!(first, format!("GET {path} HTTP/1.1"));
+                assert_eq!(values(&headers, "x-api-key"), [b"private-key".as_slice()]);
+                write!(stream, "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+            let (mut stream, _) = other_listener.accept().unwrap();
+            prepare_stream(&stream);
+            let (_, headers) = request_head(&mut BufReader::new(&mut stream));
+            assert!(values(&headers, "x-api-key").is_empty());
+            assert_eq!(values(&headers, "x-ordinary"), [b"retained".as_slice()]);
+            write!(stream, "HTTP/1.1 302 Found\r\nLocation: {base}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            let (mut stream, _) = first_listener.accept().unwrap();
+            prepare_stream(&stream);
+            let (_, headers) = request_head(&mut BufReader::new(&mut stream));
+            assert!(values(&headers, "x-api-key").is_empty());
+            stream.write_all(b"HTTP/1.1 451 Unavailable\r\nX-Repeat: one\r\nX-Repeat: two\r\nContent-Length: 3\r\nConnection: close\r\n\r\nend").unwrap();
+        });
+        let follow = HttpRedirectPolicy::Follow {
+            max_redirects: None,
+        };
+        let mut request = HttpRequest::new("GET", initial);
+        request.redirects = follow;
+        request.credential_header_names = vec!["X-API-Key".into()];
+        request.headers = vec![
+            HttpHeader {
+                name: "x-api-key".into(),
+                value: b"private-key".to_vec(),
+            },
+            HttpHeader {
+                name: "X-Ordinary".into(),
+                value: b"retained".to_vec(),
+            },
+        ];
+        let mut response = direct_transport(follow).send(request).await.unwrap();
+        assert_eq!(response.status, 451);
+        assert_eq!(response.final_url, expected_final);
+        assert_eq!(
+            values(&response.headers, "x-repeat"),
+            [b"one".as_slice(), b"two"]
+        );
+        assert_eq!(collect(&mut response.body).await, b"end");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirects_preserve_method_and_body_or_discard_them_as_http_requires() {
+        for (status, original, expected, discard) in [
+            (301, "POST", "GET", true),
+            (302, "POST", "GET", true),
+            (301, "PUT", "PUT", false),
+            (302, "PUT", "PUT", false),
+            (303, "PUT", "GET", true),
+            (303, "HEAD", "HEAD", true),
+            (307, "POST", "POST", false),
+            (308, "POST", "POST", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/first", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                prepare_stream(&stream);
+                let mut reader = BufReader::new(&mut stream);
+                let (first, _) = request_head(&mut reader);
+                assert_eq!(first, format!("{original} /first HTTP/1.1"));
+                let mut body = [0; 7];
+                reader.read_exact(&mut body).unwrap();
+                assert_eq!(&body, b"payload");
+                drop(reader);
+                write!(stream, "HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                let (mut stream, _) = listener.accept().unwrap();
+                prepare_stream(&stream);
+                let mut reader = BufReader::new(&mut stream);
+                let (first, headers) = request_head(&mut reader);
+                assert_eq!(first, format!("{expected} /final HTTP/1.1"));
+                if discard {
+                    for name in ["content-type", "content-encoding", "transfer-encoding"] {
+                        assert!(values(&headers, name).is_empty());
+                    }
+                    assert!(values(&headers, "content-length").is_empty());
+                } else {
+                    reader.read_exact(&mut body).unwrap();
+                    assert_eq!(&body, b"payload");
+                    assert_eq!(
+                        values(&headers, "content-type"),
+                        [b"application/test".as_slice()]
+                    );
+                }
+                drop(reader);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+            });
+            let follow = HttpRedirectPolicy::Follow {
+                max_redirects: None,
+            };
+            let mut request = HttpRequest::new(original, url);
+            request.redirects = follow;
+            request.headers = vec![HttpHeader {
+                name: "Content-Type".into(),
+                value: b"application/test".to_vec(),
+            }];
+            request.body = HttpRequestBody::Bytes(b"payload".to_vec());
+            let mut response = direct_transport(follow).send(request).await.unwrap();
+            assert_eq!(response.status, 409);
+            assert!(collect(&mut response.body).await.is_empty());
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_limit_and_deadline_cover_the_complete_chain() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/first", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            prepare_stream(&stream);
+            request_head(&mut BufReader::new(&mut stream));
+            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let follow = HttpRedirectPolicy::Follow {
+            max_redirects: Some(0),
+        };
+        let mut request = HttpRequest::new("GET", url);
+        request.redirects = follow;
+        let error = direct_transport(follow).send(request).await.unwrap_err();
+        assert_eq!(error.kind, HttpFailureKind::Redirect);
+        assert!(error.outcome_unknown);
+        server.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/first", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for status in [302, 200] {
+                let (mut stream, _) = listener.accept().unwrap();
+                prepare_stream(&stream);
+                request_head(&mut BufReader::new(&mut stream));
+                thread::sleep(Duration::from_millis(300));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} Response\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        let follow = HttpRedirectPolicy::Follow {
+            max_redirects: None,
+        };
+        let mut request = HttpRequest::new("GET", url);
+        request.redirects = follow;
+        request.deadline = Some(tokio::time::Instant::now() + Duration::from_millis(450));
+        let error = direct_transport(follow).send(request).await.unwrap_err();
+        assert_eq!(error.kind, HttpFailureKind::DeadlineExceeded);
+        assert_eq!(error.stage, HttpFailureStage::Send);
+        assert!(error.outcome_unknown);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn deadline_covers_the_whole_body_and_releases_the_response_on_expiry() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            for (method, status, expected_body) in [
-                ("get", "503 Service Unavailable", ""),
-                ("get", "200 OK", ""),
-                ("post", "503 Service Unavailable", "{}"),
-                ("get", "503 Service Unavailable", "payload"),
-            ] {
-                let (mut stream, _) = listener.accept().unwrap();
-                let (headers, body) = read_request(&mut stream);
-                assert!(headers.starts_with(&format!("{method} / http/1.1")));
-                assert_eq!(body, expected_body);
-                if method == "post" {
-                    assert!(headers.contains("content-type: application/json"));
-                }
-                write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            let (mut stream, _) = listener.accept().unwrap();
+            prepare_stream(&stream);
+            request_head(&mut BufReader::new(&mut stream));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\na")
+                .unwrap();
+            thread::sleep(Duration::from_millis(300));
+            let _ = stream.write_all(b"b");
+        });
+        let mut request = HttpRequest::new("GET", url);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        request.deadline = Some(deadline);
+        let mut response = direct_transport(HttpRedirectPolicy::None)
+            .send(request)
+            .await
+            .unwrap();
+        assert_eq!(response.body.chunk().await.unwrap().unwrap(), b"a");
+        tokio::time::sleep(Duration::from_millis(130)).await;
+        let error = response.body.chunk().await.unwrap_err();
+        assert_eq!(error.kind, HttpFailureKind::DeadlineExceeded);
+        assert_eq!(error.stage, HttpFailureStage::Body);
+        assert!(error.outcome_unknown);
+        assert!(response.body.response.is_none());
+        assert_eq!(response.body.chunk().await.unwrap_err(), error);
+        response.body.close();
+        assert!(response.body.chunk().await.unwrap().is_none());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_post_is_sent_once_and_reports_unknown_outcome() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            prepare_stream(&stream);
+            let mut reader = BufReader::new(&mut stream);
+            let (first, _) = request_head(&mut reader);
+            assert_eq!(first, "POST / HTTP/1.1");
+            let mut body = [0; 4];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"once");
+            drop(reader);
+            drop(stream);
+            listener.set_nonblocking(true).unwrap();
+            // Retain the listening socket so a hidden retry would be accepted, rather than
+            // merely fail to connect after this server exits.
+            for _ in 0..20 {
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let mut request = HttpRequest::new("POST", url);
+        request.body = HttpRequestBody::Bytes(b"once".to_vec());
+        let error = direct_transport(HttpRedirectPolicy::None)
+            .send(request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.stage, HttpFailureStage::Send);
+        assert!(error.outcome_unknown);
+        assert!(!error.to_string().contains("once"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_response_preserves_received_chunks_then_reports_body_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            prepare_stream(&stream);
+            request_head(&mut BufReader::new(&mut stream));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nabc")
+                .unwrap();
+        });
+        let mut response = direct_transport(HttpRedirectPolicy::None)
+            .send(HttpRequest::new("GET", url))
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        let error = loop {
+            match response.body.chunk().await {
+                Ok(Some(chunk)) => received.extend_from_slice(&chunk),
+                Ok(None) => panic!("truncated response must not become EOF"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(received, b"abc");
+        assert_eq!(error.stage, HttpFailureStage::Body);
+        assert_eq!(error.kind, HttpFailureKind::BodyInterrupted);
+        assert!(error.outcome_unknown);
+        assert!(response.body.response.is_none());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_stream_exceeds_old_twenty_mib_limit_without_aggregation() {
+        const SIZE: usize = 24 * 1024 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            prepare_stream(&stream);
+            request_head(&mut BufReader::new(&mut stream));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let block = [0x5a; 16 * 1024];
+            for _ in 0..SIZE / block.len() {
+                stream.write_all(&block).unwrap();
+            }
+        });
+        let mut response = direct_transport(HttpRedirectPolicy::None)
+            .send(HttpRequest::new("GET", url))
+            .await
+            .unwrap();
+        assert_eq!(response.content_length, Some(SIZE as u64));
+        assert!(response.body.deadline.is_none());
+        let mut received = 0;
+        while let Some(chunk) = response.body.chunk().await.unwrap() {
+            assert!(chunk.iter().all(|byte| *byte == 0x5a));
+            received += chunk.len();
+        }
+        assert_eq!(received, SIZE);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_file_upload_and_non_replayable_redirect_preserve_http_result() {
+        const SIZE: usize = 24 * 1024 * 1024;
+        let path = std::env::temp_dir().join(format!(
+            "wonderland-http-stream-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let block = [0x33; 16 * 1024];
+            for _ in 0..SIZE / block.len() {
+                file.write_all(&block).unwrap();
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/upload", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            prepare_stream(&stream);
+            let mut reader = BufReader::new(&mut stream);
+            let (first, headers) = request_head(&mut reader);
+            assert_eq!(first, "PUT /upload HTTP/1.1");
+            assert_eq!(
+                values(&headers, "content-length"),
+                [SIZE.to_string().as_bytes()]
+            );
+            let mut received = 0;
+            let mut block = [0; 16 * 1024];
+            while received < SIZE {
+                reader.read_exact(&mut block).unwrap();
+                assert!(block.iter().all(|byte| *byte == 0x33));
+                received += block.len();
+            }
+            drop(reader);
+            stream.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /replay\r\nContent-Length: 5\r\nConnection: close\r\n\r\nagain").unwrap();
+        });
+        let follow = HttpRedirectPolicy::Follow {
+            max_redirects: None,
+        };
+        let mut request = HttpRequest::new("PUT", &url);
+        request.redirects = follow;
+        request.headers = vec![HttpHeader {
+            name: "Content-Length".into(),
+            value: SIZE.to_string().into_bytes(),
+        }];
+        request.body = HttpRequestBody::File(tokio::fs::File::open(&path).await.unwrap());
+        let mut response = direct_transport(follow).send(request).await.unwrap();
+        assert_eq!(response.status, 307);
+        assert_eq!(response.final_url, url);
+        assert_eq!(
+            values(&response.headers, "location"),
+            [b"/replay".as_slice()]
+        );
+        assert_eq!(collect(&mut response.body).await, b"again");
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_file_upload_follows_303_without_replaying_the_file() {
+        let path = std::env::temp_dir().join(format!(
+            "wonderland-http-303-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"payload")
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/upload", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            prepare_stream(&stream);
+            let mut reader = BufReader::new(&mut stream);
+            let (first, _) = request_head(&mut reader);
+            assert_eq!(first, "POST /upload HTTP/1.1");
+            let mut body = [0; 7];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"payload");
+            drop(reader);
+            stream.write_all(b"HTTP/1.1 303 See Other\r\nLocation: /result\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            prepare_stream(&stream);
+            let (first, headers) = request_head(&mut BufReader::new(&mut stream));
+            assert_eq!(first, "GET /result HTTP/1.1");
+            assert!(values(&headers, "content-length").is_empty());
+            stream
+                .write_all(
+                    b"HTTP/1.1 418 Teapot\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntea",
                 )
                 .unwrap();
-            }
         });
-        let client = direct_client();
-        assert!(client.get_bytes(&url, &[], &[]).await.unwrap().is_empty());
-        for (method, body) in [("POST", "{}"), ("GET", "payload")] {
-            assert!(matches!(
-                client
-                    .request_bytes(method, &url, &[], &[], Some(body))
-                    .await,
-                Err(KernelError::Http(503))
-            ));
-        }
+        let follow = HttpRedirectPolicy::Follow {
+            max_redirects: None,
+        };
+        let mut request = HttpRequest::new("POST", url);
+        request.redirects = follow;
+        request.headers = vec![HttpHeader {
+            name: "Content-Length".into(),
+            value: b"7".to_vec(),
+        }];
+        request.body = HttpRequestBody::File(tokio::fs::File::open(&path).await.unwrap());
+        let mut response = direct_transport(follow).send(request).await.unwrap();
+        assert_eq!(response.status, 418);
+        assert!(response.final_url.ends_with("/result"));
+        assert_eq!(collect(&mut response.body).await, b"tea");
         server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_input_and_expired_preparation_never_claim_sent_outcome() {
+        let transport = direct_transport(HttpRedirectPolicy::None);
+        for (method, url, expected) in [
+            ("GET", "file:///C:/private", HttpFailureKind::InvalidUrl),
+            ("GET", "ftp://example.com/", HttpFailureKind::InvalidUrl),
+            (
+                "invalid method",
+                "http://127.0.0.1:9/",
+                HttpFailureKind::InvalidMethod,
+            ),
+        ] {
+            let error = transport
+                .send(HttpRequest::new(method, url))
+                .await
+                .unwrap_err();
+            assert_eq!(error.stage, HttpFailureStage::Prepare);
+            assert_eq!(error.kind, expected);
+            assert!(!error.outcome_unknown);
+        }
+        let mut request = HttpRequest::new("GET", "http://127.0.0.1:9/");
+        request.headers.push(HttpHeader {
+            name: "Authorization".into(),
+            value: b"secret\r\nInjected: yes".to_vec(),
+        });
+        let error = transport.send(request).await.unwrap_err();
+        assert_eq!(error.kind, HttpFailureKind::InvalidHeader);
+        assert!(!error.to_string().contains("secret"));
+        let mut request = HttpRequest::new("GET", "http://127.0.0.1:9/");
+        request.deadline = Some(tokio::time::Instant::now() - Duration::from_secs(1));
+        let error = transport.send(request).await.unwrap_err();
+        assert_eq!(error.stage, HttpFailureStage::Prepare);
+        assert_eq!(error.kind, HttpFailureKind::DeadlineExceeded);
+        assert!(!error.outcome_unknown);
+    }
+
+    #[tokio::test]
+    async fn failed_initial_connection_without_redirects_is_known_not_sent() {
+        let address = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let mut request = HttpRequest::new("POST", format!("http://{address}/?key=private"));
+        request.body = HttpRequestBody::Bytes(b"request body".to_vec());
+        request.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(8));
+        let error = direct_transport(HttpRedirectPolicy::None)
+            .send(request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, HttpFailureKind::Connection);
+        assert_eq!(error.stage, HttpFailureStage::Send);
+        assert!(!error.outcome_unknown);
+        assert!(!error.to_string().contains("private"));
     }
 }

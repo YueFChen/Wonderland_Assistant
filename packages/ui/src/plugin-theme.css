@@ -1,72 +1,105 @@
-/* Runtime theme variables for isolated plugin iframes; contains no Tailwind directives. */
+/* Runtime component tokens shared with opt-in plugin frames. No wallpaper assets. */
 :root {
   color-scheme: dark;
-  --app-ink: rgb(255 255 255 / 0.92);
-  --app-ink-muted: rgb(255 255 255 / 0.62);
-  --app-ink-faint: rgb(255 255 255 / 0.55);
-  --app-ink-rgb: 255 255 255;
-  --app-surface-rgb: 255 255 255;
+  --app-ink: #edebfa;
+  --app-ink-muted: #b1bad2;
+  --app-ink-faint: #b1bad2;
+  --app-ink-rgb: 237 235 250;
+  --app-surface-rgb: 24 31 54;
+  --app-glass-subtle: #121a2d;
+  --app-glass: #181f36;
+  --app-glass-hover: #212b47;
+  --app-glass-line: #3c4667;
+  --app-glass-line-strong: #7582a5;
+  --app-field: #121a2d;
+  --app-field-border: #7582a5;
+  --app-dialog-surface: #212b47;
+  --app-dialog-backdrop: rgb(6 9 22 / .74);
+  --app-dialog-shadow: 0 24px 64px rgb(3 7 18 / .38);
+  --app-sidebar-surface: var(--app-glass);
+  --app-sidebar-shadow: -16px 0 40px rgb(3 7 18 / .26);
+  --app-sidebar-scrim: rgb(6 9 22 / .26);
+  --app-accent: #b7b1f1;
+  --app-accent-ink: #b7b1f1;
+  --app-accent-soft: #303251;
+  --app-accent-line: #b7b1f1;
+  --app-primary-ink: #17192b;
+  --app-ornament: #c8b78d;
+  --app-ornament-opacity: .55;
+  --app-satin: rgb(237 235 250 / .025);
+  --app-sheen: rgb(237 235 250 / .12);
+  --app-danger: #eea0b2;
+  --app-danger-soft: #3a263b;
+  --app-danger-line: #c7798e;
+  --app-success: #9bccbd;
+  --app-success-soft: #1d393b;
+  --app-success-line: #72a996;
+  --app-warning: #dfc58e;
+  --app-warning-soft: #393225;
+  --app-warning-line: #a88e58;
+  --app-radius-control: 4px;
+  --app-radius-panel: 6px;
+  --app-radius-dialog: 8px;
+  --app-focus-width: 2px;
+  --app-focus-offset: 3px;
+  --app-time-press: 80ms;
+  --app-time-control: 120ms;
+  --app-time-popover: 160ms;
+  --app-time-dialog: 180ms;
+  --app-time-sheen: 520ms;
+  --app-time-flow: 1800ms;
+  --app-ease: cubic-bezier(.2, 0, 0, 1);
 
-  --app-glass-subtle: rgb(255 255 255 / 0.05);
-  --app-glass: rgb(255 255 255 / 0.09);
-  --app-glass-hover: rgb(255 255 255 / 0.16);
-  --app-glass-line: rgb(255 255 255 / 0.12);
-  --app-glass-line-strong: rgb(255 255 255 / 0.2);
-  --app-field: #252236;
-  --app-field-border: rgb(255 255 255 / 0.14);
-
-  --app-accent: #a78bfa;
-  --app-accent-ink: #ded0ff;
-  --app-accent-soft: rgb(167 139 250 / 0.18);
-  --app-accent-line: rgb(167 139 250 / 0.45);
-
-  --app-danger: #ffb9b9;
-  --app-danger-soft: rgb(224 100 100 / 0.12);
-  --app-danger-line: rgb(224 100 100 / 0.4);
-  --app-success: #a9ecce;
-  --app-success-soft: rgb(74 196 138 / 0.12);
-  --app-success-line: rgb(74 196 138 / 0.4);
-
+  /* Existing background defaults stay independent of component styling. */
   --app-page: #0b0b12;
-  --app-glow-1: rgb(109 74 255 / 0.34);
-  --app-glow-2: rgb(79 70 229 / 0.3);
-  --app-glow-3: rgb(139 92 246 / 0.16);
+  --app-glow-1: rgb(109 74 255 / .34);
+  --app-glow-2: rgb(79 70 229 / .3);
+  --app-glow-3: rgb(139 92 246 / .16);
   --app-title-from: #ffffff;
-  --app-title-to: rgb(255 255 255 / 0.72);
+  --app-title-to: rgb(255 255 255 / .72);
 }
 
 :root[data-theme='light'] {
   color-scheme: light;
-  --app-ink: rgb(26 24 46 / 0.92);
-  --app-ink-muted: rgb(26 24 46 / 0.72);
-  --app-ink-faint: rgb(26 24 46 / 0.62);
-  --app-ink-rgb: 26 24 46;
-  --app-surface-rgb: 26 24 46;
-
-  --app-glass-subtle: rgb(26 24 46 / 0.04);
-  --app-glass: rgb(255 255 255 / 0.66);
-  --app-glass-hover: rgb(255 255 255 / 0.92);
-  --app-glass-line: rgb(26 24 46 / 0.12);
-  --app-glass-line-strong: rgb(26 24 46 / 0.2);
+  --app-ink: #28314a;
+  --app-ink-muted: #58627d;
+  --app-ink-faint: #58627d;
+  --app-ink-rgb: 40 49 74;
+  --app-surface-rgb: 247 246 252;
+  --app-glass-subtle: #e8e8f3;
+  --app-glass: #f7f6fc;
+  --app-glass-hover: #ffffff;
+  --app-glass-line: #c4c5d6;
+  --app-glass-line-strong: #7d809b;
   --app-field: #ffffff;
-  --app-field-border: rgb(26 24 46 / 0.14);
-
-  --app-accent: #6d4aff;
-  --app-accent-ink: #4f46e5;
-  --app-accent-soft: rgb(109 74 255 / 0.12);
-  --app-accent-line: rgb(109 74 255 / 0.4);
-
-  --app-danger: #b4232f;
-  --app-danger-soft: rgb(180 35 47 / 0.08);
-  --app-danger-line: rgb(180 35 47 / 0.32);
-  --app-success: #0f7a4f;
-  --app-success-soft: rgb(15 122 79 / 0.08);
-  --app-success-line: rgb(15 122 79 / 0.3);
-
+  --app-field-border: #7d809b;
+  --app-dialog-surface: #ffffff;
+  --app-dialog-backdrop: rgb(30 26 54 / .40);
+  --app-dialog-shadow: 0 24px 64px rgb(32 31 64 / .16);
+  --app-sidebar-shadow: -16px 0 40px rgb(32 31 64 / .12);
+  --app-sidebar-scrim: rgb(30 26 54 / .18);
+  --app-accent: #61528f;
+  --app-accent-ink: #61528f;
+  --app-accent-soft: #e6dff4;
+  --app-accent-line: #61528f;
+  --app-primary-ink: #ffffff;
+  --app-ornament: #7d653a;
+  --app-ornament-opacity: .65;
+  --app-satin: rgb(255 255 255 / .65);
+  --app-sheen: rgb(255 255 255 / .08);
+  --app-danger: #a63b56;
+  --app-danger-soft: #f8e8ed;
+  --app-danger-line: #a63b56;
+  --app-success: #2b6954;
+  --app-success-soft: #e2f0eb;
+  --app-success-line: #2b6954;
+  --app-warning: #795b1d;
+  --app-warning-soft: #f5eddc;
+  --app-warning-line: #795b1d;
   --app-page: #f3f2fa;
-  --app-glow-1: rgb(109 74 255 / 0.18);
-  --app-glow-2: rgb(79 70 229 / 0.14);
-  --app-glow-3: rgb(139 92 246 / 0.1);
+  --app-glow-1: rgb(109 74 255 / .18);
+  --app-glow-2: rgb(79 70 229 / .14);
+  --app-glow-3: rgb(139 92 246 / .1);
   --app-title-from: #1b1830;
-  --app-title-to: rgb(27 24 48 / 0.68);
+  --app-title-to: rgb(27 24 48 / .68);
 }

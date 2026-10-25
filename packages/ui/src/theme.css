@@ -4,45 +4,63 @@
  */
 
 @import './plugin-theme.css';
+@import './controls.css';
 
-@theme {
-  /* 品牌色阶：取自应用图标主色（紫罗兰 → 靛蓝），两套主题共用 */
-  --color-brand-200: #ded7ff;
-  --color-brand-300: #c7b9ff;
-  --color-brand-400: #a78bfa;
-  --color-brand-500: #8b5cf6;
-  --color-brand-600: #6d4aff;
-  --color-brand-700: #4f46e5;
+/* Resolve semantic colors where consumed; the host supplies one component palette. */
+@theme inline {
+  /* Legacy utility names follow the shared interaction accent in both modes. */
+  --color-brand-200: var(--app-accent);
+  --color-brand-300: var(--app-accent);
+  --color-brand-400: var(--app-accent);
+  --color-brand-500: var(--app-accent);
+  --color-brand-600: var(--app-accent);
+  --color-brand-700: var(--app-accent-ink);
 
   /* 语义文字色：随主题切换 */
   --color-ink: var(--app-ink);
   --color-ink-muted: var(--app-ink-muted);
   --color-ink-faint: var(--app-ink-faint);
 
-  /* 玻璃拟态表面：随主题切换 */
+  /* Stable component surfaces; existing glass aliases remain available. */
   --color-glass-subtle: var(--app-glass-subtle);
   --color-glass: var(--app-glass);
   --color-glass-hover: var(--app-glass-hover);
   --color-glass-line: var(--app-glass-line);
   --color-glass-line-strong: var(--app-glass-line-strong);
+}
 
+@theme {
   /* 圆角与模糊 */
-  --radius-card: 1rem;
-  --blur-glass: 20px;
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-lg: 4px;
+  --radius-xl: 6px;
+  --radius-2xl: 6px;
+  --radius-3xl: 8px;
+  --radius-card: 6px;
+  --blur-glass: 0px;
 
   /* 入场动效 */
-  --animate-rise: rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-rise: rise 180ms cubic-bezier(.2, 0, 0, 1) both;
 
   @keyframes rise {
     from {
       opacity: 0;
-      transform: translateY(12px);
+      transform: translateY(4px);
     }
     to {
       opacity: 1;
       transform: translateY(0);
     }
   }
+}
+
+/* Kept above utility colors: only explicitly sampled, exposed copy receives these values. */
+.app-background-copy[data-background-ink] {
+  color: var(--app-local-ink);
+  filter: var(--app-local-copy-filter, none);
+  -webkit-text-stroke: var(--app-local-stroke, 0px) var(--app-local-outline, transparent);
+  paint-order: stroke fill;
 }
 
 @layer base {
@@ -55,7 +73,9 @@
   body {
     background-color: var(--app-page);
     color: var(--app-ink);
-    font-family: "Inter", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font-size: 14px;
+    line-height: 1.5714;
   }
 
   /* 原生选项弹层不继承 select 的玻璃背景，显式提供两套主题的实底与文字色。 */
@@ -65,24 +85,25 @@
     color: var(--app-ink);
   }
 
-  select:focus-visible {
-    outline: 2px solid var(--app-accent);
-    outline-offset: 2px;
-  }
+  :is(button, a[href], input, select, textarea, summary, [tabindex]):focus-visible { outline: var(--app-focus-width) solid var(--app-accent); outline-offset: var(--app-focus-offset); }
+  :is(input[type='checkbox'], input[type='radio']) { width: 18px; height: 18px; flex-shrink: 0; accent-color: var(--app-accent); }
+  input[type='range'] { accent-color: var(--app-accent); }
+  :is(button, [role='button']):not(:disabled) { cursor: pointer; }
 
   /* 细滚动条，贴合当前主题的玻璃面板 */
   * {
     scrollbar-width: thin;
-    scrollbar-color: var(--app-glass-hover) transparent;
+    scrollbar-color: var(--app-glass-line-strong) transparent;
   }
 }
 
 @layer components {
-  /* 玻璃卡片：面板、卡片的基础表面 */
+  /* Shared panel: stable surface, light satin highlight and a functional edge. */
   .glass-card {
-    background-color: var(--color-glass);
-    backdrop-filter: blur(var(--blur-glass));
-    border: 1px solid var(--color-glass-line);
+    background-color: var(--app-glass);
+    background-image: linear-gradient(var(--app-satin), transparent 36px);
+    border: 1px solid var(--app-glass-line);
+    border-radius: var(--app-radius-panel);
   }
 
   /* 首页主标题：随主题变化的渐变文字 */
@@ -102,17 +123,13 @@
     background-color: var(--app-page);
   }
 
-  /* 自定义背景上的自适应遮罩，颜色由背景采样生成 */
-  .app-backdrop-scrim {
-    background-image: var(--app-custom-scrim, linear-gradient(
-      135deg,
-      rgb(0 0 0 / 0.6),
-      rgb(0 0 0 / 0.4) 45%,
-      rgb(79 70 229 / 0.5)
-    ));
+  /* Only exposed labels need an edge against an image; panels supply their own surface. */
+  .app-background-copy {
+    filter: var(--app-background-copy-filter, none);
   }
 
   .user-avatar-fallback {
-    background-image: linear-gradient(135deg, var(--color-brand-600), var(--color-brand-700));
+    background: var(--app-accent-soft);
+    color: var(--app-accent-ink);
   }
 }

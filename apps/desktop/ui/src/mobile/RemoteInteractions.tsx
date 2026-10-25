@@ -1,13 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { Download, FolderOpen, X } from 'lucide-react'
-import { webDownload, webRequest } from '../core/transport'
-
-interface Interaction {
-  id: string
-  pluginId: string
-  kind: 'pick' | 'read' | 'download' | 'open_url' | 'notice'
-  payload: { name?: string; size?: number; extensions?: string[]; maxBytes?: number; handle?: string; offset?: number; length?: number; url?: string; message?: string }
-}
+import { listen, webDownload, webRequest } from '../core/transport'
+import type { RemoteInteraction as Interaction } from '../core/remoteNotifications'
+import { RemoteFileReferences } from './remoteFileReferences'
 
 /** Core-owned controls live outside plugin sandboxes; no key or file handle enters an iframe. */
 export function RemoteInteractions({ names }: { names: Map<string, string> }) {
@@ -16,22 +11,33 @@ export function RemoteInteractions({ names }: { names: Map<string, string> }) {
   const [expanded, setExpanded] = useState(true)
   const [busy, setBusy] = useState<string | null>(null)
   const [downloads, setDownloads] = useState<Record<string, string>>({})
-  const files = useRef(new Map<string, { file: File; expires: number }>())
-  const blobs = useRef(new Map<string, { url: string; expires: number }>())
+  const files = useRef(new RemoteFileReferences())
+  const refresh = useRef<(() => void) | null>(null)
   const mounted = useRef(false)
   const reply = (id: string, result: unknown) => webRequest(`interactions/${encodeURIComponent(id)}/reply`, result)
 
   useEffect(() => {
     let live = true
     mounted.current = true
-    let timer: ReturnType<typeof setTimeout>
+    let pending = false
+    let again = false
+    let needsRefresh = false
+    let stopListening: (() => void) | undefined
     const poll = async () => {
+      if (!live) return
+      if (pending) { again = true; return }
+      pending = true
+      const fileRevision = files.current.snapshotRevision()
       try {
-        const next = await webRequest<Interaction[]>('interactions')
+        const [next, selections] = await Promise.all([
+          webRequest<Interaction[]>('interactions'),
+          webRequest<{ handles: string[] }>('selected-files'),
+        ])
         if (!live) return
-        for (const [id, value] of files.current) if (value.expires < Date.now()) files.current.delete(id)
+        files.current.retain(new Set(selections.handles), fileRevision)
+        needsRefresh = false
         const activeIds = new Set(next.map((item) => item.id))
-        for (const [id, value] of blobs.current) if (value.expires < Date.now() || !activeIds.has(id)) { URL.revokeObjectURL(value.url); blobs.current.delete(id); setDownloads((old) => { const copy = { ...old }; delete copy[id]; return copy }) }
+        setDownloads((old) => Object.fromEntries(Object.entries(old).filter(([id]) => activeIds.has(id))))
         setActions(next.filter((item) => item.kind !== 'read'))
         for (const action of next.filter((item) => item.kind === 'read')) {
           const { handle, offset, length } = action.payload
@@ -48,17 +54,30 @@ export function RemoteInteractions({ names }: { names: Map<string, string> }) {
           if (offset! + length! === selected.file.size) files.current.delete(handle!)
         }
       } catch {
+        needsRefresh = true
         // Connectivity status is already shown by the workspace. Retry without duplicating banners.
-      } finally { if (live) timer = setTimeout(() => void poll(), 350) }
+      } finally {
+        pending = false
+        if (live && again) { again = false; void poll() }
+      }
     }
+    const reconnect = (event: Event) => {
+      if ((event as CustomEvent<string>).detail === 'connected' && needsRefresh) void poll()
+    }
+    refresh.current = () => { void poll() }
+    window.addEventListener('wonderland:web-connection', reconnect)
+    void Promise.all([listen('interactions:changed', () => { void poll() }), listen('plugins:changed', () => { void poll() })]).then((stops) => {
+      if (live) stopListening = () => stops.forEach((stop) => stop())
+      else stops.forEach((stop) => stop())
+    })
     void poll()
     return () => {
       live = false
       mounted.current = false
-      clearTimeout(timer)
+      stopListening?.()
+      window.removeEventListener('wonderland:web-connection', reconnect)
       files.current.clear()
-      for (const value of blobs.current.values()) URL.revokeObjectURL(value.url)
-      blobs.current.clear()
+      refresh.current = null
     }
   }, [])
 
@@ -68,34 +87,29 @@ export function RemoteInteractions({ names }: { names: Map<string, string> }) {
     finally { if (mounted.current) setBusy(null) }
   }
   const choose = async (action: Interaction, file: File) => {
-    const heldBytes = [...files.current.values()].reduce((sum, item) => sum + item.file.size, 0)
-    if (file.size > (action.payload.maxBytes ?? 0) || heldBytes + file.size > 128 * 1024 * 1024 || files.current.size >= 8) throw new Error('文件超过本次导入或当前设备的大小限制。')
+    if (action.payload.maxBytes != null && file.size > action.payload.maxBytes) throw new Error('文件超过插件为本次导入设置的大小限制。')
     const extensions = action.payload.extensions ?? []
     if (extensions.length && !extensions.some((ext) => file.name.toLowerCase().endsWith(`.${ext.toLowerCase()}`))) throw new Error('请选择插件支持的文件类型。')
     const handle = Array.from(crypto.getRandomValues(new Uint8Array(32)), (v) => v.toString(16).padStart(2, '0')).join('')
-    files.current.set(handle, { file, expires: Date.now() + 300_000 })
-    try { await reply(action.id, { handle, name: file.name, size: file.size }) }
+    files.current.register(handle, file)
+    try { await reply(action.id, { handle, name: file.name, size: file.size }); files.current.confirmed(handle, () => refresh.current?.()) }
     catch (cause) { files.current.delete(handle); throw cause }
   }
   const prepare = async (action: Interaction) => {
-    const blob = await webDownload(`interactions/${encodeURIComponent(action.id)}/content`)
+    const url = await webDownload(`interactions/${encodeURIComponent(action.id)}/content`)
     if (!mounted.current) return
-    const url = URL.createObjectURL(blob)
-    const previous = blobs.current.get(action.id)
-    if (previous) URL.revokeObjectURL(previous.url)
-    blobs.current.set(action.id, { url, expires: Date.now() + 300_000 })
     setDownloads((old) => ({ ...old, [action.id]: url }))
   }
   if (!actions.length) return null
   return <aside className="remote-interactions glass-card" aria-label="远程文件与链接">
     <button className="remote-interactions-heading" onClick={() => setExpanded(!expanded)} aria-expanded={expanded}><FolderOpen size={18} />当前设备 · 文件与链接（{actions.length}）</button>
     {expanded && <div className="remote-interactions-body">
-      <p>导入从此设备选择，导出保存到此设备。下载保留 5 分钟。</p>
+      {actions.some((action) => action.kind === 'download') && <p>未领取的文件会保留，请下载或移除。</p>}
       {actions.map((action) => <section key={action.id} className="remote-interaction">
-        <header><strong>{names.get(action.pluginId) ?? action.pluginId}</strong><button aria-label="取消或移除" disabled={busy === action.id} onClick={() => void perform(action.id, () => reply(action.id, { cancelled: true }))}><X size={16} /></button></header>
-        {action.kind === 'pick' && <label>选择要导入的文件（45 秒内）<small>上限 {Math.round((action.payload.maxBytes ?? 0) / 1024 / 1024)} MiB</small><input type="file" aria-label="从当前设备选择文件" accept={action.payload.extensions?.map((ext) => `.${ext}`).join(',')} disabled={busy === action.id} onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void perform(action.id, () => choose(action, file)) }} /></label>}
+        <header><strong>{names.get(action.rootPluginId) ?? action.rootPluginId}{action.rootPluginId !== action.pluginId && <small> · {names.get(action.pluginId) ?? action.pluginId}</small>}</strong><button aria-label="取消或移除" disabled={busy === action.id} onClick={() => void perform(action.id, () => reply(action.id, { cancelled: true }))}><X size={16} /></button></header>
+        {action.kind === 'pick' && <label>选择要导入的文件{action.payload.maxBytes != null && <small>{`上限 ${Math.round(action.payload.maxBytes / 1024 / 1024)} MiB`}</small>}<input type="file" aria-label="从当前设备选择文件" accept={action.payload.extensions?.map((ext) => `.${ext}`).join(',')} disabled={busy === action.id} onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void perform(action.id, () => choose(action, file)) }} /></label>}
         {action.kind === 'download' && <><p>{action.payload.name} <small>({Math.ceil((action.payload.size ?? 0) / 1024)} KiB)</small></p>{downloads[action.id]
-          ? <a className="remote-file-action" href={downloads[action.id]} download={action.payload.name}>保存到本设备</a>
+          ? <a className="remote-file-action" href={downloads[action.id]} download={action.payload.name}>交给浏览器保存</a>
           : <button className="remote-file-action" disabled={busy === action.id} onClick={() => void perform(action.id, () => prepare(action))}><Download size={16} />{busy === action.id ? '正在准备…' : '准备下载'}</button>}</>}
         {action.kind === 'open_url' && <a className="remote-file-action" href={action.payload.url} target="_blank" rel="noopener noreferrer">在此设备打开链接</a>}
         {action.kind === 'notice' && <p>{action.payload.message}</p>}

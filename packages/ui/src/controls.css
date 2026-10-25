@@ -1,0 +1,80 @@
+@layer components {
+  .app-button, .app-icon-button {
+    position: relative;
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 36px;
+    height: 36px;
+    padding: 7px 14px;
+    border: 1px solid var(--app-field-border);
+    border-radius: var(--app-radius-control);
+    background: var(--app-glass);
+    color: var(--app-ink);
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 20px;
+    text-decoration: none;
+    cursor: pointer;
+    transition: background-color var(--app-time-control), border-color var(--app-time-control), color var(--app-time-control), transform var(--app-time-press) var(--app-ease);
+  }
+  .app-button:hover:not(:disabled), .app-icon-button:hover:not(:disabled) { background-color: var(--app-glass-hover); border-color: var(--app-accent); }
+  .app-button kbd { height: 20px; padding: 0 4px; font-size: 12px; line-height: 18px; }
+  .app-button:active:not(:disabled), .app-icon-button:active:not(:disabled) { transform: translateY(1px); box-shadow: inset 0 1px 2px rgb(0 0 0 / .12); }
+  .app-button-primary, .app-button[data-variant='primary'] { overflow: hidden; isolation: isolate; color: var(--app-primary-ink); background-color: var(--app-accent); border-color: var(--app-accent); }
+  .app-button-primary:hover:not(:disabled), .app-button[data-variant='primary']:hover:not(:disabled) { color: var(--app-primary-ink); background-color: color-mix(in srgb, var(--app-accent) 90%, var(--app-primary-ink)); }
+  .app-button-primary::after, .app-button[data-variant='primary']::after { position: absolute; inset: 0; background: linear-gradient(110deg, transparent 25%, var(--app-sheen) 50%, transparent 75%); transform: translateX(-120%); opacity: 0; pointer-events: none; content: ''; }
+  .app-button-primary:is(:hover,:focus-visible):not(:disabled):not([aria-busy='true'])::after, .app-button[data-variant='primary']:is(:hover,:focus-visible):not(:disabled):not([aria-busy='true'])::after { animation: app-sheen var(--app-time-sheen) var(--app-ease) 1; }
+  .app-button-danger, .app-button[data-variant='danger'] { color: var(--app-danger); background: var(--app-danger-soft); border-color: var(--app-danger-line); }
+  .app-button-danger:hover:not(:disabled), .app-button[data-variant='danger']:hover:not(:disabled) { color: var(--app-danger); background: color-mix(in srgb, var(--app-danger-soft) 90%, var(--app-danger)); border-color: var(--app-danger); }
+  .app-button-quiet, .app-button[data-variant='quiet'], .app-icon-button { background: transparent; border-color: transparent; color: var(--app-ink-muted); }
+  .app-icon-button { width: 36px; height: 36px; min-width: 36px; padding: 0; }
+  .app-button[aria-pressed='true'], .app-icon-button[aria-pressed='true'], .app-button[role='radio'][aria-checked='true'] { color: var(--app-accent-ink); border-color: var(--app-accent-line); background: var(--app-accent-soft); }
+  .app-button:disabled, .app-icon-button:disabled { opacity: .45; cursor: default; }
+  .app-button[aria-busy='true']::after { position: absolute; content: ''; pointer-events: none; inset: 0 auto auto 0; width: 26%; height: 1px; background: currentColor; opacity: .7; animation: app-flow var(--app-time-flow) linear infinite; }
+  .app-button[aria-busy='true'] { overflow: hidden; opacity: 1; }
+  .app-input { min-height: 36px; min-width: 0; padding: 7px 12px; border: 1px solid var(--app-field-border); border-radius: var(--app-radius-control); background: var(--app-field); color: var(--app-ink); font-size: 14px; line-height: 20px; transition: border-color var(--app-time-control); }
+  .app-input::placeholder { color: var(--app-ink-faint); }
+  .app-input:hover:not(:disabled) { border-color: var(--app-accent); }
+  .app-input[aria-invalid='true'] { border-color: var(--app-danger); }
+  .app-input:disabled { opacity: .5; }
+  .app-search-field { border-radius: var(--app-radius-control); }
+  .app-search-field:focus-within { outline: var(--app-focus-width) solid var(--app-accent); outline-offset: var(--app-focus-offset); }
+  .app-toggle { position: relative; flex-shrink: 0; width: 36px; height: 20px; padding: 0; border: 1px solid var(--app-field-border); border-radius: var(--app-radius-control); background: var(--app-field); cursor: pointer; transition: background-color var(--app-time-control), border-color var(--app-time-control); }
+  .app-toggle > span { position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 2px; background: var(--app-ink-muted); transition: transform var(--app-time-control) var(--app-ease); }
+  .app-toggle[aria-checked='true'] { border-color: var(--app-accent); background: var(--app-accent); }
+  .app-toggle[aria-checked='true'] > span { transform: translateX(16px); background: var(--app-primary-ink); }
+  .app-toggle:disabled { cursor: default; opacity: .45; }
+  .app-badge { display: inline-flex; align-items: center; min-height: 24px; gap: 6px; padding: 2px 8px; border: 1px solid var(--app-glass-line); border-radius: 3px; color: var(--app-ink-muted); font-size: 12px; line-height: 18px; }
+  .app-ornamented { position: relative; }
+  .app-ornamented::before, .app-ornamented::after { position: absolute; width: 10px; height: 10px; opacity: var(--app-ornament-opacity); pointer-events: none; content: ''; }
+  .app-ornamented::before { top: 8px; left: 8px; border-top: 1px solid var(--app-ornament); border-left: 1px solid var(--app-ornament); }
+  .app-ornamented::after { bottom: 8px; right: 8px; border-bottom: 1px solid var(--app-ornament); border-right: 1px solid var(--app-ornament); }
+  .app-section-title { display: flex; align-items: center; gap: 12px; font-size: 16px; font-weight: 600; line-height: 24px; color: var(--app-ink); }
+  .app-section-title::after { width: 56px; height: 1px; background: linear-gradient(90deg,var(--app-ornament),transparent); opacity: var(--app-ornament-opacity); content: ''; }
+  .app-progress { overflow: hidden; height: 4px; border-radius: 2px; background: var(--app-accent-soft); }
+  .app-progress > span { display: block; height: 100%; background: var(--app-accent); }
+  .app-progress[aria-busy='true'] > span { width: 26%; animation: app-flow var(--app-time-flow) linear infinite; }
+  .app-toast { border: 1px solid var(--app-field-border); border-left: 2px solid var(--app-accent); border-radius: var(--app-radius-panel); background: var(--app-dialog-surface); color: var(--app-accent); box-shadow: var(--app-dialog-shadow); }
+  .app-toast[data-tone='error'] { border-left-color: var(--app-danger); color: var(--app-danger); }
+  .app-toast[data-tone='warning'] { border-left-color: var(--app-warning); color: var(--app-warning); }
+  .app-toast[data-tone='success'] { border-left-color: var(--app-success); color: var(--app-success); }
+  [data-motion-paused='true'] .app-progress > span, .app-progress[data-motion-paused='true'] > span, [data-motion-paused='true'] .app-button::after, .app-button[data-motion-paused='true']::after, [data-motion-paused='true'] .animate-spin { animation-play-state: paused; }
+}
+
+@keyframes app-sheen { 0% { transform: translateX(-120%); opacity: 0; } 20% { opacity: 1; } 80% { opacity: 1; } 100% { transform: translateX(120%); opacity: 0; } }
+@keyframes app-flow { from { transform: translateX(-100%); } to { transform: translateX(385%); } }
+
+/* Disabling decoration preserves text, selection, focus and task state. */
+:root[data-effects='off'] *, :root[data-effects='off'] *::before, :root[data-effects='off'] *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+:root[data-effects='off'] .app-progress[aria-busy='true'] > span { transform: translateX(142%); }
+:root[data-effects='off'] .app-button[aria-busy='true']::after { transform: none; opacity: 0; }
+:root[data-effects='off'] :is(.app-button,.app-icon-button):active { transform: none; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  .app-progress[aria-busy='true'] > span { transform: translateX(142%); }
+  .app-button[aria-busy='true']::after { transform: none; opacity: 0; }
+  :is(.app-button,.app-icon-button):active { transform: none; }
+}

@@ -61,17 +61,26 @@ struct BackgroundRecord {
 }
 
 impl FsSettingsService {
-    /// 从应用数据目录读取设置；文件缺失或无效时返回默认设置。
-    pub fn load(app_data_dir: PathBuf) -> Self {
-        let file = fs::read(app_data_dir.join("settings.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<SettingsFile>(&bytes).ok())
-            .unwrap_or_default();
-        Self {
+    /// A missing file starts with defaults; an unreadable or invalid existing store fails closed.
+    pub fn load(app_data_dir: PathBuf) -> Result<Self, KernelError> {
+        let file = match fs::read(app_data_dir.join("settings.json")) {
+            Ok(bytes) => serde_json::from_slice::<SettingsFile>(&bytes).map_err(|_| {
+                KernelError::Settings(
+                    "Existing settings.json is invalid; original data was preserved.".into(),
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => SettingsFile::default(),
+            Err(_) => {
+                return Err(KernelError::Settings(
+                    "Existing settings.json cannot be read; original data was preserved.".into(),
+                ));
+            }
+        };
+        Ok(Self {
             path: app_data_dir.join("settings.json"),
             theme_dir: app_data_dir.join("theme"),
             file: RwLock::new(file),
-        }
+        })
     }
 
     fn read(&self) -> Result<SettingsFile, KernelError> {
@@ -256,7 +265,7 @@ impl SettingsService for FsSettingsService {
                         background_opacity,
                     },
                     None => ThemeSettings {
-                        mode: ThemeMode::Dark,
+                        mode: ThemeMode::default(),
                         background: None,
                         background_opacity,
                     },
@@ -438,7 +447,7 @@ mod tests {
     fn service() -> (FsSettingsService, PathBuf) {
         let root = temp_dir();
         fs::create_dir_all(&root).unwrap();
-        (FsSettingsService::load(root.clone()), root)
+        (FsSettingsService::load(root.clone()).unwrap(), root)
     }
 
     fn image_id(state: &ThemeState) -> String {
@@ -449,12 +458,71 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_dark_without_background() {
+    fn defaults_to_system_without_background() {
         let (settings, root) = service();
-        assert_eq!(settings.theme().mode, ThemeMode::Dark);
+        assert_eq!(settings.theme().mode, ThemeMode::System);
         assert_eq!(settings.theme().background, None);
         assert_eq!(settings.theme_state().unwrap().background_url, None);
         assert!(settings.backgrounds().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absent_theme_mode_follows_system_and_explicit_modes_are_retained() {
+        for (json, expected) in [
+            (r#"{}"#, ThemeMode::System),
+            (r#"{"theme":{}}"#, ThemeMode::System),
+            (r#"{"theme":{"mode":"dark"}}"#, ThemeMode::Dark),
+            (r#"{"theme":{"mode":"light"}}"#, ThemeMode::Light),
+        ] {
+            let root = temp_dir();
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("settings.json"), json).unwrap();
+            let settings = FsSettingsService::load(root.clone()).unwrap();
+            assert_eq!(settings.theme().mode, expected);
+            assert_eq!(
+                fs::read_to_string(root.join("settings.json")).unwrap(),
+                json
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_existing_settings_are_not_exposed_as_a_writable_default_service() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("theme")).unwrap();
+        let background = root.join("theme/bg-1.png");
+        fs::write(&background, b"retained image").unwrap();
+        let path = root.join("settings.json");
+        for bytes in [
+            b"{broken".as_slice(),
+            b"{\"backgrounds\": [{\"id\":null,\"name\":\"saved\"}]}".as_slice(),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                FsSettingsService::load(root.clone()),
+                Err(KernelError::Settings(_))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(&background).unwrap(), b"retained image");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_existing_settings_are_not_replaced() {
+        let root = temp_dir();
+        let path = root.join("settings.json");
+        fs::create_dir_all(&path).unwrap();
+        let sentinel = path.join("retained");
+        fs::write(&sentinel, b"original filesystem entry").unwrap();
+        assert!(matches!(
+            FsSettingsService::load(root.clone()),
+            Err(KernelError::Settings(_))
+        ));
+        assert!(path.is_dir());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"original filesystem entry");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -540,7 +608,7 @@ mod tests {
             })
         );
         let empty = settings.remove_background(&second_id).unwrap();
-        assert_eq!(empty.settings.mode, ThemeMode::Dark);
+        assert_eq!(empty.settings.mode, ThemeMode::System);
         assert_eq!(empty.settings.background, None);
         assert!(settings.backgrounds().unwrap().is_empty());
         assert_eq!(fs::read_dir(root.join("theme")).unwrap().count(), 0);
@@ -553,7 +621,7 @@ mod tests {
         let (settings, root) = service();
         let id = image_id(&settings.add_background(PNG, "夜景.png").unwrap());
 
-        let reloaded = FsSettingsService::load(root.clone());
+        let reloaded = FsSettingsService::load(root.clone()).unwrap();
         assert_eq!(reloaded.theme().mode, ThemeMode::Custom);
         assert_eq!(reloaded.backgrounds().unwrap().len(), 1);
         assert!(reloaded.theme_state().unwrap().background_url.is_some());
@@ -582,7 +650,7 @@ mod tests {
             .unwrap();
         assert_eq!(saved.level, LogLevel::Trace);
         assert_eq!(settings.logging().level, LogLevel::Trace);
-        let reloaded = FsSettingsService::load(root.clone());
+        let reloaded = FsSettingsService::load(root.clone()).unwrap();
         assert_eq!(reloaded.logging().level, LogLevel::Trace);
         let raw = fs::read_to_string(root.join("settings.json")).unwrap();
         assert!(raw.contains("\"logging\""));

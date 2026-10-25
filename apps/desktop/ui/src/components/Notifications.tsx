@@ -126,19 +126,11 @@ function ToastItem({ toast, onDismiss }: { toast: ToastNotification; onDismiss: 
         ? <AlertCircle className="h-4 w-4 shrink-0" aria-hidden />
         : <Info className="h-4 w-4 shrink-0" aria-hidden />
 
-  const color = toast.tone === 'error'
-    ? 'border-[var(--app-danger)]/35 text-[var(--app-danger)]'
-    : toast.tone === 'success'
-      ? 'border-emerald-500/30 text-emerald-700 dark:text-emerald-300'
-      : toast.tone === 'warning'
-        ? 'border-amber-500/35 text-amber-800 dark:text-amber-300'
-        : 'border-brand-500/25 text-brand-500'
-
   return (
-    <div role={toast.tone === 'error' ? 'alert' : 'status'} className={`toast-enter pointer-events-auto flex items-start gap-3 rounded-xl border bg-[color-mix(in_srgb,var(--app-glass)_96%,var(--app-ink)_4%)] px-4 py-3 text-sm shadow-xl backdrop-blur-xl ${color}`}>
+    <div role={toast.tone === 'error' ? 'alert' : 'status'} data-tone={toast.tone} className="app-toast toast-enter pointer-events-auto flex items-start gap-3 px-4 py-3 text-sm">
       {icon}
       <p className="min-w-0 flex-1 whitespace-pre-wrap break-words leading-5 text-ink">{toast.message}</p>
-      <button type="button" onClick={() => onDismiss(toast.id)} className="-mr-1 -mt-1 rounded-md p-1 text-ink-faint hover:bg-glass-hover hover:text-ink" aria-label={t('notifications.dismiss')}>
+      <button type="button" onClick={() => onDismiss(toast.id)} className="app-icon-button -mr-1 -mt-1" aria-label={t('notifications.dismiss')}>
         <X className="h-3.5 w-3.5" aria-hidden />
       </button>
     </div>

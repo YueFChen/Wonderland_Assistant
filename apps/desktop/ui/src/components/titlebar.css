@@ -20,6 +20,11 @@
   pointer-events: auto;
 }
 
+/* Plugin tabs provide their own empty-space drag region; do not cover their upper edge. */
+.app-window:has(.plugin-surface-tabs) .app-titlebar-drag {
+  pointer-events: none;
+}
+
 .app-titlebar-controls {
   display: flex;
   height: 100%;
@@ -37,18 +42,23 @@
 
 .app-titlebar-controls button {
   display: grid;
-  width: 30px;
-  height: 30px;
+  width: 36px;
+  height: 36px;
   place-items: center;
-  border-radius: 8px;
+  border-radius: var(--app-radius-control);
   color: var(--app-ink-muted);
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  transition: background var(--app-time-control), color var(--app-time-control);
 }
 
 .app-titlebar-controls button:hover {
   background: var(--app-glass-hover);
   color: var(--app-ink);
+}
+
+.app-titlebar-controls button:hover .app-background-copy {
+  color: inherit;
+  filter: none;
 }
 
 .app-titlebar-controls .app-titlebar-close:hover {
@@ -58,11 +68,12 @@
 
 .app-titlebar-controls button:focus-visible {
   outline: 2px solid var(--app-accent);
-  outline-offset: 2px;
+  outline-offset: var(--app-focus-offset);
 }
 
 .app-titlebar-controls svg {
-  width: 15px;
-  height: 15px;
+  filter: var(--app-background-copy-filter, none);
+  width: 16px;
+  height: 16px;
   stroke-width: 1.8;
 }

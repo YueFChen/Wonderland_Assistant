@@ -46,35 +46,54 @@ pub struct FsUserDataService {
 }
 
 impl FsUserDataService {
+    /// Resolve roots that must be locked before bootstrap can recover control files or migrate.
+    /// This performs only reads: missing default roots and recovery files are left untouched.
+    pub fn bootstrap_lock_roots(default_path: &Path) -> Result<Vec<PathBuf>, KernelError> {
+        let (control, _) = read_control_snapshot(&default_path.join(CONTROL_FILE))?;
+        let active = control
+            .active_path
+            .as_deref()
+            .map(validate_stored_path)
+            .transpose()?
+            .unwrap_or_else(|| default_path.to_path_buf());
+        if !same_path(&active, default_path) {
+            ensure_active_readable(&active)?;
+        }
+        let mut roots = vec![default_path.to_path_buf()];
+        let mut include = |root: PathBuf| {
+            if !roots.iter().any(|existing| same_path(existing, &root)) {
+                roots.push(root);
+            }
+        };
+        include(active);
+        // Invalid stored migration paths remain bootstrap diagnostics. They cannot be a
+        // filesystem destination, so no additional target lock is needed for that branch.
+        if let Some(pending) = control.pending_path.as_deref()
+            && let Ok(target) = validate_stored_path(pending)
+        {
+            include(target);
+        }
+        Ok(roots)
+    }
+
     /// 解析活动目录，并执行上次预约的迁移。必须早于其它持久化服务调用。
     pub fn bootstrap(default_path: PathBuf) -> Result<(Self, PathBuf), KernelError> {
         fs::create_dir_all(&default_path).map_err(storage)?;
         let control_path = default_path.join(CONTROL_FILE);
-        let mut control = read_control(&control_path)?;
-        cleanup_control_temps(&default_path);
+        let (mut control, recovered) = read_control_snapshot(&control_path)?;
         let mut control_dirty = false;
         let mut active = control
             .active_path
             .as_deref()
-            .map(PathBuf::from)
+            .map(validate_stored_path)
+            .transpose()?
             .unwrap_or_else(|| default_path.clone());
 
-        if !active.is_dir() {
-            let unavailable_path = active.clone();
-            active = default_path.clone();
-            control.active_path = None;
-            // A pending migration was requested from the unavailable directory. Do not
-            // accidentally migrate data from the fallback directory into its target.
-            control.pending_path = None;
-            control.last_migration_path = None;
-            control.last_migration_source = None;
-            control.last_migration_warning = None;
-            control.last_migration_error = Some(format!(
-                "已配置的用户数据目录当前不可用：{}；应用已切回默认目录并继续启动。原目录数据仍保留在该路径，恢复后可在设置中重新迁移。",
-                unavailable_path.display()
-            ));
-            control_dirty = true;
-        }
+        // Validate the selected root before consuming a pending migration or changing any
+        // control records. Starting at the default root would make retained data appear lost.
+        ensure_active_readable(&active)?;
+        commit_control_recovery(&control_path, recovered)?;
+        cleanup_control_temps(&default_path);
 
         cleanup_committed_marker(&active);
 
@@ -711,13 +730,29 @@ fn is_reparse_metadata(metadata: &fs::Metadata) -> bool {
 }
 
 fn read_control(path: &Path) -> Result<ControlFile, KernelError> {
+    let (control, recovered) = read_control_snapshot(path)?;
+    commit_control_recovery(path, recovered)?;
+    Ok(control)
+}
+
+fn commit_control_recovery(path: &Path, recovered: bool) -> Result<(), KernelError> {
+    let backup = control_backup_path(path);
+    if recovered {
+        fs::rename(&backup, path).map_err(storage)?;
+    } else if backup.exists() {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
+fn read_control_snapshot(path: &Path) -> Result<(ControlFile, bool), KernelError> {
     let backup = control_backup_path(path);
     let (bytes, recovered) = match fs::read(path) {
         Ok(bytes) => (bytes, false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::read(&backup) {
             Ok(bytes) => (bytes, true),
             Err(backup_error) if backup_error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ControlFile::default());
+                return Ok((ControlFile::default(), false));
             }
             Err(backup_error) => return Err(storage(backup_error)),
         },
@@ -729,12 +764,16 @@ fn read_control(path: &Path) -> Result<ControlFile, KernelError> {
             path.display()
         ))
     })?;
-    if recovered {
-        fs::rename(&backup, path).map_err(storage)?;
-    } else if backup.exists() {
-        let _ = fs::remove_file(backup);
-    }
-    Ok(control)
+    Ok((control, recovered))
+}
+
+fn ensure_active_readable(active: &Path) -> Result<(), KernelError> {
+    fs::read_dir(active).map(|_| ()).map_err(|error| {
+        KernelError::Settings(format!(
+            "已配置的用户数据目录当前不可用（{}）：{error}；位置记录和迁移预约已保留，未切换到默认目录。请恢复目录访问后重试。",
+            active.display()
+        ))
+    })
 }
 
 fn write_control(path: &Path, control: &ControlFile) -> Result<(), KernelError> {
@@ -836,7 +875,7 @@ fn validate_stored_path(raw: &str) -> Result<PathBuf, KernelError> {
         Ok(path)
     } else {
         Err(KernelError::Other(
-            "迁移记录中的目标目录不是绝对路径；原数据目录未更改".to_owned(),
+            "用户数据记录中的目录不是绝对路径；位置记录和原数据目录未更改".to_owned(),
         ))
     }
 }
@@ -1076,6 +1115,190 @@ mod tests {
         );
         fs::remove_dir_all(default).unwrap();
         fs::remove_dir_all(external).unwrap();
+    }
+
+    #[test]
+    fn unavailable_custom_root_preserves_locator_and_pending_migration() {
+        for active_is_file in [false, true] {
+            let default = temp("unavailable-default");
+            let active = temp("unavailable-custom");
+            let target = temp("unavailable-pending");
+            fs::create_dir_all(&default).unwrap();
+            fs::create_dir_all(&target).unwrap();
+            fs::write(default.join("settings.json"), b"default data").unwrap();
+            fs::write(target.join("keep.txt"), b"target data").unwrap();
+            if active_is_file {
+                fs::write(&active, b"unexpected file; keep it").unwrap();
+            }
+            let control = ControlFile {
+                active_path: Some(path_text(&active)),
+                pending_path: Some(path_text(&target)),
+                last_migration_path: Some("previous migration".into()),
+                last_migration_source: Some("previous source".into()),
+                last_migration_warning: Some("previous warning".into()),
+                last_migration_error: Some("previous error".into()),
+            };
+            let control_path = default.join(CONTROL_FILE);
+            let mut original = serde_json::to_vec_pretty(&control).unwrap();
+            original.extend_from_slice(b"\n\n");
+            fs::write(&control_path, &original).unwrap();
+
+            assert!(FsUserDataService::bootstrap_lock_roots(&default).is_err());
+            assert_eq!(fs::read(&control_path).unwrap(), original);
+
+            let error = match FsUserDataService::bootstrap(default.clone()) {
+                Err(error) => error,
+                Ok(_) => panic!("unavailable custom root must fail startup"),
+            };
+
+            assert!(error.to_string().contains("未切换到默认目录"));
+            assert_eq!(fs::read(&control_path).unwrap(), original);
+            let retained = read_control(&control_path).unwrap();
+            assert_eq!(retained.active_path, control.active_path);
+            assert_eq!(retained.pending_path, control.pending_path);
+            assert_eq!(retained.last_migration_error, control.last_migration_error);
+            assert_eq!(
+                fs::read(default.join("settings.json")).unwrap(),
+                b"default data"
+            );
+            assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"target data");
+            assert_eq!(fs::read_dir(&target).unwrap().count(), 1);
+            if active_is_file {
+                assert_eq!(fs::read(&active).unwrap(), b"unexpected file; keep it");
+                fs::remove_file(active).unwrap();
+            } else {
+                assert!(!active.exists());
+            }
+            fs::remove_dir_all(default).unwrap();
+            fs::remove_dir_all(target).unwrap();
+        }
+    }
+
+    #[test]
+    fn bootstrap_lock_roots_does_not_create_a_default_directory() {
+        let default = temp("lock-new-default");
+        assert_eq!(
+            FsUserDataService::bootstrap_lock_roots(&default).unwrap(),
+            vec![default.clone()]
+        );
+        assert!(!default.exists());
+    }
+
+    #[test]
+    fn bootstrap_lock_roots_preserves_control_recovery_and_temp_files() {
+        let default = temp("lock-default");
+        let active = temp("lock-active");
+        let target = temp("lock-target");
+        for directory in [&default, &active, &target] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let control_path = default.join(CONTROL_FILE);
+        let original = serde_json::to_vec_pretty(&ControlFile {
+            active_path: Some(path_text(&active)),
+            pending_path: Some(path_text(&target)),
+            ..ControlFile::default()
+        })
+        .unwrap();
+        let backup = control_backup_path(&control_path);
+        let stale = default.join(format!(".{CONTROL_FILE}.fixture.tmp"));
+        fs::write(&control_path, &original).unwrap();
+        fs::write(&backup, b"existing backup").unwrap();
+        fs::write(&stale, b"existing temporary record").unwrap();
+
+        assert_eq!(
+            FsUserDataService::bootstrap_lock_roots(&default).unwrap(),
+            vec![default.clone(), active.clone(), target.clone()]
+        );
+        assert_eq!(fs::read(&control_path).unwrap(), original);
+        assert_eq!(fs::read(&backup).unwrap(), b"existing backup");
+        assert_eq!(fs::read(&stale).unwrap(), b"existing temporary record");
+
+        // A second pending reference to the source must not require a duplicate lock.
+        fs::write(
+            &control_path,
+            serde_json::to_vec_pretty(&ControlFile {
+                active_path: Some(path_text(&active)),
+                pending_path: Some(path_text(&active)),
+                ..ControlFile::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            FsUserDataService::bootstrap_lock_roots(&default).unwrap(),
+            vec![default.clone(), active.clone()]
+        );
+        for directory in [default, active, target] {
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn bootstrap_lock_roots_reads_backup_without_committing_recovery() {
+        let default = temp("lock-recovery-default");
+        let active = temp("lock-recovery-active");
+        fs::create_dir_all(&default).unwrap();
+        fs::create_dir_all(&active).unwrap();
+        let control_path = default.join(CONTROL_FILE);
+        let backup = control_backup_path(&control_path);
+        let original = serde_json::to_vec_pretty(&ControlFile {
+            active_path: Some(path_text(&active)),
+            ..ControlFile::default()
+        })
+        .unwrap();
+        fs::write(&backup, &original).unwrap();
+        assert_eq!(
+            FsUserDataService::bootstrap_lock_roots(&default).unwrap(),
+            vec![default.clone(), active.clone()]
+        );
+        assert!(!control_path.exists());
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        fs::remove_dir_all(default).unwrap();
+        fs::remove_dir_all(active).unwrap();
+    }
+
+    #[test]
+    fn unavailable_root_keeps_uncommitted_control_recovery() {
+        let default = temp("unavailable-recovery-default");
+        let active = temp("unavailable-recovery-active");
+        fs::create_dir_all(&default).unwrap();
+        let control_path = default.join(CONTROL_FILE);
+        let backup = control_backup_path(&control_path);
+        let original = serde_json::to_vec_pretty(&ControlFile {
+            active_path: Some(path_text(&active)),
+            pending_path: Some(path_text(&temp("unavailable-recovery-target"))),
+            ..ControlFile::default()
+        })
+        .unwrap();
+        fs::write(&backup, &original).unwrap();
+
+        assert!(FsUserDataService::bootstrap(default.clone()).is_err());
+        assert!(!control_path.exists());
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert!(!active.exists());
+        fs::remove_dir_all(default).unwrap();
+    }
+
+    #[test]
+    fn invalid_active_path_fails_without_changing_locator_bytes() {
+        for raw in ["relative-user-data", ""] {
+            let default = temp("invalid-active-path");
+            fs::create_dir_all(&default).unwrap();
+            let control_path = default.join(CONTROL_FILE);
+            let original = serde_json::to_vec_pretty(&ControlFile {
+                active_path: Some(raw.to_owned()),
+                pending_path: Some(path_text(&temp("invalid-active-pending"))),
+                ..ControlFile::default()
+            })
+            .unwrap();
+            fs::write(&control_path, &original).unwrap();
+
+            assert!(FsUserDataService::bootstrap_lock_roots(&default).is_err());
+            assert!(FsUserDataService::bootstrap(default.clone()).is_err());
+            assert_eq!(fs::read(&control_path).unwrap(), original);
+            assert_eq!(fs::read_dir(&default).unwrap().count(), 1);
+            fs::remove_dir_all(default).unwrap();
+        }
     }
 
     #[test]

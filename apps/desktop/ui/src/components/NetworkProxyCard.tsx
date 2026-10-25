@@ -102,7 +102,6 @@ export function NetworkProxyCard() {
     <section className="glass-card rounded-card p-6">
       <div className="max-w-3xl">
         <h2 className="text-base font-semibold text-ink">{t('settings.proxy.title')}</h2>
-        <p className="mt-1 text-xs leading-relaxed text-ink-faint">{t('settings.proxy.hint')}</p>
       </div>
 
       {!settings ? (
@@ -118,11 +117,7 @@ export function NetworkProxyCard() {
                 aria-checked={mode === item}
                 disabled={busy}
                 onClick={() => setMode(item)}
-                className={`rounded-lg border px-3 py-2 text-xs transition disabled:opacity-60 ${
-                  mode === item
-                    ? 'border-brand-400/70 bg-brand-500/15 text-ink'
-                    : 'border-glass-line text-ink-muted hover:bg-glass-hover'
-                }`}
+                className="app-button"
               >
                 {t(`settings.proxy.mode.${item}`)}
               </button>
@@ -139,7 +134,7 @@ export function NetworkProxyCard() {
                   onChange={(event) => setAddress(event.target.value)}
                   placeholder="http://127.0.0.1:7890"
                   autoComplete="url"
-                  className="w-full rounded-lg border border-[var(--app-field-border)] bg-[var(--app-field)] px-3 py-2 text-sm text-ink outline-none focus:border-brand-400"
+                  className="app-input w-full"
                 />
               </label>
               <label className="space-y-1 text-xs text-ink-muted md:col-span-2">
@@ -149,7 +144,7 @@ export function NetworkProxyCard() {
                   disabled={busy}
                   onChange={(event) => setBypass(event.target.value)}
                   placeholder="localhost,127.0.0.1,.example.com"
-                  className="w-full rounded-lg border border-[var(--app-field-border)] bg-[var(--app-field)] px-3 py-2 text-sm text-ink outline-none focus:border-brand-400"
+                  className="app-input w-full"
                 />
               </label>
               <label className="space-y-1 text-xs text-ink-muted">
@@ -159,7 +154,7 @@ export function NetworkProxyCard() {
                   disabled={busy || clearCredentials}
                   onChange={(event) => setUsername(event.target.value)}
                   autoComplete="username"
-                  className="w-full rounded-lg border border-[var(--app-field-border)] bg-[var(--app-field)] px-3 py-2 text-sm text-ink outline-none focus:border-brand-400"
+                  className="app-input w-full"
                 />
               </label>
               <label className="space-y-1 text-xs text-ink-muted">
@@ -170,7 +165,8 @@ export function NetworkProxyCard() {
                   disabled={busy || clearCredentials}
                   onChange={(event) => setPassword(event.target.value)}
                   autoComplete="new-password"
-                  className="w-full rounded-lg border border-[var(--app-field-border)] bg-[var(--app-field)] px-3 py-2 text-sm text-ink outline-none focus:border-brand-400"
+                  placeholder={settings.credentialsConfigured ? t('settings.proxy.credentialsReplaceHint') : undefined}
+                  className="app-input w-full"
                 />
               </label>
               {settings.credentialsConfigured && (
@@ -180,11 +176,10 @@ export function NetworkProxyCard() {
                       ? 'settings.proxy.credentialsSaved'
                       : 'settings.proxy.credentialsBoundElsewhere')
                     : t('settings.proxy.credentialsUnavailable')}
-                  {' '}{t('settings.proxy.credentialsReplaceHint')}
                 </div>
               )}
-              {(hasNewCredentials || settings.credentialsConfigured) && (
-                <p className="text-xs leading-relaxed text-amber-200/80 md:col-span-2">
+              {(hasNewCredentials || settings.credentialsConfigured) && /^http:\/\//i.test(address) && (
+                <p className="text-xs leading-relaxed text-[var(--app-warning)] md:col-span-2">
                   {t('settings.proxy.authWarning')}
                 </p>
               )}
@@ -218,7 +213,6 @@ export function NetworkProxyCard() {
             )
           )}
 
-          <p className="text-[11px] leading-relaxed text-ink-faint">{t('settings.proxy.scopeHint')}</p>
 
           {settings.warning && <p role="alert" className="text-xs text-[var(--app-danger)]">{settings.warning}</p>}
           {failure && <p role="alert" className="text-sm text-[var(--app-danger)]">{failure}</p>}
@@ -233,7 +227,7 @@ export function NetworkProxyCard() {
               type="button"
               disabled={busy || !canSaveCredentials}
               onClick={() => void save()}
-              className="rounded-lg bg-brand-600 px-4 py-2 text-xs font-medium text-white hover:bg-brand-500 disabled:cursor-default disabled:opacity-50"
+              className="app-button app-button-primary"
             >
               {t('settings.proxy.save')}
             </button>
@@ -241,7 +235,7 @@ export function NetworkProxyCard() {
               type="button"
               disabled={busy || !settings || hasUnsavedChanges}
               onClick={() => void test()}
-              className="rounded-lg border border-glass-line px-4 py-2 text-xs text-ink-muted hover:bg-glass-hover hover:text-ink disabled:cursor-default disabled:opacity-50"
+              className="app-button"
             >
               {busy ? t('settings.proxy.working') : t('settings.proxy.testButton')}
             </button>

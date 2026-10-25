@@ -1,7 +1,7 @@
 import type { NavigateFunction } from 'react-router-dom'
 import type { PluginRuntimeState, PluginUiContributionKind } from '@wonderland/plugin-protocol'
 
-import { rememberOpenContribution, setActiveSidebarContribution } from './workspaceLayout'
+import { rememberOpenContribution, setActiveSidebarContribution } from './workspaceLayout.ts'
 
 export type ContributionStatus =
   | 'ready'
@@ -27,7 +27,7 @@ export interface WorkspaceContribution {
   state: PluginRuntimeState
 }
 
-/** Core 的统一导航注册表。Manifest v2 中的 ID 始终作为布局和路由的稳定键。 */
+/** Core 的统一导航注册表。Contribution ID 始终作为布局和路由的稳定键。 */
 export function buildContributionRegistry(
   states: readonly PluginRuntimeState[] | null,
 ): WorkspaceContribution[] {
@@ -71,24 +71,27 @@ export function openContribution(
 ): boolean {
   const contribution = findContribution(contributions, id)
   if (!contribution) return false
-  if (contribution.kind === 'view' && contribution.status === 'ready') {
+  if (contribution.kind === 'view' && canOpenContribution(contribution)) {
     setActiveSidebarContribution(contribution.id)
     navigate('/workspace')
     return true
   }
-  if (contribution.kind === 'activity' && contribution.status === 'ready') rememberOpenContribution(contribution.id)
+  if (contribution.kind === 'activity' && canOpenContribution(contribution)) rememberOpenContribution(contribution.id)
   navigate(contribution.href)
   return true
+}
+
+/** Opening a valid enabled page can prepare a cold backend or show its retry state. */
+export function canOpenContribution(item: WorkspaceContribution): boolean {
+  return item.state.installation === 'installed' && item.state.enabled && item.state.runtime !== 'stopping'
 }
 
 function contributionStatus(state: PluginRuntimeState): ContributionStatus {
   if (state.installation === 'checking') return 'failed'
   if (state.installation === 'invalid') return 'invalid'
   if (state.installation === 'incompatible') return 'incompatible'
-  if ((state.serviceDependencyIssues?.length ?? 0) > 0) return 'failed'
   if (!state.enabled) return 'disabled'
   if (state.runtime === 'failed') return 'failed'
-  if (state.runtime === 'starting' || state.runtime === 'stopping') return 'starting'
-  if (state.runtime !== 'running') return 'stopped'
+  if (state.runtime === 'stopping') return 'starting'
   return 'ready'
 }

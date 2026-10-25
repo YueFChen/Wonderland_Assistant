@@ -1,0 +1,24 @@
+.app-dialog-body.command-palette-body { padding: .375rem .75rem .75rem; }
+.install-candidates { display: grid; gap: .625rem; }
+.install-candidate { display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: start; gap: .875rem; padding: 1rem; border: 1px solid var(--app-glass-line); border-radius: var(--app-radius-panel); }
+.install-candidate[data-selected='true'] { border-color: var(--app-accent-line); background: var(--app-accent-soft); }
+.install-candidate[data-invalid='true'] { border-color: var(--app-danger-line); }
+.install-candidate > input { width: 18px; height: 18px; margin-top: .25rem; accent-color: var(--app-accent); }
+.install-candidate-heading { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: .5rem 1rem; }
+.install-candidate-heading label, .install-candidate-heading h3 { font-size: .875rem; font-weight: 600; cursor: pointer; }
+.install-candidate-version { color: var(--app-ink-muted); font-size: .75rem; white-space: nowrap; }
+.install-candidate-meta { display: flex; flex-wrap: wrap; align-items: center; gap: .375rem .75rem; margin-top: .375rem; color: var(--app-ink-muted); font-size: .75rem; }
+.install-candidate-status { margin-top: .5rem; font-size: .75rem; color: var(--app-accent-ink); }
+.install-candidate-status[data-tone='danger'] { color: var(--app-danger); }
+.install-signature { padding: .0625rem .375rem; border: 1px solid var(--app-glass-line); border-radius: .375rem; font-size: .75rem; }
+.install-candidate .app-dialog-details { margin-top: .5rem; }
+.install-candidate .app-dialog-facts { font-size: .75rem; }
+.install-candidate .app-dialog-facts dd { word-break: break-all; }
+.catalog-settings-form { display: grid; gap: .625rem; }
+.catalog-settings-form + .catalog-settings-form { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--app-glass-line); }
+.catalog-settings-form > label { font-weight: 600; }
+.catalog-settings-field { display: flex; flex-wrap: wrap; gap: .5rem; }
+.catalog-settings-field input { min-width: 10rem; flex: 1; }
+.catalog-settings-field input:focus { border-color: var(--app-accent-line); outline: var(--app-focus-width) solid var(--app-accent); outline-offset: var(--app-focus-offset); }
+.install-candidates[data-single='true'] .install-candidate { grid-template-columns: minmax(0, 1fr); border: 0; padding: 0; background: transparent; }
+.install-signature[data-tone='danger'] { border-color: var(--app-danger-line); color: var(--app-danger); }

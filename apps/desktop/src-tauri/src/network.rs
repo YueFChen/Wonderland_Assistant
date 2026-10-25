@@ -9,12 +9,13 @@ use tauri::{Emitter, State, WebviewWindow};
 use wonderland_kernel::KernelError;
 use wonderland_kernel::logging::{info, warn};
 use wonderland_net::{
-    PluginCatalogClient, ProxyConfiguration, ProxyCredentials, ProxyEnvironmentVariable, ProxyMode,
-    ProxySettings,
+    DistributionClient, DistributionSource, ProxyConfiguration, ProxyCredentials,
+    ProxyEnvironmentVariable, ProxyMode, ProxySettings,
 };
 
 use crate::commands::ensure_main_window;
 use crate::core_update::CoreUpdateState;
+use crate::plugin_manager::PluginManager;
 
 const SETTINGS_FILE: &str = "network-proxy.json";
 const MAX_SETTINGS_BYTES: u64 = 16 * 1024;
@@ -443,21 +444,35 @@ pub fn network_proxy_set(
 pub async fn network_proxy_test(
     window: WebviewWindow,
     proxy: State<'_, NetworkProxyService>,
+    plugins: State<'_, PluginManager>,
 ) -> Result<ProxyTestResult, KernelError> {
     ensure_main_window(&window)?;
     let view = proxy.view()?;
     let started = Instant::now();
-    let result = match PluginCatalogClient::new() {
-        Ok(client) => client.get_index().await,
+    let Some(source) = plugins
+        .distribution_settings()
+        .map_err(|_| KernelError::Busy)?
+        .source_url
+    else {
+        return Ok(ProxyTestResult {
+            success: false,
+            route: proxy_route(view.mode),
+            outcome: "distribution_not_configured",
+            http_status: None,
+            duration_ms: 0,
+        });
+    };
+    let result = match DistributionSource::parse(&source).and_then(DistributionClient::new) {
+        // A connectivity probe does not need the current access code.
+        Ok(client) => client.access(None).await,
         Err(error) => Err(error),
     };
     let (outcome, http_status) = match &result {
         Ok(_) => ("connected", None),
-        Err(KernelError::Timeout) => ("timeout", None),
-        Err(KernelError::Connection) => ("connection_failed", None),
-        Err(KernelError::Http(407)) => ("proxy_auth_required", Some(407)),
-        Err(KernelError::Http(status)) => ("http_error", Some(*status)),
-        Err(KernelError::InvalidResponse) => ("invalid_response", None),
+        Err(error) if error.status == Some(407) => ("proxy_auth_required", Some(407)),
+        Err(error) if error.status.is_some() => ("http_error", error.status),
+        Err(error) if error.code == "DISTRIBUTION_UNAVAILABLE" => ("connection_failed", None),
+        Err(error) if error.code == "INVALID_DISTRIBUTION_RESPONSE" => ("invalid_response", None),
         Err(_) => ("request_failed", None),
     };
     let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -533,6 +548,7 @@ mod tests {
 
     #[test]
     fn settings_file_never_contains_proxy_credentials_in_plaintext() {
+        let _proxy = crate::test_proxy::direct();
         let root = temp_directory();
         let service = NetworkProxyService::load(&root).unwrap();
         #[cfg(windows)]

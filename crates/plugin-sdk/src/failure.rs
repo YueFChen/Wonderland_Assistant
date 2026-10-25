@@ -69,14 +69,14 @@ impl fmt::Display for PluginFailure {
                 }
             }
             Self::InvalidResponse => write!(f, "官方接口数据结构已变化或分页不完整"),
-            Self::InvalidInput => write!(f, "请求参数无效或角色不属于此账号"),
+            Self::InvalidInput => write!(f, "请求参数无效"),
             Self::PluginDisabled => write!(f, "插件本次启动未启用"),
             Self::Archive(detail) => write!(f, "本地归档读写失败：{detail}"),
             Self::Settings(detail) => write!(f, "应用设置读写失败：{detail}"),
             Self::LocalData(detail) => write!(f, "本地留存的数据不可用：{detail}"),
             Self::Busy => write!(f, "已有操作正在进行"),
             Self::NotInitialized => write!(f, "插件服务尚未完成初始化"),
-            Self::NotLoggedIn => write!(f, "尚未登录米哈游通行证"),
+            Self::NotLoggedIn => write!(f, "尚未登录"),
             Self::LoginInProgress => write!(f, "已有登录流程正在进行"),
             Self::NoLoginInProgress => write!(f, "当前没有进行中的登录流程"),
             Self::CredentialStore(detail) => write!(f, "凭据读写失败：{detail}"),

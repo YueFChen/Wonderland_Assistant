@@ -22,5 +22,5 @@ bindings = ["dep:ts-rs"]
 
 # 内核契约的 TS 绑定由本 crate 自产；`--features bindings` 为运行前提。
 [[example]]
-name = "generate_bindings"
+name = "generate_core_bindings"
 required-features = ["bindings"]

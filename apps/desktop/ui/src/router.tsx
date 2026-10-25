@@ -29,7 +29,6 @@ export const router = createHashRouter([
         Component: WorkspaceLayout,
         children: [
           { index: true, Component: WorkspacePage },
-          { path: 'account', element: <Navigate to="/workspace/settings" replace /> },
           { path: 'settings', Component: SettingsPage },
           { path: 'plugins/install', Component: PluginInstallPage },
           { path: 'plugin/:pluginId/:contributionId', Component: PluginPage },

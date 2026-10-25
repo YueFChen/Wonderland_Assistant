@@ -59,7 +59,9 @@ try {
   ]
   if (description) initArgs.push('--description', description)
   run(process.execPath, initArgs, staging)
-  runPnpm(['run', 'validate'], staging)
+  // Validate metadata before moving the checkout. pnpm run can auto-install packages
+  // into staging, whose store paths then need a second install after the rename.
+  run(process.execPath, ['scripts/validate-template.mjs'], staging)
   run('git', ['init', '--initial-branch=main'], staging)
 
   await rename(staging, destination)
@@ -133,6 +135,10 @@ async function validateTemplate(templateRoot) {
   }
   const manifest = JSON.parse(await readFile(path.join(templateRoot, 'package/manifest.json'), 'utf8'))
   if (!manifest.id || !manifest.version) throw new Error('Template manifest has no plugin identity.')
+  if (manifest.manifestVersion !== 3) throw new Error('Template must use manifestVersion 3 for the current Core.')
+  if (['capabilities', 'networkPublicHosts', 'provides', 'requires'].some((key) => Object.hasOwn(manifest, key))) {
+    throw new Error('Template contains removed manifest fields; update it before creating plugins.')
+  }
 }
 
 function shouldCopy(sourceRoot, sourcePath) {

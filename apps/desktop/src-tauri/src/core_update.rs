@@ -109,9 +109,22 @@ pub async fn core_update_install(
     app: AppHandle,
     window: WebviewWindow,
     updates: State<'_, CoreUpdateState>,
+    plugins: State<'_, crate::plugin_manager::PluginManager>,
+    web: State<'_, crate::web_access::WebAccessService>,
     update_id: String,
 ) -> Result<(), KernelError> {
     ensure_main_window(&window)?;
+    let _plugin_upgrade_guard = plugins
+        .begin_upgrade()
+        .map_err(|error| KernelError::Transport(error.message))?;
+    let mut blockers = plugins.upgrade_blockers();
+    blockers.extend(web.upgrade_blockers().await);
+    if !blockers.is_empty() {
+        return Err(KernelError::Transport(format!(
+            "请先结束运行中的任务、完成文件交互并领取下载，再安装更新：{}",
+            blockers.join("；")
+        )));
+    }
     if update_id.len() != 32 || !update_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(KernelError::InvalidInput);
     }

@@ -1,0 +1,16 @@
+{
+  "name": "@wonderland/core-updates",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "deploy": "wrangler deploy",
+    "prepare:update": "node tools/prepare.mjs",
+    "publish": "node --use-env-proxy tools/publish.mjs"
+  },
+  "devDependencies": {
+    "miniflare": "5.20261006.2-beta",
+    "wrangler": "4.150.0"
+  }
+}

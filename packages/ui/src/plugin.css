@@ -1,0 +1,21 @@
+/* Opt-in component foundation for plugin frames; no wallpaper or host DOM access. */
+@import './plugin-theme.css';
+@import './controls.css';
+
+@layer base {
+  :root { font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif; font-size: 14px; line-height: 1.5714; font-synthesis: none; }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body, #root { min-width: 0; margin: 0; }
+  body { color: var(--app-ink); background: transparent; }
+  button, input, select, textarea { font: inherit; }
+  :is(button, a[href], input, select, textarea, summary, [tabindex]):focus-visible { outline: var(--app-focus-width) solid var(--app-accent); outline-offset: var(--app-focus-offset); }
+  :is(input[type='checkbox'], input[type='radio']) { accent-color: var(--app-accent); }
+  select option { color: var(--app-ink); background: var(--app-field); }
+  * { scrollbar-width: thin; scrollbar-color: var(--app-glass-line-strong) transparent; }
+}
+
+@layer components {
+  .plugin-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; min-width: 0; }
+  .plugin-panel { border: 1px solid var(--app-glass-line); border-radius: var(--app-radius-panel); background: var(--app-glass); }
+  .plugin-empty { padding: 32px 16px; color: var(--app-ink-muted); font-size: 14px; text-align: center; }
+}

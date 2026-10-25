@@ -1,11 +1,15 @@
 # Build output
 target/
 
-# Independent plugin repositories
-plugins/**
-#Plugins README.md
-!plugins/README.md
+# Local deliveries, reports and private recovery backups
+artifacts/
 
+# Independent repositories (Core keeps only the listed workspace entry documents)
+/plugins/*
+!/plugins/README.md
+/docs/*
+!/docs/CORE-CLI-COMMAND-INVENTORY.md
+!/docs/WEB-ACCESS.md
 
 # Node and pnpm
 node_modules/
@@ -13,6 +17,7 @@ dist/
 *.tsbuildinfo
 .pnpm-store/
 .npm-cache/
+.cache/
 
 # Generated Tauri files
 apps/desktop/src-tauri/gen/
@@ -22,13 +27,14 @@ apps/desktop/src-tauri/binaries/
 *.log
 logs/
 tmp/
-docs/*
-!docs/CORE-CLI-COMMAND-INVENTORY.md
-!docs/WEB-ACCESS.md
+.tmp/
+*.tmp
+private-backups/
 # Local Cargo cache
 .cargo-home/
 .DS_Store
 Thumbs.db
+Desktop.ini
 
 # Editor files
 .idea/
@@ -40,5 +46,28 @@ Thumbs.db
 !.vscode/extensions.json
 
 # Authentication secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+!.dev.vars.*.example
+.secrets/
+.wrangler/
+author-keys/
+.cargo/credentials
+.cargo/credentials.toml
+.git-credentials
+.netrc
+.pypirc
+PLUGIN_UPDATE_SIGNING_KEY
+TAURI_SIGNING_PRIVATE_KEY
+*.private.key
+*.private.pem
 *.cookie
 *.session
+
+# ts-rs test export scratch output; package bindings are generated explicitly
+crates/kernel/bindings/

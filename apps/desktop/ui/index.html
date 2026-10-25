@@ -4,13 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <script>
+      let mode = 'system'
       try {
-        const mode = localStorage.getItem('wonderland.theme.mode')
-        const dark = mode === 'dark' || mode === 'custom' || (mode === 'system' && matchMedia('(prefers-color-scheme: dark)').matches)
-        if (['light', 'dark', 'system', 'custom'].includes(mode)) {
-          document.documentElement.dataset.theme = dark ? 'dark' : 'light'
-        }
-      } catch (_) { /* Storage may be unavailable; the app will read its saved setting. */ }
+        const cached = localStorage.getItem('wonderland.theme.mode')
+        if (['light', 'dark', 'system', 'custom'].includes(cached)) mode = cached
+      } catch (_) { /* Continue with the system preference when storage is unavailable. */ }
+      const dark = mode === 'dark' || ((mode === 'system' || mode === 'custom') && matchMedia('(prefers-color-scheme: dark)').matches)
+      document.documentElement.dataset.theme = dark ? 'dark' : 'light'
     </script>
     <title>Wonderland Assistant</title>
   </head>

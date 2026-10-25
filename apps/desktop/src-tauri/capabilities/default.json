@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "应用壳默认能力：只开放 Tauri 核心 API，插件权限后续按需追加。",
+  "description": "桌面应用壳的 Tauri IPC 权限：开放窗口操作与重启等接口。此列表不用于插件普通宿主服务授权。",
   "windows": ["main"],
   "permissions": [
     "core:default",
