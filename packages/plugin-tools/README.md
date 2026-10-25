@@ -6,7 +6,7 @@
 
 ```powershell
 # 开发包；没有身份时允许未签名，不需要增加本地版本号
-pnpm --dir plugins/template_plugin run package:plugin
+pnpm --dir plugins/wla_template_plugin run package:plugin
 # 正式成品；缺少原签名身份时失败
 pnpm --dir plugins/rich_editor run package:release
 node packages/plugin-tools/verify.mjs plugins/rich_editor/target/rich_editor-0.2.2-windows-x86_64.wplug --signed

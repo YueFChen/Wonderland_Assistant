@@ -5,7 +5,7 @@ import path from 'node:path'
 
 const coreRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const pluginsRoot = path.join(coreRoot, 'plugins')
-const defaultTemplateRepository = 'git@github.com:YueFChen/template_plugin.git'
+const defaultTemplateRepository = 'git@github.com:YueFChen/wla_template_plugin.git'
 const options = parseArgs(process.argv.slice(2))
 const id = options.id ?? ''
 const name = options.name?.trim() ?? ''
@@ -83,7 +83,7 @@ try {
 
 async function resolveTemplate(specifier) {
   if (!specifier) {
-    const localTemplate = path.join(pluginsRoot, 'template_plugin')
+    const localTemplate = path.join(pluginsRoot, 'wla_template_plugin')
     if (await exists(localTemplate)) return { path: localTemplate, temporary: false }
     specifier = defaultTemplateRepository
   }
