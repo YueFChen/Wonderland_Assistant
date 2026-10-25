@@ -1,9 +1,18 @@
 import assert from 'node:assert/strict'
 import { afterEach, test } from 'node:test'
-import { createPluginHostClient, UI_BRIDGE_PROTOCOL, UI_BRIDGE_VERSION, type PluginHostClient } from '../../../../packages/plugin-ui-sdk/src/index.ts'
+import { createPluginHostClient, UI_BRIDGE_PROTOCOL, UI_BRIDGE_VERSION, type PluginHostClient } from '../src/index.ts'
+import { createRequestId } from '../src/requestId.ts'
 
 const clients: PluginHostClient[] = []
-afterEach(() => { clients.splice(0).forEach((client) => client.dispose()) })
+const globals = new Map(['window', 'document', 'crypto'].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
+
+afterEach(() => {
+  clients.splice(0).forEach(client => client.dispose())
+  for (const [key, descriptor] of globals) {
+    if (descriptor) Object.defineProperty(globalThis, key, descriptor)
+    else Reflect.deleteProperty(globalThis, key)
+  }
+})
 
 function surface() {
   const variables = new Map<string, string>()
@@ -108,4 +117,9 @@ test('external links disconnect their opener and preserve the HTTP(S) contract',
   frame.client.openExternal('https://example.com/tool')
   assert.deepEqual(frame.opened[0], ['https://example.com/tool', '_blank', ',noopener,noreferrer'])
   assert.throws(() => frame.client.openExternal('javascript:alert(1)'), { code: 'INVALID_INPUT' })
+})
+
+test('LAN HTTP identifiers use secure random bytes without randomUUID', () => {
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: { getRandomValues: (bytes: Uint8Array) => { bytes.fill(42); return bytes } } })
+  assert.equal(createRequestId(), '2a'.repeat(16))
 })

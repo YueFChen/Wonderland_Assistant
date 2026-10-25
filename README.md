@@ -69,6 +69,8 @@ pnpm dev
 | `pnpm check:docs` | 检查 Core 随库文档的本地链接；可传入独立文档路径另行检查 |
 | `pnpm release:status` | 查看 GitHub Release 暂缓状态及缺少正式接入证据的插件 |
 
+测试归属、真实插件进程测试及临时产物约定见 [测试维护说明](tests/README.md)。前端检查统一做一次类型检查，再运行测试和资源构建；单独 `build:ui` 仍包含类型检查。
+
 VS Code 的 F5 配置包括桌面运行、Rust 宿主调试和独立 CLI 调试；Rust 调试需安装推荐的 CodeLLDB 扩展。宿主调试通过后台任务等待 Vite 就绪，再由 Cargo 构建并选择可执行文件，遵循 [Tauri 调试流程](https://v2.tauri.app/develop/debug/vscode/)。`Ctrl+Shift+B` 构建本地安装包，也可从“运行任务”选择前端、CLI 或检查任务。
 
 编辑器沿用系统的 `CARGO_HOME`、`RUSTUP_HOME` 和 npm 缓存配置；工具链由 `rust-toolchain.toml` 固定，Cargo 输出目录由 Cargo 配置或 `CARGO_TARGET_DIR` 决定。

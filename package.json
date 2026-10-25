@@ -17,7 +17,7 @@
     "build:cli": "cargo build --locked --release --package wonderland-desktop --bin wla",
     "build:ci": "pnpm --filter @wonderland/desktop run build:ci",
     "check": "pnpm run check:frontend && pnpm run check:rust && pnpm run check:bindings",
-    "check:frontend": "pnpm run typecheck && pnpm run test && pnpm run build:ui",
+    "check:frontend": "pnpm run typecheck && pnpm run test && pnpm --filter @wonderland/desktop-ui run build:assets",
     "check:rust": "cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo test --workspace --locked",
     "check:bindings": "cargo run --locked -p wonderland-kernel --example generate_core_bindings --features bindings -- --check && cargo run --locked -p wonderland-plugin-protocol --example generate_bindings --features bindings -- --check",
     "check:docs": "node scripts/check-core-doc-links.mjs",
