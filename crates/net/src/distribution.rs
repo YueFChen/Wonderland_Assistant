@@ -4,6 +4,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::{HttpFailureKind, HttpTransportError};
 use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 
@@ -97,6 +98,7 @@ pub struct DistributionHttpError {
     pub code: &'static str,
     pub status: Option<u16>,
     pub retry_after_seconds: Option<u64>,
+    pub transport: Option<HttpTransportError>,
 }
 
 impl fmt::Display for DistributionHttpError {
@@ -112,6 +114,15 @@ fn error(code: &'static str) -> DistributionHttpError {
         code,
         status: None,
         retry_after_seconds: None,
+        transport: None,
+    }
+}
+
+fn transport_failure(transport: HttpTransportError) -> DistributionHttpError {
+    DistributionHttpError {
+        status: (transport.kind == HttpFailureKind::ProxyAuthentication).then_some(407),
+        transport: Some(transport),
+        ..error("DISTRIBUTION_UNAVAILABLE")
     }
 }
 
@@ -243,38 +254,38 @@ impl DistributionClient {
         let mut response = request
             .send()
             .await
-            .map_err(|_| error("DISTRIBUTION_UNAVAILABLE"))?;
+            .map_err(|error| transport_failure(HttpTransportError::send(error, false)))?;
         let status = response.status();
+        if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+            return Err(transport_failure(HttpTransportError {
+                stage: crate::HttpFailureStage::Send,
+                kind: HttpFailureKind::ProxyAuthentication,
+                outcome_unknown: false,
+            }));
+        }
         if status.is_success() {
+            let total = response.content_length();
+            if total.is_some_and(|value| value > limit as u64) {
+                return Err(error("RESOURCE_LIMIT"));
+            }
+            let mut bytes = Vec::new();
             if let Some(progress) = progress {
-                let total = response.content_length();
-                if total.is_some_and(|value| value > limit as u64) {
+                progress(0, total);
+            }
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| transport_failure(HttpTransportError::body(error)))?
+            {
+                if chunk.len() > limit.saturating_sub(bytes.len()) {
                     return Err(error("RESOURCE_LIMIT"));
                 }
-                let mut bytes = Vec::new();
-                progress(0, total);
-                while let Some(chunk) = response
-                    .chunk()
-                    .await
-                    .map_err(|_| error("DISTRIBUTION_UNAVAILABLE"))?
-                {
-                    if chunk.len() > limit.saturating_sub(bytes.len()) {
-                        return Err(error("RESOURCE_LIMIT"));
-                    }
-                    bytes.extend_from_slice(&chunk);
+                bytes.extend_from_slice(&chunk);
+                if let Some(progress) = progress {
                     progress(bytes.len() as u64, total);
                 }
-                return Ok(bytes);
             }
-            return crate::read_limited_body(response, limit)
-                .await
-                .map_err(|error_value| {
-                    if matches!(error_value, wonderland_kernel::KernelError::ResourceLimit) {
-                        error("RESOURCE_LIMIT")
-                    } else {
-                        error("DISTRIBUTION_UNAVAILABLE")
-                    }
-                });
+            return Ok(bytes);
         }
         let retry_after_seconds = response
             .headers()
@@ -311,6 +322,7 @@ impl DistributionClient {
             code,
             status: Some(status.as_u16()),
             retry_after_seconds,
+            transport: None,
         })
     }
 }
@@ -459,5 +471,115 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "RESOURCE_LIMIT");
         task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_authentication_failures_keep_safe_diagnostics() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let configuration = crate::ProxyConfiguration::new(
+            crate::ProxySettings {
+                mode: crate::ProxyMode::Custom,
+                address: Some(format!("http://{}", listener.local_addr().unwrap())),
+                bypass: String::new(),
+            },
+            None,
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).unwrap();
+            assert!(request[..count].starts_with(b"CONNECT private.example:443 "));
+            stream.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"private-realm\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let client = DistributionClient {
+            source: DistributionSource::parse("https://private.example").unwrap(),
+            client: configuration
+                .apply_to(reqwest::Client::builder().timeout(Duration::from_secs(3)))
+                .build()
+                .unwrap(),
+        };
+        let error = client
+            .access(Some("private-distribution-code"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "DISTRIBUTION_UNAVAILABLE");
+        assert_eq!(error.status, Some(407));
+        let transport = error.transport.unwrap();
+        assert_eq!(transport.kind, HttpFailureKind::ProxyAuthentication);
+        assert_eq!(transport.stage, crate::HttpFailureStage::Send);
+        assert!(!transport.outcome_unknown);
+        let diagnostic = format!("{error:?} {error}");
+        for private in [
+            "private.example",
+            "private-realm",
+            "private-distribution-code",
+        ] {
+            assert!(!diagnostic.contains(private));
+        }
+        server.join().unwrap();
+
+        let (client, server) = self::server("HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into());
+        let error = client.access(None).await.unwrap_err();
+        assert_eq!(error.status, Some(407));
+        assert_eq!(
+            error.transport.unwrap().kind,
+            HttpFailureKind::ProxyAuthentication
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_and_body_timeouts_retain_the_failure_stage() {
+        use std::io::{Read, Write};
+        for body_started in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let source = DistributionSource::debug_loopback(&format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request).unwrap();
+                if body_started {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            });
+            let client = DistributionClient {
+                source,
+                client: reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_millis(100))
+                    .build()
+                    .unwrap(),
+            };
+            let error = client.access(None).await.unwrap_err();
+            let transport = error.transport.unwrap();
+            assert_eq!(transport.kind, HttpFailureKind::Timeout);
+            assert_eq!(
+                transport.stage,
+                if body_started {
+                    crate::HttpFailureStage::Body
+                } else {
+                    crate::HttpFailureStage::Send
+                }
+            );
+            assert_eq!(error.status, None);
+            server.join().unwrap();
+        }
     }
 }

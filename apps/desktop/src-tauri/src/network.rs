@@ -9,8 +9,8 @@ use tauri::{Emitter, State, WebviewWindow};
 use wonderland_kernel::KernelError;
 use wonderland_kernel::logging::{info, warn};
 use wonderland_net::{
-    DistributionClient, DistributionSource, ProxyConfiguration, ProxyCredentials,
-    ProxyEnvironmentVariable, ProxyMode, ProxySettings,
+    DistributionClient, DistributionHttpError, DistributionSource, HttpFailureKind,
+    ProxyConfiguration, ProxyCredentials, ProxyEnvironmentVariable, ProxyMode, ProxySettings,
 };
 
 use crate::commands::ensure_main_window;
@@ -467,18 +467,14 @@ pub async fn network_proxy_test(
         Ok(client) => client.access(None).await,
         Err(error) => Err(error),
     };
-    let (outcome, http_status) = match &result {
-        Ok(_) => ("connected", None),
-        Err(error) if error.status == Some(407) => ("proxy_auth_required", Some(407)),
-        Err(error) if error.status.is_some() => ("http_error", error.status),
-        Err(error) if error.code == "DISTRIBUTION_UNAVAILABLE" => ("connection_failed", None),
-        Err(error) if error.code == "INVALID_DISTRIBUTION_RESPONSE" => ("invalid_response", None),
-        Err(_) => ("request_failed", None),
-    };
+    let (outcome, http_status) = proxy_test_outcome(&result);
+    let transport = result.as_ref().err().and_then(|error| error.transport);
     let elapsed = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     info!(
         route = proxy_route(view.mode),
         outcome,
+        failure_stage = ?transport.map(|error| error.stage),
+        failure_kind = ?transport.map(|error| error.kind),
         duration_ms = elapsed,
         "Core 目录网络连通性检查完成"
     );
@@ -489,6 +485,30 @@ pub async fn network_proxy_test(
         http_status,
         duration_ms: elapsed,
     })
+}
+
+fn proxy_test_outcome(
+    result: &Result<Vec<u8>, DistributionHttpError>,
+) -> (&'static str, Option<u16>) {
+    match result {
+        Ok(_) => ("connected", None),
+        Err(error) if error.status == Some(407) => ("proxy_auth_required", Some(407)),
+        Err(error) if error.status.is_some() => ("http_error", error.status),
+        Err(error) if error.transport.is_some() => (
+            match error.transport.unwrap().kind {
+                HttpFailureKind::Timeout | HttpFailureKind::DeadlineExceeded => "timeout",
+                HttpFailureKind::ProxyAuthentication => "proxy_auth_required",
+                HttpFailureKind::Dns => "dns_failed",
+                HttpFailureKind::Tls => "tls_failed",
+                HttpFailureKind::Connection => "connection_failed",
+                _ => "request_failed",
+            },
+            None,
+        ),
+        Err(error) if error.code == "DISTRIBUTION_UNAVAILABLE" => ("connection_failed", None),
+        Err(error) if error.code == "INVALID_DISTRIBUTION_RESPONSE" => ("invalid_response", None),
+        Err(_) => ("request_failed", None),
+    }
 }
 
 fn proxy_route(mode: ProxyMode) -> &'static str {
@@ -535,6 +555,48 @@ fn windows_system_proxy_state() -> WindowsSystemProxyState {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn https_connect_authentication_failure_reaches_proxy_test_ui() {
+        use std::io::{Read, Write};
+        let _proxy = crate::test_proxy::direct();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let configuration = ProxyConfiguration::new(
+            ProxySettings {
+                mode: ProxyMode::Custom,
+                address: Some(format!("http://{}", listener.local_addr().unwrap())),
+                bypass: String::new(),
+            },
+            None,
+        )
+        .unwrap();
+        wonderland_net::proxy::set_current_proxy(configuration).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).unwrap();
+            assert!(request[..count].starts_with(b"CONNECT example.invalid:443 "));
+            stream.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            DistributionClient::new(DistributionSource::parse("https://example.invalid").unwrap())
+                .unwrap()
+                .access(None)
+                .await
+        });
+        assert_eq!(
+            proxy_test_outcome(&result),
+            ("proxy_auth_required", Some(407))
+        );
+        server.join().unwrap();
+    }
 
     fn temp_directory() -> PathBuf {
         let nonce = SystemTime::now()

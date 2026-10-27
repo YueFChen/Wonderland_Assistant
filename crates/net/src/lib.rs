@@ -8,6 +8,7 @@ use std::time::Duration;
 pub use reqwest::Url;
 use wonderland_kernel::KernelError;
 
+mod diagnostics;
 pub mod distribution;
 pub mod proxy;
 pub use distribution::{DistributionClient, DistributionHttpError, DistributionSource};
@@ -112,6 +113,9 @@ pub enum HttpFailureKind {
     DeadlineExceeded,
     Connection,
     Timeout,
+    ProxyAuthentication,
+    Dns,
+    Tls,
     Redirect,
     RequestFailed,
     BodyInterrupted,
@@ -145,15 +149,7 @@ impl HttpTransportError {
     }
 
     fn send(error: reqwest::Error, followed_response: bool) -> Self {
-        let kind = if error.is_connect() {
-            HttpFailureKind::Connection
-        } else if error.is_timeout() {
-            HttpFailureKind::Timeout
-        } else if error.is_redirect() {
-            HttpFailureKind::Redirect
-        } else {
-            HttpFailureKind::RequestFailed
-        };
+        let kind = HttpFailureKind::from_reqwest(&error);
         // A failed connection to the original URL has not sent an HTTP request. A failure
         // on a redirect may follow already-processed requests, so its outcome remains unknown.
         let outcome_unknown = !error.is_connect() || followed_response;
@@ -161,6 +157,18 @@ impl HttpTransportError {
             stage: HttpFailureStage::Send,
             kind,
             outcome_unknown,
+        }
+    }
+
+    fn body(error: reqwest::Error) -> Self {
+        Self {
+            stage: HttpFailureStage::Body,
+            kind: if error.is_timeout() {
+                HttpFailureKind::Timeout
+            } else {
+                HttpFailureKind::BodyInterrupted
+            },
+            outcome_unknown: true,
         }
     }
 }
@@ -175,6 +183,9 @@ impl fmt::Display for HttpTransportError {
             HttpFailureKind::DeadlineExceeded => "The requested HTTP deadline expired",
             HttpFailureKind::Connection => "HTTP connection failed",
             HttpFailureKind::Timeout => "HTTP transport reported a timeout",
+            HttpFailureKind::ProxyAuthentication => "HTTP proxy authentication failed",
+            HttpFailureKind::Dns => "HTTP host name resolution failed",
+            HttpFailureKind::Tls => "HTTP TLS handshake or certificate validation failed",
             HttpFailureKind::Redirect => "HTTP redirect failed",
             HttpFailureKind::RequestFailed => "HTTP request failed",
             HttpFailureKind::BodyInterrupted => "HTTP response body was interrupted",
@@ -226,18 +237,10 @@ impl HttpResponseBody {
                 Err(HttpTransportError::deadline(HttpFailureStage::Body))
             }
             Some(deadline) => match tokio::time::timeout_at(deadline, response.chunk()).await {
-                Ok(result) => result.map_err(|_| HttpTransportError {
-                    stage: HttpFailureStage::Body,
-                    kind: HttpFailureKind::BodyInterrupted,
-                    outcome_unknown: true,
-                }),
+                Ok(result) => result.map_err(HttpTransportError::body),
                 Err(_) => Err(HttpTransportError::deadline(HttpFailureStage::Body)),
             },
-            None => response.chunk().await.map_err(|_| HttpTransportError {
-                stage: HttpFailureStage::Body,
-                kind: HttpFailureKind::BodyInterrupted,
-                outcome_unknown: true,
-            }),
+            None => response.chunk().await.map_err(HttpTransportError::body),
         };
         match result {
             Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
@@ -259,9 +262,29 @@ impl HttpResponseBody {
     }
 }
 
-type CachedHttpTransport = Option<(u64, HttpRedirectPolicy, reqwest::Client)>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HttpClientKey {
+    revision: u64,
+    redirects: HttpRedirectPolicy,
+    system_proxy: Option<u64>,
+}
+
+impl HttpClientKey {
+    fn new(snapshot: &proxy::ProxySnapshot, redirects: HttpRedirectPolicy) -> Self {
+        Self {
+            revision: snapshot.revision,
+            redirects,
+            system_proxy: (snapshot.configuration.settings().mode == ProxyMode::System)
+                .then(proxy::system_proxy_fingerprint),
+        }
+    }
+}
+
+type CachedHttpTransport = Option<(HttpClientKey, reqwest::Client)>;
 
 /// General plugin HTTP transport. Distribution requests retain separate policy.
+/// Windows system proxy and process proxy environment changes invalidate the cached
+/// client for subsequent requests. In-flight requests retain their original client.
 #[derive(Clone, Default)]
 pub struct HttpTransport {
     cached: Arc<RwLock<CachedHttpTransport>>,
@@ -275,10 +298,19 @@ impl HttpTransport {
     fn inner(&self, redirects: HttpRedirectPolicy) -> Result<reqwest::Client, HttpTransportError> {
         let unavailable = || HttpTransportError::prepare(HttpFailureKind::ClientUnavailable);
         let snapshot = proxy::current_proxy().map_err(|_| unavailable())?;
+        let key = HttpClientKey::new(&snapshot, redirects);
+        self.client(&snapshot, key)
+    }
+
+    fn client(
+        &self,
+        snapshot: &proxy::ProxySnapshot,
+        key: HttpClientKey,
+    ) -> Result<reqwest::Client, HttpTransportError> {
+        let unavailable = || HttpTransportError::prepare(HttpFailureKind::ClientUnavailable);
         let mut cached = self.cached.write().map_err(|_| unavailable())?;
-        if let Some((revision, policy, client)) = cached.as_ref()
-            && *revision == snapshot.revision
-            && *policy == redirects
+        if let Some((cached_key, client)) = cached.as_ref()
+            && *cached_key == key
         {
             return Ok(client.clone());
         }
@@ -301,7 +333,7 @@ impl HttpTransport {
             .apply_to(builder)
             .build()
             .map_err(|_| unavailable())?;
-        *cached = Some((snapshot.revision, redirects, client.clone()));
+        *cached = Some((key, client.clone()));
         Ok(client)
     }
 
@@ -512,11 +544,62 @@ mod transport_tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
+    #[tokio::test]
+    async fn external_proxy_change_refreshes_client_without_core_revision_change() {
+        let transport = HttpTransport::new();
+        for (fingerprint, body) in [(1, "first"), (2, "second")] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            // Simulate two externally resolved system policies with the same Core revision.
+            // Local proxies keep the test independent of the user's Windows settings.
+            let snapshot = proxy::ProxySnapshot {
+                revision: 42,
+                configuration: ProxyConfiguration::new(
+                    ProxySettings {
+                        mode: ProxyMode::Custom,
+                        address: Some(format!("http://{}", listener.local_addr().unwrap())),
+                        bypass: String::new(),
+                    },
+                    None,
+                )
+                .unwrap(),
+            };
+            let key = HttpClientKey {
+                revision: snapshot.revision,
+                redirects: HttpRedirectPolicy::None,
+                system_proxy: Some(fingerprint),
+            };
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = [0; 4096];
+                let count = stream.read(&mut request).unwrap();
+                assert!(request[..count].starts_with(b"GET http://example.invalid/ HTTP/1.1"));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            });
+            let response = transport
+                .client(&snapshot, key)
+                .unwrap()
+                .get("http://example.invalid/")
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), body);
+            server.join().unwrap();
+        }
+    }
+
     fn direct_transport(redirects: HttpRedirectPolicy) -> HttpTransport {
         let transport = HttpTransport::new();
         *transport.cached.write().unwrap() = Some((
-            proxy::current_proxy().unwrap().revision,
-            redirects,
+            HttpClientKey::new(&proxy::current_proxy().unwrap(), redirects),
             reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())

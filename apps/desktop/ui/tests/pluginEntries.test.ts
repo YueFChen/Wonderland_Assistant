@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { primaryPluginEntries } from '../src/plugins/pluginEntries.ts'
+import { orderPluginCards, primaryPluginEntries } from '../src/plugins/pluginEntries.ts'
 
 test('one entry per plugin, preferring primary activity over auxiliary views', () => {
   const entries = [
@@ -13,4 +13,20 @@ test('one entry per plugin, preferring primary activity over auxiliary views', (
   assert.deepEqual(primaryPluginEntries([...entries].reverse()).map((item) => item.id), ['editor/main', 'viewer/view'])
   assert.equal(entries[0].id, 'editor/images')
   assert.deepEqual(primaryPluginEntries([]), [])
+})
+
+test('management follows reordered primary activities and retains plugins without UI', () => {
+  const states = [
+    { manifest: { id: 'background' }, enabled: true },
+    { manifest: { id: 'editor' }, enabled: false },
+    { manifest: { id: 'viewer' }, enabled: true },
+  ]
+  const activities = [
+    { pluginId: 'viewer' },
+    { pluginId: 'editor' },
+  ]
+  assert.deepEqual(orderPluginCards(states, activities).map(item => item.manifest.id), ['viewer', 'editor', 'background'])
+  assert.deepEqual(orderPluginCards([...states].reverse(), activities), orderPluginCards(states, activities))
+  assert.deepEqual(states.map(item => item.manifest.id), ['background', 'editor', 'viewer'])
+  assert.equal(orderPluginCards(states, activities)[1], states[1])
 })

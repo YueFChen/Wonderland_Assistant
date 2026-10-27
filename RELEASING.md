@@ -1,6 +1,6 @@
 # Core 发布
 
-**Cloudflare 正常更新，GitHub Release 暂缓。** Core 当前版本为 0.2.0；截至 2026-10-25，GitHub 最新正式版仍为 0.1.9。源码准备和推送、CF 更新、本地候选及 GitHub Release 分别管理。
+**Cloudflare 正常更新，GitHub Release 暂缓。** Core 当前版本为 0.2.1；2026-10-27 准备该版本的 CF 更新，发布状态以线上稳定索引为准。GitHub 最新正式版仍为 0.1.9。源码准备和推送、CF 更新、本地候选及 GitHub Release 分别管理。
 
 ## 渠道与门槛
 

@@ -1819,8 +1819,26 @@ fn status_for_error(code: &str) -> &'static str {
 }
 fn http_failure(error: DistributionHttpError) -> PluginError {
     let mut failure = failure(error.code);
+    let mut details = serde_json::Map::new();
     if let Some(seconds) = error.retry_after_seconds {
-        failure.details = Some(serde_json::json!({"retryAfterSeconds":seconds}));
+        details.insert("retryAfterSeconds".into(), seconds.into());
+    }
+    if let Some(status) = error.status {
+        details.insert("httpStatus".into(), status.into());
+    }
+    if let Some(transport) = error.transport {
+        failure.message = format!(
+            "{}（{}）",
+            failure.message,
+            transport.kind.diagnostic_message()
+        );
+        details.insert(
+            "transport".into(),
+            serde_json::to_value(transport).expect("transport diagnostics are serializable"),
+        );
+    }
+    if !details.is_empty() {
+        failure.details = Some(details.into());
     }
     failure
 }

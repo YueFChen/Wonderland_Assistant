@@ -27,6 +27,7 @@ mod ui_external_browser;
 mod ui_policy;
 mod user_data;
 mod web_access;
+mod webview_behavior;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -594,7 +595,8 @@ fn run_application(data_dir: Option<PathBuf>) {
                 } else {
                     builder
                 };
-                builder.build()?;
+                let window = builder.build()?;
+                webview_behavior::configure(&window)?;
             }
             if let Some(main_window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 let close_event_window = main_window.clone();
@@ -652,6 +654,7 @@ fn run_application(data_dir: Option<PathBuf>) {
             tray::core_exit,
             tray::tray_sync_pinned,
             user_data::user_data_get,
+            user_data::user_data_reveal_dir,
             user_data::user_data_migrate_custom,
             user_data::user_data_migrate_default,
             user_data::user_data_cancel_migration,

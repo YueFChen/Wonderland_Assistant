@@ -56,3 +56,5 @@ tauri-plugin-process = "2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 winreg = "0.55"
+webview2-com = "=0.38.2"
+windows = "0.61"

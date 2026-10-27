@@ -1,0 +1,30 @@
+@layer components {
+  .release-notes { color: var(--app-ink-muted); font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; }
+  .release-notes > :first-child { margin-top: 0; }
+  .release-notes > :last-child { margin-bottom: 0; }
+  .release-notes :is(h1,h2,h3,h4,h5,h6) { margin: 1.5em 0 .6em; color: var(--app-ink); font-weight: 600; line-height: 1.45; }
+  .release-notes h1 { font-size: 20px; }
+  .release-notes h2 { font-size: 17px; }
+  .release-notes :is(h3,h4,h5,h6) { font-size: 15px; }
+  .release-notes p { margin: .7em 0; white-space: pre-wrap; }
+  .release-notes :is(ul,ol) { margin: .7em 0; padding-left: 1.5em; }
+  .release-notes ul { list-style: disc; }
+  .release-notes ol { list-style: decimal; }
+  .release-notes li + li { margin-top: .3em; }
+  .release-notes li > p { margin: .3em 0; }
+  .release-notes strong { color: var(--app-ink); font-weight: 600; }
+  .release-notes a { color: var(--app-accent-ink); text-decoration: underline; text-underline-offset: 3px; }
+  .release-notes a:hover { text-decoration-thickness: 2px; }
+  .release-notes a:focus-visible { outline: 2px solid var(--app-accent); outline-offset: 3px; border-radius: 2px; }
+  .release-notes code { padding: .15em .4em; border-radius: 5px; background: var(--app-glass-subtle); font-size: .9em; }
+  .release-notes pre { margin: 1em 0; padding: 14px; overflow-x: auto; border: 1px solid var(--app-glass-line); border-radius: var(--app-radius-control); background: var(--app-glass-subtle); }
+  .release-notes pre code { padding: 0; background: none; white-space: pre; }
+  .release-notes blockquote { margin: 1em 0; padding: .15em 1em; border-left: 3px solid var(--app-accent-line); }
+  .release-notes hr { margin: 1.4em 0; border: 0; border-top: 1px solid var(--app-glass-line); }
+  .release-notes-table { margin: 1em 0; overflow-x: auto; }
+  .release-notes table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .release-notes :is(th,td) { padding: 8px 12px; border: 1px solid var(--app-glass-line); text-align: left; }
+  .release-notes th { color: var(--app-ink); background: var(--app-glass-subtle); font-weight: 600; }
+  .release-notes .contains-task-list { list-style: none; padding-left: .2em; }
+  .release-notes .task-list-item > input { margin-right: .5em; }
+}

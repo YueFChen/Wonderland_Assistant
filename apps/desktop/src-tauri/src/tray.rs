@@ -135,7 +135,7 @@ fn build_menu<R: Runtime>(
     let home = MenuItem::with_id(manager, "home", "进入首页", true, None::<&str>)?;
     let plugins = MenuItem::with_id(manager, "plugin-management", "插件管理", true, None::<&str>)?;
     let separator_before_pinned = PredefinedMenuItem::separator(manager)?;
-    let pinned = Submenu::new(manager, "固定到侧栏的工作区", true)?;
+    let pinned = Submenu::new(manager, "工作区", true)?;
     if pinned_entries.is_empty() {
         let empty = MenuItem::with_id(
             manager,
@@ -152,13 +152,7 @@ fn build_menu<R: Runtime>(
         }
     }
     let separator_before_exit = PredefinedMenuItem::separator(manager)?;
-    let exit = MenuItem::with_id(
-        manager,
-        "exit",
-        "退出 Wonderland Assistant",
-        true,
-        None::<&str>,
-    )?;
+    let exit = MenuItem::with_id(manager, "exit", "退出", true, None::<&str>)?;
 
     let menu = Menu::new(manager)?;
     menu.append(&home)?;

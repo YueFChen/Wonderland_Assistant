@@ -3,9 +3,13 @@
 //! System mode follows the platform proxy integration and standard proxy environment
 //! variables. Direct and custom modes explicitly disable those implicit settings.
 
+use std::hash::{Hash, Hasher};
 use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
+
+mod browser;
+pub use browser::BrowserProxyPolicy;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -220,6 +224,42 @@ pub fn set_current_proxy(configuration: ProxyConfiguration) -> Result<u64, Proxy
     current.revision = current.revision.wrapping_add(1);
     current.configuration = configuration;
     Ok(current.revision)
+}
+
+/// Cache identity for the inputs reqwest reads when constructing a system-mode client.
+/// Keep only a digest: environment proxy URLs may contain credentials.
+pub(crate) fn system_proxy_fingerprint() -> u64 {
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "REQUEST_METHOD",
+    ] {
+        std::env::var_os(name).hash(&mut state);
+    }
+    #[cfg(windows)]
+    {
+        use winreg::{RegKey, enums::HKEY_CURRENT_USER};
+        let settings = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings");
+        settings.is_ok().hash(&mut state);
+        if let Ok(settings) = settings {
+            settings
+                .get_value::<u32, _>("ProxyEnable")
+                .ok()
+                .hash(&mut state);
+            for name in ["ProxyServer", "ProxyOverride"] {
+                settings.get_value::<String, _>(name).ok().hash(&mut state);
+            }
+        }
+    }
+    state.finish()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

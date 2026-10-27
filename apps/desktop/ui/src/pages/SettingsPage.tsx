@@ -207,6 +207,7 @@ function UserDataCard({ state, setState, loadFailure }: {
   const [customPath, setCustomPath] = useState('')
   const [busy, setBusy] = useState(false)
   const [choosing, setChoosing] = useState(false)
+  const [opening, setOpening] = useState(false)
   const [failure, setFailure] = useState('')
 
   useEffect(() => {
@@ -238,6 +239,18 @@ function UserDataCard({ state, setState, loadFailure }: {
     }
   }
 
+  const openDirectory = async () => {
+    setOpening(true)
+    setFailure('')
+    try {
+      await userDataApi.revealDirectory()
+    } catch (cause) {
+      setFailure(errorText(cause))
+    } finally {
+      setOpening(false)
+    }
+  }
+
   return (
     <section className="glass-card rounded-card p-6">
       <SectionHead title={t('settings.userData.title')} />
@@ -248,7 +261,7 @@ function UserDataCard({ state, setState, loadFailure }: {
         <div className="mt-4 space-y-4">
           <div className="flex items-start gap-3 rounded-lg border border-glass-line bg-glass-subtle p-3">
             <HardDrive className="mt-0.5 h-4 w-4 shrink-0 text-ink-muted" aria-hidden />
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <p className="text-xs text-ink-faint">
                 {t('settings.userData.current')} · {' '}
                 {state.location === 'default'
@@ -257,6 +270,10 @@ function UserDataCard({ state, setState, loadFailure }: {
               </p>
               <p className="mt-1 break-all font-mono text-xs text-ink">{state.active_path}</p>
             </div>
+            <button type="button" disabled={opening} onClick={() => void openDirectory()} className="app-button shrink-0" aria-label={t('settings.userData.revealLabel')} title={t('settings.userData.revealLabel')}>
+              <FolderOpen className="h-4 w-4" aria-hidden />
+              {t('settings.userData.reveal')}
+            </button>
           </div>
 
           {state.pending_path ? (

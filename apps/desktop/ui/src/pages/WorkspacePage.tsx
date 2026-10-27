@@ -4,7 +4,7 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 
 import { PluginIcon } from '../plugins/icons'
 import { buildContributionRegistry, openContribution } from '../plugins/contributions'
-import { primaryPluginEntries } from '../plugins/pluginEntries'
+import { orderPluginCards, primaryPluginEntries } from '../plugins/pluginEntries'
 import { orderContributions, useWorkspaceLayout } from '../plugins/workspaceLayout'
 import { usePlugins } from '../plugins/api'
 import { PluginManagement } from './PluginManagement'
@@ -216,7 +216,7 @@ export function WorkspacePage() {
       )}
 
       {managingPlugins ? (
-        <PluginManagement states={states} error={error} setStates={setStates} />
+        <PluginManagement states={states ? orderPluginCards(states, activities) : null} error={error} setStates={setStates} />
       ) : (
         <>
       {pinned.length > 0 && (

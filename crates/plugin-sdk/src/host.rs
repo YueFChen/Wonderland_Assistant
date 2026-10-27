@@ -13,6 +13,13 @@ fn decode<T: DeserializeOwned>(value: Value) -> Result<T, PluginError> {
     serde_json::from_value(value).map_err(|e| PluginError::new("INVALID_RESPONSE", e.to_string()))
 }
 
+/// Local native selection for persistent sources. Available starting with Core 0.2.1.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct SelectedPaths {
+    pub cancelled: bool,
+    pub paths: Vec<String>,
+}
+
 // A local SDK deadline can win the race with Core's detailed error response.
 // Without proof of preparation-only failure, callers must not assume safe replay.
 fn interrupted_transport(mut error: PluginError, stage: &str) -> PluginError {
@@ -38,6 +45,18 @@ pub(super) fn interrupted_service(method: &str, error: PluginError) -> PluginErr
 }
 
 impl HostClient {
+    pub fn pick_paths(
+        &self,
+        directory: bool,
+        extensions: &[&str],
+    ) -> Result<SelectedPaths, PluginError> {
+        decode(self.call_core(
+            "core.files.pick_paths",
+            json!({
+                "kind": if directory { "directory" } else { "files" }, "extensions": extensions
+            }),
+        )?)
+    }
     pub fn http_request(
         &self,
         request: &HttpRequestParams,

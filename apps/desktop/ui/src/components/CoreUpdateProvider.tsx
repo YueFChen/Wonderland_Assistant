@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { getVersion } from '@tauri-apps/api/app'
 import { isTauri } from '@tauri-apps/api/core'
 import { relaunch } from '@tauri-apps/plugin-process'
@@ -7,11 +7,13 @@ import { Dialog, DialogButton } from '@wonderland/ui'
 
 import { t } from '../i18n'
 import { createUpdateCheckGate, UPDATE_CHECK_INTERVAL_MS, UPDATE_WAKE_COOLDOWN_MS } from '../core/updateChecks'
+import { releaseDateLabel, releaseNotesPreview } from '../core/releaseNotes'
 import { networkApi, type CoreUpdateAvailable, type CoreUpdateProgress } from '../network/api'
 import { useNotifications } from './Notifications'
 
 const IGNORED_VERSIONS_KEY = 'wonderland.core.ignored-update-versions.v1'
 const HOME_NOTICE_PREFIX = 'core-update:'
+const ReleaseNotes = lazy(() => import('./ReleaseNotes'))
 
 interface CoreUpdateContextValue {
   version: string
@@ -25,6 +27,7 @@ interface CoreUpdateContextValue {
   installUpdate: () => Promise<void>
   ignoreCurrentVersion: () => void
   dismissPrompt: () => void
+  showUpdateDetails: () => void
 }
 
 const CoreUpdateContext = createContext<CoreUpdateContextValue | null>(null)
@@ -80,7 +83,7 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
         publishHomeNotification({
           id: noticeId,
           title: t('settings.update.available', { version: next.version }),
-          message: next.body?.trim().slice(0, 260) || t('home.updateNotice', { version: next.version }),
+          message: releaseNotesPreview(next.body) || t('home.updateNotice', { version: next.version }),
           href: '/workspace/settings',
         })
       }
@@ -120,6 +123,10 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
       gate.current.endInstall()
     }
   }, [notify, update])
+
+  const showUpdateDetails = useCallback(() => {
+    if (update) setPromptOpen(true)
+  }, [update])
 
   const ignoreCurrentVersion = useCallback(() => {
     if (!update) return
@@ -211,7 +218,8 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
     installUpdate,
     ignoreCurrentVersion,
     dismissPrompt: () => setPromptOpen(false),
-  }), [version, update, hasUpdate, checking, installing, progress, message, checkForUpdate, installUpdate, ignoreCurrentVersion])
+    showUpdateDetails,
+  }), [version, update, hasUpdate, checking, installing, progress, message, checkForUpdate, installUpdate, ignoreCurrentVersion, showUpdateDetails])
 
   return (
     <CoreUpdateContext.Provider value={context}>
@@ -220,6 +228,7 @@ export function CoreUpdateProvider({ children }: { children: ReactNode }) {
         <CoreUpdateDialog
           update={update}
           currentVersion={version}
+          checking={checking}
           installing={installing}
           progress={progress}
           failure={promptFailure}
@@ -241,6 +250,7 @@ export function useCoreUpdate() {
 export function CoreUpdateDialog({
   update,
   currentVersion,
+  checking,
   installing,
   progress,
   failure,
@@ -250,6 +260,7 @@ export function CoreUpdateDialog({
 }: {
   update: CoreUpdateAvailable
   currentVersion: string
+  checking: boolean
   installing: boolean
   progress: number | null
   failure: string
@@ -257,18 +268,26 @@ export function CoreUpdateDialog({
   onIgnore: () => void
   onLater: () => void
 }) {
-  return <Dialog open title={t('update.prompt.title')} closeLabel={t('common.close')} size="md" dismissible={!installing} onClose={onLater} footer={<>
-    <DialogButton className="mr-auto" variant="quiet" disabled={installing} onClick={onIgnore}>{t('update.prompt.ignore')}</DialogButton>
-    <DialogButton data-dialog-autofocus disabled={installing} onClick={onLater}>{t('update.prompt.later')}</DialogButton>
-    <DialogButton variant="primary" disabled={installing} onClick={onInstall}><Download className="h-3.5 w-3.5" aria-hidden />{t('update.prompt.install')}</DialogButton>
-  </>}>
-    <p className="app-dialog-description">{t('update.prompt.versions', { current: currentVersion || '—', next: update.version })}</p>
-    {update.body && <p className="mt-4 whitespace-pre-wrap text-sm leading-6 text-ink-muted">{update.body}</p>}
-    {failure && <p role="alert" className="app-dialog-notice mt-4" data-tone="danger">{failure}</p>}
-    {installing && <div className="mt-4" role="status">
+  const published = releaseDateLabel(update.date)
+  const body = update.body?.trim()
+  return <Dialog open title={t('update.prompt.title')} closeLabel={t('common.close')} size="lg" dismissible={!installing} onClose={onLater} footer={<>
+    {failure && <p role="alert" className="app-dialog-notice w-full" data-tone="danger">{failure}</p>}
+    {installing && <div className="w-full" role="status">
       <p className="text-xs text-ink-muted">{progress === null ? t('settings.update.downloading') : t('settings.update.progress', { progress })}</p>
       <div className="app-progress mt-2" role="progressbar" aria-label={t('settings.update.downloading')} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress ?? undefined} aria-busy={progress === null}><span style={progress === null ? undefined : { width: `${progress}%` }} /></div>
     </div>}
+    <DialogButton className="mr-auto" variant="quiet" disabled={installing} onClick={onIgnore}>{t('update.prompt.ignore')}</DialogButton>
+    <DialogButton data-dialog-autofocus disabled={installing} onClick={onLater}>{t('update.prompt.later')}</DialogButton>
+    <DialogButton variant="primary" disabled={checking || installing} onClick={onInstall}><Download className="h-3.5 w-3.5" aria-hidden />{t('update.prompt.install')}</DialogButton>
+  </>}>
+    <p className="app-dialog-description">{t('update.prompt.versions', { current: currentVersion || '—', next: update.version })}</p>
+    {published && <p className="mt-2 text-xs text-ink-faint"><time dateTime={update.date ?? undefined}>{t('settings.update.published', { date: published })}</time></p>}
+    <section className="mt-5 border-t border-glass-line pt-5" aria-label={t('settings.update.releaseNotes')}>
+      <h3 className="mb-3 text-xs font-semibold text-ink-faint">{t('settings.update.releaseNotes')}</h3>
+      {body ? <Suspense fallback={<p role="status" className="text-sm text-ink-muted">{t('settings.update.notesLoading')}</p>}>
+        <ReleaseNotes body={body} />
+      </Suspense> : <p className="text-sm text-ink-muted">{t('settings.update.notesEmpty')}</p>}
+    </section>
   </Dialog>
 }
 

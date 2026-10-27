@@ -3,6 +3,7 @@ import type { UserDataState } from '@wonderland/core-bindings'
 
 export const userDataApi = {
   get: () => invoke<UserDataState>('user_data_get'),
+  revealDirectory: () => invoke<void>('user_data_reveal_dir'),
   migrateCustom: (path: string) =>
     invoke<UserDataState>('user_data_migrate_custom', { path }),
   migrateDefault: () => invoke<UserDataState>('user_data_migrate_default'),

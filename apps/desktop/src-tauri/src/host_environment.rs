@@ -11,6 +11,13 @@ use crate::plugin_runtime::plugin_error;
 pub(crate) trait HostEnvironment: Send + Sync {
     fn emit(&self, topic: &str, payload: Value);
     fn pick_file(&self, extensions: &[String]) -> Result<Option<PathBuf>, PluginError>;
+    fn pick_paths(
+        &self,
+        _directory: bool,
+        _extensions: &[String],
+    ) -> Result<Option<Vec<PathBuf>>, PluginError> {
+        Err(unavailable())
+    }
     fn open_url(&self, url: &str) -> Result<(), PluginError>;
     fn reveal_dir(&self, path: &Path) -> Result<(), PluginError>;
     fn browser_open(
@@ -44,6 +51,33 @@ impl DesktopEnvironment {
 }
 
 impl HostEnvironment for DesktopEnvironment {
+    fn pick_paths(
+        &self,
+        directory: bool,
+        extensions: &[String],
+    ) -> Result<Option<Vec<PathBuf>>, PluginError> {
+        let mut picker = self.0.dialog().file();
+        if !extensions.is_empty() {
+            let extensions = extensions.iter().map(String::as_str).collect::<Vec<_>>();
+            picker = picker.add_filter("Plugin files", &extensions);
+        }
+        let files = if directory {
+            picker.blocking_pick_folder().map(|path| vec![path])
+        } else {
+            picker.blocking_pick_files()
+        };
+        files
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|file| {
+                        file.into_path()
+                            .map_err(|_| plugin_error("INVALID_INPUT", "Selected path is invalid."))
+                    })
+                    .collect()
+            })
+            .transpose()
+    }
     fn browser_visibility(&self, label: &str, visible: bool) -> Result<(), PluginError> {
         use tauri::Manager;
         let window = self.0.get_webview_window(label).ok_or_else(|| {

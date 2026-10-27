@@ -5404,7 +5404,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wonderland-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -5415,7 +5415,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-desktop"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5436,6 +5436,8 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "tokio-util",
+ "webview2-com",
+ "windows",
  "windows-sys 0.61.2",
  "winreg",
  "wonderland-config",
@@ -5451,7 +5453,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-kernel"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5461,7 +5463,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-logging"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "regex",
  "tracing",
@@ -5472,18 +5474,21 @@ dependencies = [
 
 [[package]]
 name = "wonderland-net"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
+ "percent-encoding",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "winreg",
  "wonderland-kernel",
 ]
 
 [[package]]
 name = "wonderland-plugin-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5492,7 +5497,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-plugin-sdk"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -5503,7 +5508,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-plugin-signing"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hex",
  "ring",
@@ -5513,7 +5518,7 @@ dependencies = [
 
 [[package]]
 name = "wonderland-plugin-tools"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -5523,11 +5528,11 @@ dependencies = [
 
 [[package]]
 name = "wonderland-secret"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "wonderland-user-data"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",

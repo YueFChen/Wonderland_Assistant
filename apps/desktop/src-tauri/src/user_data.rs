@@ -13,6 +13,19 @@ pub fn user_data_get(
     ipc("user_data_get", || Ok(context.user_data()?.state()))
 }
 
+/// Open the effective data root; callers cannot supply another host path.
+#[tauri::command]
+pub fn user_data_reveal_dir(
+    window: WebviewWindow,
+    context: State<'_, AppContext>,
+) -> Result<(), KernelError> {
+    ensure_main_window(&window)?;
+    ipc("user_data_reveal_dir", || {
+        let current = context.user_data()?.state().active_path;
+        crate::reveal::open_dir(std::path::Path::new(&current))
+    })
+}
+
 /// Schedule a directory migration for the next application startup.
 #[tauri::command]
 pub fn user_data_migrate_custom(

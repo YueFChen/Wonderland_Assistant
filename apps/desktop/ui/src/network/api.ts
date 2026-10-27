@@ -38,7 +38,7 @@ export type ProxySettingsUpdate = {
 export type ProxyTestResult = {
   success: boolean
   route: ProxyMode
-  outcome: 'connected' | 'timeout' | 'connection_failed' | 'proxy_auth_required' | 'http_error' | 'invalid_response' | 'request_failed' | 'distribution_not_configured'
+  outcome: 'connected' | 'timeout' | 'connection_failed' | 'proxy_auth_required' | 'dns_failed' | 'tls_failed' | 'http_error' | 'invalid_response' | 'request_failed' | 'distribution_not_configured'
   httpStatus: number | null
   durationMs: number
 }

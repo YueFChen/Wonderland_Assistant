@@ -70,9 +70,10 @@ pub async fn core_update_check(
         .configure_client(move |builder| proxy.apply_to(builder))
         .build()
         .map_err(|_| KernelError::Transport("更新检查客户端初始化失败".to_owned()))?;
-    let update = updater.check().await.map_err(|_| {
-        KernelError::Transport("更新检查失败；请检查 Core 网络代理设置后重试".to_owned())
-    })?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|error| update_error(error, "更新检查失败"))?;
 
     let mut cache = updates
         .cache
@@ -167,9 +168,7 @@ pub async fn core_update_install(
             },
         )
         .await
-        .map_err(|_| {
-            KernelError::Transport("更新下载、签名校验或安装失败；请检查网络后重试".to_owned())
-        });
+        .map_err(|error| update_error(error, "更新下载、签名校验或安装失败"));
     // Allow retry after failure while preserving the single-use install handle.
     // A proxy change or a newer update check must not restore an obsolete session.
     if result.is_err()
@@ -180,6 +179,17 @@ pub async fn core_update_install(
         cache.updates.insert(update_id, update);
     }
     result
+}
+
+fn update_error(error: tauri_plugin_updater::Error, context: &str) -> KernelError {
+    match error {
+        tauri_plugin_updater::Error::Reqwest(error) => {
+            let kind = wonderland_net::HttpFailureKind::from_reqwest(&error);
+            wonderland_kernel::logging::warn!(?kind, "Core 更新网络请求失败");
+            KernelError::Transport(format!("{context}：{}", kind.diagnostic_message()))
+        }
+        _ => KernelError::Transport(format!("{context}；请稍后重试")),
+    }
 }
 
 fn new_update_id() -> Result<String, KernelError> {

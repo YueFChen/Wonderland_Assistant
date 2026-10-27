@@ -15,3 +15,15 @@ export function primaryPluginEntries<T extends Entry>(contributions: readonly T[
   }
   return [...primary.values()].sort((a, b) => a.defaultOrder - b.defaultOrder || a.id.localeCompare(b.id))
 }
+
+/** Management follows the launcher order; plugins without a launcher remain manageable. */
+export function orderPluginCards<T extends { manifest: { id: string } }>(
+  states: readonly T[],
+  activities: readonly { pluginId: string }[],
+): T[] {
+  const positions = new Map(activities.map((entry, index) => [entry.pluginId, index]))
+  return [...states].sort((left, right) =>
+    (positions.get(left.manifest.id) ?? activities.length) - (positions.get(right.manifest.id) ?? activities.length)
+    || left.manifest.id.localeCompare(right.manifest.id),
+  )
+}

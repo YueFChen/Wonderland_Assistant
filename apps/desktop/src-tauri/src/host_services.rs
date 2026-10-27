@@ -291,6 +291,20 @@ impl HostServices {
                     self.browsers.call(method, params, invocation)
                 }
                 "core.network.request" => self.network_request(params, invocation),
+                "core.network.proxy_info" => {
+                    if invocation.remote.is_some() {
+                        return Err(plugin_error(
+                            "LOCAL_ONLY",
+                            "Proxy information requires the local host.",
+                        ));
+                    }
+                    let snapshot = wonderland_net::proxy::current_proxy().map_err(|_| {
+                        plugin_error("SERVICE_UNAVAILABLE", "Proxy settings are unavailable.")
+                    })?;
+                    Ok(
+                        json!({"settings": snapshot.configuration.settings(), "hasCredentials": snapshot.configuration.has_credentials()}),
+                    )
+                }
                 "core.network.public" | "core.network.model" => Err(plugin_error(
                     "METHOD_NOT_FOUND",
                     "This Host method was removed; update the plugin to core.network.request.",
@@ -315,6 +329,7 @@ impl HostServices {
                 "core.secrets.plugin.delete" => self.secret_delete(params),
                 "core.secrets.plugin.has" => self.secret_has(params),
                 "core.files.pick" => self.pick_file(params, invocation),
+                "core.files.pick_paths" => self.pick_paths(params, invocation),
                 "core.files.read" => self.read_picked_file(params),
                 "core.files.export" => self.export_file(params),
                 "core.files.export_dir" => self.export_dir(),
@@ -366,6 +381,96 @@ impl HostServices {
     }
     pub(crate) fn cleanup(&self) {
         self.streams.prune();
+    }
+    fn pick_paths(
+        &self,
+        params: &Value,
+        invocation: &HostInvocation,
+    ) -> Result<Value, PluginError> {
+        // Persistent host paths are meaningful only on the local desktop, never a remote client.
+        if invocation.remote.is_some() {
+            return Err(plugin_error(
+                "LOCAL_ONLY",
+                "Persistent path selection requires the local desktop.",
+            ));
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Options {
+            kind: String,
+            #[serde(default)]
+            extensions: Vec<String>,
+        }
+        let options: Options = serde_json::from_value(params.clone())
+            .map_err(|_| plugin_error("INVALID_INPUT", "Invalid path picker options."))?;
+        let directory = match options.kind.as_str() {
+            "directory" => true,
+            "files" => false,
+            _ => {
+                return Err(plugin_error(
+                    "INVALID_INPUT",
+                    "Expected files or directory.",
+                ));
+            }
+        };
+        if options.extensions.len() > 128
+            || options.extensions.iter().any(|extension| {
+                extension.is_empty()
+                    || extension.len() > 32
+                    || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+        {
+            return Err(plugin_error(
+                "INVALID_INPUT",
+                "File picker extensions are invalid.",
+            ));
+        }
+        let Some(paths) = self
+            .services
+            .environment
+            .pick_paths(directory, &options.extensions)?
+        else {
+            return Ok(json!({"cancelled": true, "paths": []}));
+        };
+        invocation.check()?;
+        if paths.is_empty() || paths.len() > 1024 || (directory && paths.len() != 1) {
+            return Err(plugin_error(
+                "RESOURCE_LIMIT",
+                "Invalid number of selected paths.",
+            ));
+        }
+        let paths = paths
+            .into_iter()
+            .map(|path| {
+                let path = fs::canonicalize(path)
+                    .map_err(|_| plugin_error("INVALID_INPUT", "Selected path is unavailable."))?;
+                let metadata = fs::metadata(&path)
+                    .map_err(|_| plugin_error("INVALID_INPUT", "Cannot inspect selected path."))?;
+                if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+                    return Err(plugin_error(
+                        "INVALID_INPUT",
+                        "Selected path has the wrong type.",
+                    ));
+                }
+                if !directory
+                    && !options.extensions.is_empty()
+                    && !options.extensions.iter().any(|extension| {
+                        path.extension()
+                            .and_then(|value| value.to_str())
+                            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+                    })
+                {
+                    return Err(plugin_error(
+                        "INVALID_INPUT",
+                        "Selected file has an unsupported extension.",
+                    ));
+                }
+                path.to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| plugin_error("INVALID_INPUT", "Selected path is not UTF-8."))
+            })
+            .collect::<Result<Vec<_>, PluginError>>()?;
+        Ok(json!({"cancelled": false, "paths": paths}))
     }
     fn pick_file(&self, params: &Value, invocation: &HostInvocation) -> Result<Value, PluginError> {
         let extensions = match params.get("extensions") {
@@ -1172,6 +1277,108 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn persistent_path_picker_validates_selection_and_rejects_remote_requests() {
+        struct Selection(Vec<PathBuf>);
+        impl HostEnvironment for Selection {
+            fn emit(&self, _: &str, _: Value) {}
+            fn pick_file(&self, _: &[String]) -> Result<Option<PathBuf>, PluginError> {
+                unreachable!()
+            }
+            fn pick_paths(
+                &self,
+                _: bool,
+                _: &[String],
+            ) -> Result<Option<Vec<PathBuf>>, PluginError> {
+                Ok(Some(self.0.clone()))
+            }
+            fn open_url(&self, _: &str) -> Result<(), PluginError> {
+                unreachable!()
+            }
+            fn reveal_dir(&self, _: &Path) -> Result<(), PluginError> {
+                unreachable!()
+            }
+        }
+        let runtime = runtime();
+        let root = TestRoot::new();
+        let first = root.0.join("first.md");
+        let second = root.0.join("second.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        let mut host = root.host(&runtime, "demo");
+        host.services.environment = Arc::new(Selection(vec![first.clone(), second]));
+        let params = json!({"kind":"files","extensions":["md","txt"]});
+        let result = host
+            .call("core.files.pick_paths", &params, &HostInvocation::default())
+            .unwrap();
+        assert_eq!(result["cancelled"], false);
+        assert_eq!(result["paths"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            PathBuf::from(result["paths"][0].as_str().unwrap()),
+            fs::canonicalize(first).unwrap()
+        );
+        assert_eq!(
+            host.call(
+                "core.files.pick_paths",
+                &json!({"kind":"files","extensions":["pdf"]}),
+                &HostInvocation::default()
+            )
+            .unwrap_err()
+            .code,
+            "INVALID_INPUT"
+        );
+        let remote = Arc::new(RemoteContext::new(
+            Arc::new(crate::remote_interaction::RemoteBroker::default()),
+            "browser".into(),
+            "root".into(),
+        ));
+        let invocation = HostInvocation {
+            remote: Some(remote.for_plugin("demo")),
+            ..HostInvocation::default()
+        };
+        assert_eq!(
+            host.call("core.files.pick_paths", &params, &invocation)
+                .unwrap_err()
+                .code,
+            "LOCAL_ONLY"
+        );
+        assert_eq!(
+            host.call("core.network.proxy_info", &json!({}), &invocation)
+                .unwrap_err()
+                .code,
+            "LOCAL_ONLY"
+        );
+    }
+
+    #[test]
+    fn persistent_directory_picker_handles_cancellation_and_invalid_options() {
+        let runtime = runtime();
+        let root = TestRoot::new();
+        let host = root.host(&runtime, "demo");
+        for params in [
+            json!({"kind":"unknown"}),
+            json!({"kind":"files","extensions":["../md"]}),
+            json!({"kind":"directory","extra":true}),
+        ] {
+            assert_eq!(
+                host.call("core.files.pick_paths", &params, &HostInvocation::default())
+                    .unwrap_err()
+                    .code,
+                "INVALID_INPUT"
+            );
+        }
+        assert_eq!(
+            host.call(
+                "core.files.pick_paths",
+                &json!({"kind":"directory"}),
+                &HostInvocation::default()
+            )
+            .unwrap_err()
+            .code,
+            "INTERACTION_UNAVAILABLE"
+        );
     }
 
     #[test]

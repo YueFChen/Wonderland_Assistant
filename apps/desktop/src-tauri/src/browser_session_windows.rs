@@ -13,6 +13,7 @@ use tauri::{
     AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent, Wry,
     webview::NewWindowResponse,
 };
+use wonderland_net::proxy::BrowserProxyPolicy;
 
 #[derive(Default)]
 struct PopupState {
@@ -25,15 +26,17 @@ struct PopupFamily {
     title: String,
     sequence: AtomicU64,
     state: Mutex<PopupState>,
+    proxy: Arc<BrowserProxyPolicy>,
 }
 
 impl PopupFamily {
-    fn new(root: &str, title: &str) -> Self {
+    fn new(root: &str, title: &str, proxy: Arc<BrowserProxyPolicy>) -> Self {
         Self {
             root: root.into(),
             title: title.into(),
             sequence: AtomicU64::new(0),
             state: Mutex::default(),
+            proxy,
         }
     }
 
@@ -103,6 +106,14 @@ fn with_popups<'a>(
                     return NewWindowResponse::Deny;
                 }
             };
+            if crate::webview_behavior::configure(&child)
+                .and_then(|()| install_proxy_authentication(&child, family.proxy.clone()))
+                .is_err()
+            {
+                let _ = child.destroy();
+                wonderland_kernel::logging::warn!("Cannot configure browser-session popup");
+                return NewWindowResponse::Deny;
+            }
             if !family.track(&label) {
                 let _ = child.destroy();
                 return NewWindowResponse::Deny;
@@ -123,7 +134,10 @@ pub(crate) fn create(
     profile: &Path,
     options: &crate::browser_sessions::BrowserOptions,
 ) -> Result<WebviewWindow, tauri::Error> {
-    let family = Arc::new(PopupFamily::new(label, &options.title));
+    let policy = wonderland_net::proxy::current_proxy()
+        .and_then(|snapshot| snapshot.configuration.browser_policy())
+        .map_err(|_| proxy_error())?;
+    let family = Arc::new(PopupFamily::new(label, &options.title, Arc::new(policy)));
     let builder = WebviewWindowBuilder::new(
         app,
         label,
@@ -133,7 +147,14 @@ pub(crate) fn create(
     .inner_size(f64::from(options.width), f64::from(options.height))
     .visible(false)
     .data_directory(profile.to_path_buf());
+    let builder = configure_proxy(builder, &family.proxy)?;
     let window = with_popups(builder, app.clone(), family.clone()).build()?;
+    if let Err(error) = crate::webview_behavior::configure(&window)
+        .and_then(|()| install_proxy_authentication(&window, family.proxy.clone()))
+    {
+        let _ = window.destroy();
+        return Err(error);
+    }
     let app = app.clone();
     window.on_window_event(move |event| {
         if matches!(event, WindowEvent::Destroyed) {
@@ -145,6 +166,92 @@ pub(crate) fn create(
         }
     });
     Ok(window)
+}
+
+fn proxy_error() -> tauri::Error {
+    std::io::Error::other("Cannot configure the browser session network proxy").into()
+}
+
+fn configure_proxy<'a>(
+    builder: WebviewWindowBuilder<'a, Wry, AppHandle>,
+    proxy: &BrowserProxyPolicy,
+) -> Result<WebviewWindowBuilder<'a, Wry, AppHandle>, tauri::Error> {
+    let Some(arguments) = proxy.chromium_arguments() else {
+        return Ok(builder);
+    };
+    #[cfg(windows)]
+    {
+        // additional_browser_args replaces Wry's defaults, so retain its feature restrictions.
+        let arguments =
+            format!("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection {arguments}");
+        Ok(builder.additional_browser_args(&arguments))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = arguments;
+        Err(proxy_error())
+    }
+}
+
+fn install_proxy_authentication(
+    window: &WebviewWindow,
+    proxy: Arc<BrowserProxyPolicy>,
+) -> Result<(), tauri::Error> {
+    if !proxy.has_explicit_proxy() {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        use webview2_com::{
+            BasicAuthenticationRequestedEventHandler,
+            Microsoft::Web::WebView2::Win32::ICoreWebView2_10, take_pwstr,
+        };
+        use windows::core::{HSTRING, Interface, PWSTR};
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        window.with_webview(move |webview| {
+            // Runs on the WebView's UI thread. Registration must succeed before navigation.
+            let result = (|| -> windows::core::Result<()> {
+                unsafe {
+                    let webview: ICoreWebView2_10 = webview.controller().CoreWebView2()?.cast()?;
+                    let handler = BasicAuthenticationRequestedEventHandler::create(Box::new(
+                        move |_, args| {
+                            let Some(args) = args else {
+                                return Ok(());
+                            };
+                            let mut uri = PWSTR::null();
+                            args.Uri(&mut uri)?;
+                            let uri = take_pwstr(uri);
+                            if let Some((username, password)) =
+                                proxy.credentials_for_challenge(&uri)
+                            {
+                                let response = args.Response()?;
+                                response.SetUserName(&HSTRING::from(username))?;
+                                response.SetPassword(&HSTRING::from(password))?;
+                            } else if proxy.is_proxy_challenge(&uri) {
+                                args.SetCancel(true)?;
+                            }
+                            // Ordinary website authentication never receives proxy credentials.
+                            Ok(())
+                        },
+                    ));
+                    let mut token = 0;
+                    webview.add_BasicAuthenticationRequested(&handler, &mut token)?;
+                }
+                Ok(())
+            })();
+            let _ = tx.send(result.is_ok());
+        })?;
+        if rx.recv() == Ok(true) {
+            Ok(())
+        } else {
+            Err(proxy_error())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        Err(proxy_error())
+    }
 }
 
 #[cfg(test)]
@@ -174,7 +281,11 @@ mod tests {
 
     #[test]
     fn session_cleanup_drains_all_descendants_and_prevents_late_windows() {
-        let family = PopupFamily::new("session", "Browser");
+        let family = PopupFamily::new(
+            "session",
+            "Browser",
+            Arc::new(BrowserProxyPolicy::default()),
+        );
         let first = family.next_label();
         let second = family.next_label();
         assert_ne!(first, second);
