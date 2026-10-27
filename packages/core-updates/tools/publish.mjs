@@ -38,9 +38,33 @@ export async function prepareRelease(directory, source, publicKey) {
   return { manifest, files }
 }
 
-async function get(url) {
-  return fetch(url, { redirect: 'error', signal: AbortSignal.timeout(60_000), headers: { 'Cache-Control': 'no-cache' } })
+/** Only reads are retried. Finish reading the body before returning, including cold R2 assets. */
+export async function readUpdateResponse(url, fetcher = fetch) {
+  const deadline = Date.now() + (new URL(url).pathname.startsWith('/releases/') ? 300_000 : 60_000)
+  let failure
+  for (let attempt = 0; attempt < 3 && Date.now() < deadline; attempt += 1) {
+    try {
+      const response = await fetcher(url, {
+        redirect: 'error', signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+        headers: { 'Cache-Control': 'no-cache' },
+      })
+      if ([502, 503, 504].includes(response.status) && attempt < 2) {
+        await response.body?.cancel()
+        throw new Error(`Temporary Core readback HTTP ${response.status}`)
+      }
+      const body = response.body === null ? null : await response.arrayBuffer()
+      return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers })
+    } catch (error) {
+      failure = error
+      if (attempt < 2 && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(500 * (attempt + 1), deadline - Date.now())))
+      }
+    }
+  }
+  throw new Error('Core update HTTPS readback failed after bounded retries.', { cause: failure })
 }
+
+const get = readUpdateResponse
 
 export async function publish(directory) {
   const source = JSON.parse(await readFile(path.join(directory, 'latest.json'), 'utf8'))
