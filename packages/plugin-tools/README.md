@@ -8,8 +8,8 @@
 # 开发包；没有身份时允许未签名，不需要增加本地版本号
 pnpm --dir plugins/wla_template_plugin run package:plugin
 # 正式成品；缺少原签名身份时失败
-pnpm --dir plugins/rich_editor run package:release
-node packages/plugin-tools/verify.mjs plugins/rich_editor/target/rich_editor-0.2.2-windows-x86_64.wplug --signed
+pnpm --dir plugins/wla_rich_editor run package:release
+node packages/plugin-tools/verify.mjs plugins/wla_rich_editor/target/wla_rich_editor-0.2.3-windows-x86_64.wplug --signed
 ```
 
 正式上传同 pluginId＋版本必须保持原始包字节。已在线登记的旧版本不能补签覆盖；准备新的在线版本。稳定推广复用原包。
@@ -17,8 +17,8 @@ node packages/plugin-tools/verify.mjs plugins/rich_editor/target/rich_editor-0.2
 ## 原身份首次导入
 
 ```powershell
-node packages/plugin-tools/cli.mjs import --plugin rich_editor --file plugins/rich_editor/.secrets/PLUGIN_UPDATE_SIGNING_KEY --expected-public-key 31a775e5aae522c4272bcc39547c89cfd78d2df1c768df1dd33d80fa05416fef
-node packages/plugin-tools/cli.mjs status --plugin rich_editor
+node packages/plugin-tools/cli.mjs import --plugin wla_rich_editor --file plugins/wla_rich_editor/.secrets/PLUGIN_UPDATE_SIGNING_KEY --expected-public-key 31a775e5aae522c4272bcc39547c89cfd78d2df1c768df1dd33d80fa05416fef
+node packages/plugin-tools/cli.mjs status --plugin wla_rich_editor
 ```
 
 文件是原 Ed25519 32 字节 seed 的标准 Base64 文本。工具只输出公钥和状态，原文件不删除。本机身份存于 `%LOCALAPPDATA%/Wonderland/author-keys`，由独立 `wla-plugin-key` 程序调用 Windows DPAPI 保护，无需启动 Core。首次使用会编译这个小工具，亦可预先运行 `cargo build --locked -p wonderland-plugin-tools`。
@@ -33,8 +33,8 @@ node packages/plugin-tools/cli.mjs status --plugin rich_editor
 
 ```powershell
 $backupPassword = Read-Host '备份口令' -MaskInput
-@{password=$backupPassword} | ConvertTo-Json -Compress | node packages/plugin-tools/cli.mjs export --plugin rich_editor --file rich_editor-backup.json
-@{password=$backupPassword} | ConvertTo-Json -Compress | node packages/plugin-tools/cli.mjs restore --plugin rich_editor --file rich_editor-backup.json
+@{password=$backupPassword} | ConvertTo-Json -Compress | node packages/plugin-tools/cli.mjs export --plugin wla_rich_editor --file wla_rich_editor-backup.json
+@{password=$backupPassword} | ConvertTo-Json -Compress | node packages/plugin-tools/cli.mjs restore --plugin wla_rich_editor --file wla_rich_editor-backup.json
 Remove-Variable backupPassword
 ```
 

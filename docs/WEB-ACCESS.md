@@ -86,7 +86,7 @@ $webOptions = @{
     port = 17890
     publicUrl = 'https://core.example.com/' # 不使用公网时为空字符串
     accessKey = '' # 可选；非空时要求设备提供此密钥
-    pluginIds = @('rich_editor') # 必须已经安装、启用并声明远程支持；可以待用
+    pluginIds = @('wla_rich_editor') # 必须已经安装、启用并声明远程支持；可以待用
 } | ConvertTo-Json -Compress
 wla web start --config-json $webOptions --yes
 wla web status

@@ -22,7 +22,7 @@ pnpm --dir .\plugins\wla_my_plugin run debug
 
 ## 本地维护范围
 
-当前维护奇域监测（`wla_wonderland_monitor`，合并原 `genshin_ugc` 与 `comment_collector`）、分发管理、知识库、我的奇域、富文本编辑器、插件模板、翻译工作台和网站收藏。各仓库的 README 说明自身业务、数据位置和检查命令；构建与检查从对应插件目录执行。
+当前维护奇域监测（`wla_wonderland_monitor`，合并原 `genshin_ugc` 与 `comment_collector`）、分发管理、知识库、我的奇域、富文本编辑器（`wla_rich_editor`）、插件模板、翻译工作台和网站收藏。各仓库的 README 说明自身业务、数据位置和检查命令；构建与检查从对应插件目录执行。
 
 合并后的奇域监测使用新 ID 和独立空白数据分区，两侧旧数据均不迁移，旧评论仓库保留作历史参考。
 
