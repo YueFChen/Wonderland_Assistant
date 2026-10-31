@@ -4,9 +4,9 @@ target/
 # Local deliveries, reports and private recovery backups
 artifacts/
 
-# User-managed trash for files whose deletion was blocked by approval policy
-/trash/*
-!/trash/README.md
+# User-managed trash; preserve its tracked usage instructions
+/.trash/*
+!/.trash/README.md
 
 # Independent repositories (Core keeps only the listed workspace entry documents)
 /plugins/*
