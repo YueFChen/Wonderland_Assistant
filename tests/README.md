@@ -45,4 +45,4 @@ cargo test -p wonderland-desktop web_access::tests::cold_remote --lib --locked -
 
 常规测试使用隔离临时目录，退出前停止自己创建的进程并清理目录。缓存与编译输出位于 Git 忽略的 `target/`、`node_modules/` 等位置。手工验收收据放在 `artifacts/reports/`；当前交付、私有备份和历史恢复资料按 `artifacts/README.md` 保留，不能当作临时文件批量删除。
 
-已授权清理的内容若被审批策略阻止删除，按 [项目维护约定](../AGENTS.md) 移入 [垃圾桶](../trash/README.md)，由用户手动清理。
+已授权清理的内容若被审批策略阻止删除，按 [项目维护约定](../AGENTS.md) 移入 [垃圾桶](../.trash/README.md)，由用户手动清理。

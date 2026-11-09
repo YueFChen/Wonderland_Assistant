@@ -8,13 +8,14 @@ const currentDocuments = files.length ? files : [
   'README.md',
   'AGENTS.md',
   'RELEASING.md',
+  'RELEASE_NOTES.md',
   'docs/CORE-CLI-COMMAND-INVENTORY.md',
   'docs/WEB-ACCESS.md',
   'packages/core-updates/README.md',
   'packages/plugin-tools/README.md',
   'plugins/README.md',
   'tests/README.md',
-  'trash/README.md',
+  '.trash/README.md',
   'tests/fixtures/direct-plugin/README.md',
 ]
 const missing = []

@@ -5,7 +5,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { Miniflare } from 'miniflare'
-import { releaseStatus, assertReleaseAllowed, readPolicy, checkReleaseTag } from '../../../scripts/check-core-release.mjs'
+import { checkReleaseTag } from '../../../scripts/check-core-release.mjs'
 import { prepareRelease } from '../tools/publish.mjs'
 import { verifyInstallerSignature } from '../tools/signature.mjs'
 import { UPDATE_ORIGIN, validateManifest } from '../src/manifest.mjs'
@@ -122,24 +122,10 @@ test('manifest validation rejects missing signatures and version/path mismatches
   }
 })
 
-test('release policy requires an explicit opening and evidence for every required plugin', () => {
-  const policy = { schemaVersion: 1, allowRelease: false, reason: 'pending plugins', requiredPlugins: ['one', 'two'], integratedPlugins: {} }
-  assert.throws(() => assertReleaseAllowed(policy), /Release held/)
-  policy.allowRelease = true
-  policy.integratedPlugins.one = { version: '0.1.0', evidence: 'signed stable acceptance receipt' }
-  assert.deepEqual(releaseStatus(policy).pending, ['two'])
-  assert.throws(() => assertReleaseAllowed(policy), /two/)
-  policy.integratedPlugins.two = { version: '0.1.0', evidence: 'signed stable acceptance receipt' }
-  assert.doesNotThrow(() => assertReleaseAllowed(policy))
-  policy.requiredPlugins.push('two')
-  assert.throws(() => releaseStatus(policy), /Invalid/)
-})
-
-test('source versions and CF endpoint match independently from the GitHub release hold', async () => {
+test('source versions and CF endpoint match', async () => {
   const config = JSON.parse(await readFile(new URL('../../../apps/desktop/src-tauri/tauri.conf.json', import.meta.url), 'utf8'))
   assert.doesNotThrow(() => checkReleaseTag(`v${config.version}`))
   assert.throws(() => checkReleaseTag('invalid-tag'), /versions must match/)
-  assert.equal(typeof releaseStatus(readPolicy()).allowed, 'boolean')
   assert.deepEqual(config.plugins.updater.endpoints, [`${UPDATE_ORIGIN}/stable/latest.json`])
 })
 

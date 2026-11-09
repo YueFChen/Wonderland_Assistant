@@ -1,6 +1,6 @@
 # Core Cloudflare 更新服务
 
-Core 的更新服务由 Core 仓库维护，独立于插件分发服务。Cloudflare 正常提供 Core 更新；GitHub Release 暂缓不会关闭 CF。
+Core 的更新服务由 Core 仓库维护，独立于插件分发服务。Cloudflare 提供 Core 自动更新，GitHub Release 同步同版本的原始签名成品。
 
 ## 资源与接口
 
@@ -46,7 +46,7 @@ pnpm --filter @wonderland/core-updates exec wrangler r2 bucket domain list wonde
 pnpm --filter @wonderland/core-updates exec wrangler deployments list --json
 ```
 
-2026-10-25 部署已启用服务，Worker 版本为 `2d7a4be4-fc8c-4f4c-9fdf-e209accdedea`。GitHub Release 的插件接入门槛另见 [RELEASING.md](../../RELEASING.md)，与此服务开关无关。
+2026-10-25 部署已启用服务，Worker 版本为 `2d7a4be4-fc8c-4f4c-9fdf-e209accdedea`。Core 签名构建与 GitHub 同步流程见 [RELEASING.md](../../RELEASING.md)。
 
 ## 直接发布签名 Core 更新
 
@@ -71,4 +71,10 @@ HTTPS 只读请求对短暂连接／正文中断及 502／503／504 最多尝试
 
 应急停更时可将版本化配置的 RELEASES_ENABLED 改为 false 后部署：索引返回 204，安装包路径隐藏，R2 对象保留。恢复前核对原签名和全部摘要。索引回退先保存当前指针，并按实际授权执行恢复；普通发布工具拒绝自动降级，Tauri 默认版本比较也不会让已升级客户端降级。
 
-本地运行时测试和 HTTPS 回读不能代替真实旧安装升级、用户数据保留及失败恢复验收。插件正式接入和 GitHub Release 是单独的后续工作。
+本地运行时测试和 HTTPS 回读不能代替真实旧安装升级、用户数据保留及失败恢复验收。
+
+## 同步 GitHub
+
+在 Core 根目录运行 `pnpm --filter @wonderland/core-updates run prepare:github '<新输出目录的绝对路径>' YueFChen/Wonderland_Assistant vX.Y.Z`。工具从 CF 当前稳定索引下载原始 NSIS／MSI 和签名，按内置公钥验签后输出 GitHub latest.json 与 SHA256SUMS.txt；索引说明来自根目录 RELEASE_NOTES.md。
+
+此操作仅下载并准备本地成品，不重新构建、签名、上传 CF 或创建 GitHub Release。输出目录必须尚不存在；失败后的目录应先检查，再按项目约定归档。实际 GitHub 发布由 Core 标签工作流完成。

@@ -7,6 +7,7 @@
     "test": "node --test tests/*.test.mjs",
     "deploy": "wrangler deploy",
     "prepare:update": "node tools/prepare.mjs",
+    "prepare:github": "node --use-env-proxy tools/prepare-github.mjs",
     "publish": "node --use-env-proxy tools/publish.mjs"
   },
   "devDependencies": {

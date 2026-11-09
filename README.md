@@ -2,7 +2,7 @@
 
 Wonderland Assistant Core 是 Windows 桌面应用，为《原神 千星奇域》相关工作流和独立插件、应用工具提供统一入口。插件业务代码独立维护；Core 负责工作区、插件生命周期、统一宿主服务、在线目录和应用更新。
 
-当前 Core 版本为 0.2.0，更新通过 Cloudflare 独立分发；所有维护插件正式接入前暂缓 GitHub Release。渠道与发布门槛见 [Core 发布说明](RELEASING.md)，完整开发契约与未完成验收由独立文档仓库维护，组合工作区入口为 `docs/README.md`。
+当前 Core 正式版为 0.2.1。Cloudflare 提供签名安装器与自动更新，GitHub Release 同步相同版本的原始成品。渠道与发布流程见 [Core 发布说明](RELEASING.md)，本版改动见 [更新说明](RELEASE_NOTES.md)；完整开发契约由独立文档仓库维护，组合工作区入口为 `docs/README.md`。
 
 ## 功能
 
@@ -18,7 +18,7 @@ Wonderland Assistant Core 是 Windows 桌面应用，为《原神 千星奇域�
 
 ## 安装与使用
 
-从 [Cloudflare 更新索引](https://updates.yuef.me/stable/latest.json) 的 Windows 下载地址获取当前安装包，或从 [GitHub Releases](https://github.com/YueFChen/Wonderland_Assistant/releases) 获取既有正式版。GitHub 新 Release 暂缓；当前 Core 通过 CF 正常更新。安装完成后可从开始菜单或桌面快捷方式启动。
+从 [Cloudflare 更新索引](https://updates.yuef.me/stable/latest.json) 的 Windows 下载地址或 [GitHub Releases](https://github.com/YueFChen/Wonderland_Assistant/releases) 获取安装包。安装完成后可从开始菜单或桌面快捷方式启动。
 
 在工作区中打开“插件管理 → 安装插件”可浏览在线目录或选择本地插件包。插件分发由私有 Cloudflare R2／D1 和 Worker 提供，测试／稳定渠道共用不可变版本库及授权政策。作者构建完整签名包，管理插件验签后发布；受限插件按访问码获取。作者构建见[作者工具](packages/plugin-tools/README.md)；完整分发契约由独立文档仓库的 `docs/PLUGIN-DISTRIBUTION-CONTRACT.md` 维护。Core 使用独立的 [Cloudflare 更新服务](packages/core-updates/README.md)，与 GitHub Release 的开放状态分别管理。
 
@@ -37,10 +37,10 @@ Wonderland Assistant Core 是 Windows 桌面应用，为《原神 千星奇域�
 插件仓库位于 `plugins/` 下，每个插件保留独立的 Git、Cargo 和 pnpm workspace，不属于 Core 的 Cargo workspace。使用模板创建插件：
 
 ```powershell
-pnpm run create:plugin -- --id my_plugin --name "我的插件" --author "作者名"
+pnpm run create:plugin -- --id wla_my_plugin --name "我的插件" --author "作者名"
 ```
 
-该命令会在 `plugins/my_plugin` 创建插件仓库并安装依赖。开发与调试命令、模板选项和插件目录结构见 [plugins/README.md](plugins/README.md)。
+该命令会在 `plugins/wla_my_plugin` 创建插件仓库并安装依赖。开发与调试命令、模板选项和插件目录结构见 [plugins/README.md](plugins/README.md)。
 
 ## Core 开发
 
@@ -67,7 +67,7 @@ pnpm dev
 | `pnpm check:bindings` | 检查 Core 与插件协议的生成绑定是否同步 |
 | `pnpm check` | 顺序执行前端、Rust 和绑定检查 |
 | `pnpm check:docs` | 检查 Core 随库文档的本地链接；可传入独立文档路径另行检查 |
-| `pnpm release:status` | 查看 GitHub Release 暂缓状态及缺少正式接入证据的插件 |
+| `pnpm release:status` | 检查 Core 版本一致性并显示对应标签 |
 
 测试归属、真实插件进程测试及临时产物约定见 [测试维护说明](tests/README.md)。前端检查统一做一次类型检查，再运行测试和资源构建；单独 `build:ui` 仍包含类型检查。
 
@@ -75,7 +75,7 @@ VS Code 的 F5 配置包括桌面运行、Rust 宿主调试和独立 CLI 调试�
 
 编辑器沿用系统的 `CARGO_HOME`、`RUSTUP_HOME` 和 npm 缓存配置；工具链由 `rust-toolchain.toml` 固定，Cargo 输出目录由 Cargo 配置或 `CARGO_TARGET_DIR` 决定。
 
-Windows 安装包位于 `target/release/bundle/`。签名 Core 产物可直接发布到 CF，无需 GitHub Release 或版本标签。GitHub 的标签工作流另有插件接入门槛；发布流程见 [RELEASING.md](RELEASING.md)。
+Windows 安装包位于 `target/release/bundle/`。签名 Core 产物先发布到 CF，GitHub 标签工作流验证并复用同版本原包；发布流程见 [RELEASING.md](RELEASING.md)。
 
 `target/` 仅保存 Cargo 构建输出。本地交付、验收记录和恢复备份统一放在 Git 忽略的 `artifacts/`，当前交付清单为 `artifacts/current/manifest.json`，目录说明为 `artifacts/README.md`。
 
